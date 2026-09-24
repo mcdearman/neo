@@ -1,0 +1,170 @@
+//! Platform window effects.
+
+use winit::window::Window;
+
+/// Sets the strength of the platform blur set up by [`set_blur`], in logical
+/// pixels. Returns false when the platform's blur layers do not exist yet
+/// (macOS builds them lazily), so the caller should try again after the next
+/// frame. Platforms without a strength control return true.
+pub(crate) fn set_blur_strength(window: &Window, radius: f32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_blur_strength(window, radius)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, radius);
+        true
+    }
+}
+
+/// Turns the compositor's background blur behind a transparent window on or
+/// off. `radius` is the corner radius Neo draws the window with, so the blur
+/// does not show outside the rounded corners.
+///
+/// - macOS 26+: clear Liquid Glass clipped to `radius`. Older macOS: a
+///   behind-window `NSVisualEffectView` with the HUD material.
+/// - Windows 10/11: acrylic via DWM. Windows 11 rounds the blur with its own
+///   fixed corner, so `radius` is not applied.
+/// - Linux, Wayland: KDE's blur protocol, over the whole surface for now.
+///   Other compositors show the window translucent without blur.
+/// - Linux, X11: translucent only.
+pub(crate) fn set_blur(window: &Window, enabled: bool, radius: f32) {
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{
+            apply_liquid_glass, apply_vibrancy, clear_liquid_glass, clear_vibrancy, LiquidGlassOptions, NSGlassEffectViewStyle, NSVisualEffectMaterial,
+            NSVisualEffectState,
+        };
+        // Replacing the view is the only way to change its radius.
+        let _ = clear_liquid_glass(window);
+        let _ = clear_vibrancy(window);
+        if enabled {
+            let radius = radius as f64;
+            // Clear Liquid Glass (macOS 26+) is the most transparent system
+            // blur. Neo paints its own tint on top, so none is set here.
+            let result = apply_liquid_glass(window, LiquidGlassOptions::new(NSGlassEffectViewStyle::Clear).radius(radius)).or_else(|_| {
+                // Older macOS: the HUD material is the least tinted blur.
+                apply_vibrancy(window, NSVisualEffectMaterial::HudWindow, Some(NSVisualEffectState::Active), Some(radius))
+            });
+            match result {
+                Ok(()) => macos::raise_metal_layer(window),
+                Err(e) => eprintln!("neo: window blur unavailable: {e}"),
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = radius;
+        let result = if enabled {
+            window_vibrancy::apply_acrylic(window, Some((0, 0, 0, 0)))
+        } else {
+            window_vibrancy::clear_acrylic(window)
+        };
+        if let Err(e) = result {
+            eprintln!("neo: window blur unavailable: {e}");
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = radius;
+        window.set_blur(enabled);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    /// wgpu draws into a `CAMetalLayer` added directly to the content view's
+    /// layer, and window-vibrancy inserts its blur view into the same view.
+    /// AppKit attaches the blur view's layer lazily and places it above the
+    /// Metal layer, hiding Neo's content. Raising the Metal layer's
+    /// z-position keeps it on top whatever order AppKit chooses.
+    /// wgpu draws into a `CAMetalLayer` added directly to the content view's
+    /// layer, and window-vibrancy inserts its blur view into the same view.
+    /// AppKit attaches the blur view's layer lazily and places it above the
+    /// Metal layer, hiding Neo's content. Raising the Metal layer's
+    /// z-position keeps it on top whatever order AppKit chooses.
+    fn ns_string(s: &std::ffi::CStr) -> *mut AnyObject {
+        let cls = objc2::runtime::AnyClass::get(c"NSString").expect("Foundation is loaded");
+        unsafe { msg_send![cls, stringWithUTF8String: s.as_ptr()] }
+    }
+
+    /// Sets the blur radius on the system glass. Neither Liquid Glass nor
+    /// NSVisualEffectView exposes this publicly; both are backed by a
+    /// `CABackdropLayer` whose filter has a radius input:
+    /// `glassBackground.inputBlurRadius` (Liquid Glass, default 10) or
+    /// `gaussianBlur.inputRadius` (visual effect views). If Apple changes
+    /// either, this finds nothing and the system default stays.
+    pub(super) fn set_blur_strength(window: &Window, radius: f32) -> bool {
+        unsafe fn visit(layer: *mut AnyObject, radius: f64, found: &mut bool) {
+            unsafe {
+                let filters: *mut AnyObject = msg_send![layer, filters];
+                let n: usize = if filters.is_null() { 0 } else { msg_send![filters, count] };
+                for i in 0..n {
+                    let f: *mut AnyObject = msg_send![filters, objectAtIndex: i];
+                    let name: *mut AnyObject = msg_send![f, name];
+                    if name.is_null() {
+                        continue;
+                    }
+                    let name_c: *const std::ffi::c_char = msg_send![name, UTF8String];
+                    let key = match std::ffi::CStr::from_ptr(name_c).to_bytes() {
+                        b"glassBackground" => c"inputBlurRadius",
+                        b"gaussianBlur" => c"inputRadius",
+                        _ => continue,
+                    };
+                    let path = format!("filters.{}.{}", std::ffi::CStr::from_ptr(name_c).to_string_lossy(), key.to_string_lossy());
+                    let path = std::ffi::CString::new(path).expect("no interior nul");
+                    let number_cls = objc2::runtime::AnyClass::get(c"NSNumber").expect("Foundation is loaded");
+                    let value: *mut AnyObject = msg_send![number_cls, numberWithDouble: radius];
+                    let _: () = msg_send![layer, setValue: value, forKeyPath: ns_string(&path)];
+                    *found = true;
+                }
+                let subs: *mut AnyObject = msg_send![layer, sublayers];
+                let n: usize = if subs.is_null() { 0 } else { msg_send![subs, count] };
+                for i in 0..n {
+                    let l: *mut AnyObject = msg_send![subs, objectAtIndex: i];
+                    visit(l, radius, found);
+                }
+            }
+        }
+        let Ok(handle) = window.window_handle() else { return true };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else { return true };
+        let mut found = false;
+        // SAFETY: winit hands out a valid NSView and this runs on the main thread.
+        unsafe {
+            let view = h.ns_view.as_ptr().cast::<AnyObject>();
+            let root: *mut AnyObject = msg_send![view, layer];
+            if !root.is_null() {
+                visit(root, radius.max(0.0) as f64, &mut found);
+            }
+        }
+        found
+    }
+
+    pub(super) fn raise_metal_layer(window: &Window) {
+        let Ok(handle) = window.window_handle() else { return };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+        // SAFETY: winit hands out a valid NSView, and this runs on the main
+        // thread (window events and sync_window only run there).
+        unsafe {
+            let view = h.ns_view.as_ptr().cast::<AnyObject>();
+            let root: *mut AnyObject = msg_send![view, layer];
+            if root.is_null() {
+                return;
+            }
+            let subs: *mut AnyObject = msg_send![root, sublayers];
+            let n: usize = if subs.is_null() { 0 } else { msg_send![subs, count] };
+            for i in 0..n {
+                let layer: *mut AnyObject = msg_send![subs, objectAtIndex: i];
+                if (*layer).class().name().to_bytes().ends_with(b"MetalLayer") {
+                    let _: () = msg_send![layer, setZPosition: 1.0f64];
+                }
+            }
+        }
+    }
+}

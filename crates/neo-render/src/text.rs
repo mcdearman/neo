@@ -1,0 +1,216 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight, Wrap};
+
+use crate::geometry::{Point, Size};
+
+/// Which bundled typeface to use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    #[default]
+    Sans,
+    Mono,
+    Icons,
+}
+
+/// Everything that affects how a string is shaped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextStyle {
+    /// Font size in logical pixels.
+    pub size: f32,
+    pub weight: u16,
+    pub family: FontFamily,
+    /// Line height as a multiple of `size`.
+    pub line_height: f32,
+    /// Extra space between letters in logical pixels.
+    pub letter_spacing: f32,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self { size: 14.0, weight: 500, family: FontFamily::Sans, line_height: 1.4, letter_spacing: 0.0 }
+    }
+}
+
+impl TextStyle {
+    pub fn from_spec(spec: neo_theme::TextSpec) -> Self {
+        Self {
+            size: spec.size,
+            weight: spec.weight.0,
+            family: FontFamily::Sans,
+            line_height: spec.line_height,
+            letter_spacing: spec.letter_spacing,
+        }
+    }
+}
+
+/// Shaped text, cheap to clone.
+#[derive(Clone)]
+pub struct TextLayout {
+    pub(crate) buffer: Rc<Buffer>,
+    size: Size,
+    line_height: f32,
+}
+
+impl std::fmt::Debug for TextLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextLayout").field("size", &self.size).finish()
+    }
+}
+
+impl TextLayout {
+    /// The bounding size of the laid-out text.
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    pub fn line_height(&self) -> f32 {
+        self.line_height
+    }
+
+    /// The byte index in the source string closest to `p` (relative to the
+    /// layout's top-left corner).
+    pub fn hit(&self, p: Point) -> usize {
+        match self.buffer.hit(p.x, p.y) {
+            Some(c) => {
+                // Single-paragraph layouts only; add line offsets for multi-line text.
+                let mut offset = 0;
+                for (i, line) in self.buffer.lines.iter().enumerate() {
+                    if i == c.line {
+                        return offset + c.index;
+                    }
+                    offset += line.text().len() + 1;
+                }
+                offset
+            }
+            None => 0,
+        }
+    }
+
+    /// The caret position (top-left, relative to the layout) before byte `index`.
+    pub fn caret(&self, index: usize) -> Point {
+        let mut last = Point::ZERO;
+        for run in self.buffer.layout_runs() {
+            for g in run.glyphs {
+                if g.start >= index {
+                    return Point::new(g.x, run.line_top);
+                }
+                last = Point::new(g.x + g.w, run.line_top);
+            }
+            if run.glyphs.is_empty() {
+                last = Point::new(0.0, run.line_top);
+            }
+        }
+        last
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    text: String,
+    size: u32,
+    weight: u16,
+    family: FontFamily,
+    line_height: u32,
+    spacing: u32,
+    max_width: Option<u32>,
+}
+
+struct Entry {
+    layout: TextLayout,
+    last_used: u64,
+}
+
+/// Owns the font database and caches shaped text between frames.
+pub struct TextSystem {
+    pub(crate) fonts: FontSystem,
+    cache: HashMap<u64, Vec<(Key, Entry)>>,
+    frame: u64,
+}
+
+impl TextSystem {
+    /// Loads the bundled fonts plus system fonts for fallback (emoji, CJK, ...).
+    pub fn new() -> Self {
+        let mut fonts = FontSystem::new();
+        let db = fonts.db_mut();
+        for data in neo_theme::fonts::ALL {
+            db.load_font_data(data.to_vec());
+        }
+        db.set_sans_serif_family(neo_theme::fonts::SANS);
+        db.set_monospace_family(neo_theme::fonts::MONO);
+        Self { fonts, cache: HashMap::new(), frame: 0 }
+    }
+
+    /// Shapes `text`, wrapping at `max_width` when given.
+    pub fn layout(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+        let key = Key {
+            text: text.to_owned(),
+            size: style.size.to_bits(),
+            weight: style.weight,
+            family: style.family,
+            line_height: style.line_height.to_bits(),
+            spacing: style.letter_spacing.to_bits(),
+            max_width: max_width.filter(|w| w.is_finite()).map(|w| w.to_bits()),
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let hash = h.finish();
+        let frame = self.frame;
+        if let Some(bucket) = self.cache.get_mut(&hash)
+            && let Some((_, e)) = bucket.iter_mut().find(|(k, _)| *k == key) {
+                e.last_used = frame;
+                return e.layout.clone();
+            }
+
+        let line_height = (style.size * style.line_height).round();
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(style.size, line_height));
+        let family = match style.family {
+            FontFamily::Sans => Family::Name(neo_theme::fonts::SANS),
+            FontFamily::Mono => Family::Name(neo_theme::fonts::MONO),
+            FontFamily::Icons => Family::Name(neo_theme::fonts::ICONS),
+        };
+        let attrs = Attrs::new()
+            .family(family)
+            .weight(Weight(style.weight))
+            .letter_spacing(style.letter_spacing / style.size.max(1.0));
+        let width = max_width.filter(|w| w.is_finite());
+        buffer.set_wrap(if width.is_some() { Wrap::WordOrGlyph } else { Wrap::None });
+        buffer.set_size(width, None);
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+
+        let mut w: f32 = 0.0;
+        let mut lines = 0;
+        for run in buffer.layout_runs() {
+            // Trailing letter spacing is not part of the visible width.
+            w = w.max(run.line_w - if run.glyphs.is_empty() { 0.0 } else { style.letter_spacing });
+            lines += 1;
+        }
+        let lines = lines.max(1);
+        let layout = TextLayout {
+            buffer: Rc::new(buffer),
+            size: Size::new(w.ceil().max(0.0), line_height * lines as f32),
+            line_height,
+        };
+        self.cache.entry(hash).or_default().push((key, Entry { layout: layout.clone(), last_used: frame }));
+        layout
+    }
+
+    /// Drops cached layouts that went unused for a while.
+    pub fn end_frame(&mut self) {
+        self.frame += 1;
+        let frame = self.frame;
+        self.cache.retain(|_, bucket| {
+            bucket.retain(|(_, e)| frame - e.last_used < 120);
+            !bucket.is_empty()
+        });
+    }
+}
+
+impl Default for TextSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
