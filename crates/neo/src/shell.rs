@@ -401,7 +401,11 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 self.dispatch(Event::WindowFocus(f));
             }
             WindowEvent::RedrawRequested => self.render(),
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                let mods = self.modifiers();
+                self.ui.set_modifiers(mods);
+            }
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => {
                 let p = Point::new(x as f32 / scale, y as f32 / scale);
                 self.pointer = Some(p);

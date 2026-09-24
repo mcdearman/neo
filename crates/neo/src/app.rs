@@ -4,6 +4,7 @@ use neo_render::Size;
 use neo_theme::{Scheme, Theme};
 
 use crate::core::Element;
+use crate::event::KeyEvent;
 
 /// A Neo application, in the Elm style: state, messages that change it,
 /// and a view that describes the interface for the current state.
@@ -24,6 +25,11 @@ pub trait App: 'static {
     /// The theme to use. `system` is the desktop's light or dark preference.
     fn theme(&self, system: Scheme) -> Theme {
         Theme { scheme: system, ..Theme::default() }
+    }
+
+    /// Key presses no widget handled, for app-wide shortcuts such as save.
+    fn on_key(&self, _key: &KeyEvent) -> Option<Self::Message> {
+        None
     }
 
     /// Timers that send messages periodically.

@@ -15,6 +15,8 @@ Both styles come in light and dark schemes with four accents: royal blue (defaul
 cargo run -p neo --example gallery                  # live widget gallery
 cargo run -p neo --example gallery -- --glass --blur 24   # start with glass windows on
 cargo run -p neo --example gallery -- --snapshot target/snapshots   # PNGs of every style
+cargo run -p neo --example editor                   # Neo Code, a small code editor
+cargo run -p neo --example editor -- path/to/folder # edit a real folder (Cmd/Ctrl+S saves)
 cargo run -p neo-render --example primitives        # renderer test card
 cargo test --workspace
 ```
@@ -61,7 +63,9 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 ### Widgets
 
-Text, Icon, Container, Row, Column, Stack, Space, Divider, Scrollable, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, ProgressBar, Gauge and Sparkline.
+Text, Icon, Container, Row, Column, Stack, Space, Divider, Scrollable, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, TextEditor, ProgressBar, Gauge and Sparkline.
+
+TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
 
 ### How it works
 

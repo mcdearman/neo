@@ -278,6 +278,7 @@ pub(crate) struct RuntimeState {
     pub clipboard_in: Option<String>,
     pub content_color: Option<Color>,
     pub window_focused: bool,
+    pub modifiers: crate::event::Modifiers,
 }
 
 /// Context handed to every widget method.
@@ -364,6 +365,11 @@ impl<'a, 'b> Cx<'a, 'b> {
 
     pub fn window_request(&mut self, r: WindowRequest) {
         self.shared.runtime.window_requests.push(r);
+    }
+
+    /// Modifier keys currently held, for example to extend a selection on shift-click.
+    pub fn modifiers(&self) -> crate::event::Modifiers {
+        self.shared.runtime.modifiers
     }
 
     /// Latest pointer position in window coordinates.

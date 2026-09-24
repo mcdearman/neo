@@ -68,6 +68,12 @@ impl<A: App> Harness<A> {
         }
     }
 
+    /// Presses the paste shortcut with `text` on the clipboard.
+    pub fn paste(&mut self, text: &str, command: Modifiers) {
+        self.ui.set_clipboard(Some(text.to_owned()));
+        self.event(Event::Key(KeyEvent { key: Key::Character("v".into()), pressed: true, repeat: false, modifiers: command, text: None }));
+    }
+
     /// Types `text` one character at a time.
     pub fn type_text(&mut self, text: &str) {
         for c in text.chars() {

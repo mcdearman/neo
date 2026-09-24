@@ -3,8 +3,10 @@
 mod button;
 mod container;
 mod data;
+mod document;
 mod flex;
 pub(crate) mod frame;
+mod highlight;
 mod icon;
 pub(crate) mod map;
 mod scrollable;
@@ -14,11 +16,14 @@ mod space;
 mod stack;
 pub mod style;
 mod text;
+mod text_editor;
 mod text_input;
 mod toggle;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
+pub use document::{Action, Document, Motion, Pos, INDENT};
+pub use highlight::Language;
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use flex::{column, row, Column, Flex, Justify, Row};
 pub use icon::{icon, Icon};
@@ -30,6 +35,7 @@ pub use space::{Divider, Space};
 pub use stack::{stack, Stack};
 pub use style::Tone;
 pub use text::{text, Text};
+pub use text_editor::{text_editor, TextEditor};
 pub use text_input::{text_input, TextInput};
 pub use toggle::{checkbox, toggle, Checkbox, Toggle};
 
@@ -56,4 +62,4 @@ macro_rules! into_element_generic {
 }
 
 into_element!(Text, Icon, Space, Divider, ProgressBar, Gauge, Sparkline);
-into_element_generic!(Button, Container, Flex, Scrollable, Segmented, Slider, Stack, TextInput, Toggle, Checkbox);
+into_element_generic!(Button, Container, Flex, Scrollable, Segmented, Slider, Stack, TextEditor, TextInput, Toggle, Checkbox);

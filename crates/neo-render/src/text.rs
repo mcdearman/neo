@@ -110,6 +110,8 @@ impl TextLayout {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     text: String,
+    /// Byte length and RGBA of each coloured span; empty for plain text.
+    spans: Vec<(usize, [u8; 4])>,
     size: u32,
     weight: u16,
     family: FontFamily,
@@ -145,8 +147,21 @@ impl TextSystem {
 
     /// Shapes `text`, wrapping at `max_width` when given.
     pub fn layout(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+        self.layout_inner(text, &[], style, max_width)
+    }
+
+    /// Shapes coloured spans as one run of text, for syntax highlighting.
+    /// Spans with no colour of their own use the colour passed when drawing.
+    pub fn layout_spans(&mut self, spans: &[(&str, Option<neo_theme::Color>)], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+        let text: String = spans.iter().map(|(t, _)| *t).collect();
+        let colors: Vec<(usize, [u8; 4])> = spans.iter().map(|(t, c)| (t.len(), c.map_or([0; 4], |c| c.to_rgba8()))).collect();
+        self.layout_inner(&text, &colors, style, max_width)
+    }
+
+    fn layout_inner(&mut self, text: &str, spans: &[(usize, [u8; 4])], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
         let key = Key {
             text: text.to_owned(),
+            spans: spans.to_vec(),
             size: style.size.to_bits(),
             weight: style.weight,
             family: style.family,
@@ -178,7 +193,18 @@ impl TextSystem {
         let width = max_width.filter(|w| w.is_finite());
         buffer.set_wrap(if width.is_some() { Wrap::WordOrGlyph } else { Wrap::None });
         buffer.set_size(width, None);
-        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        if spans.is_empty() {
+            buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        } else {
+            let mut at = 0;
+            let rich = spans.iter().map(|(len, rgba)| {
+                let t = &text[at..at + len];
+                at += len;
+                let a = if rgba[3] == 0 { attrs.clone() } else { attrs.clone().color(glyphon::Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3])) };
+                (t, a)
+            });
+            buffer.set_rich_text(rich, &attrs, Shaping::Advanced, None);
+        }
         buffer.shape_until_scroll(&mut self.fonts, false);
 
         let mut w: f32 = 0.0;

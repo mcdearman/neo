@@ -215,3 +215,63 @@ mod scrolling {
         assert_eq!(end, h.render(1.0));
     }
 }
+
+mod editor {
+    use super::*;
+    use neo::widgets::{Action, Document};
+
+    struct Ed {
+        doc: Document,
+    }
+
+    impl App for Ed {
+        type Message = Action;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, a: Action) {
+            self.doc.apply(a);
+        }
+        fn view(&self) -> Element<Action> {
+            text_editor(&self.doc).language(Language::Rust).on_action(|a| a).into()
+        }
+    }
+
+    fn cmd() -> Modifiers {
+        if cfg!(target_os = "macos") { Modifiers { logo: true, ..Default::default() } } else { Modifiers { ctrl: true, ..Default::default() } }
+    }
+
+    #[test]
+    fn typing_editing_and_undo_through_the_widget() {
+        let mut h = Harness::new(Ed { doc: Document::new("fn main() {}") }, Size::new(600.0, 300.0)).unwrap();
+        // Click far right of the first line: cursor goes to the end.
+        h.click(Point::new(590.0, 20.0));
+        assert_eq!(h.app().doc.cursor().col, 12);
+        h.key(Key::Left, Modifiers::default());
+        h.key(Key::Enter, Modifiers::default());
+        h.type_text("run();");
+        assert_eq!(h.app().doc.text(), "fn main() {\n    run();\n}");
+        h.key(Key::Character("z".into()), cmd());
+        assert_eq!(h.app().doc.text(), "fn main() {\n    \n}");
+        h.key(Key::Character("z".into()), Modifiers { shift: true, ..cmd() });
+        assert_eq!(h.app().doc.text(), "fn main() {\n    run();\n}");
+        // Tab indents, Shift+Tab outdents.
+        h.key(Key::Home, Modifiers::default());
+        h.key(Key::Tab, Modifiers::default());
+        assert_eq!(h.app().doc.lines()[1], "        run();");
+        h.key(Key::Tab, Modifiers { shift: true, ..Default::default() });
+        assert_eq!(h.app().doc.lines()[1], "    run();");
+    }
+
+    #[test]
+    fn select_all_cut_and_paste() {
+        let mut h = Harness::new(Ed { doc: Document::new("one\ntwo") }, Size::new(400.0, 200.0)).unwrap();
+        h.click(Point::new(200.0, 20.0));
+        h.key(Key::Character("a".into()), cmd());
+        h.key(Key::Character("x".into()), cmd());
+        assert_eq!(h.app().doc.text(), "");
+        // The harness has no system clipboard, so paste text arrives through the runtime.
+        h.paste("three\nfour", cmd());
+        assert_eq!(h.app().doc.text(), "three\nfour");
+    }
+}

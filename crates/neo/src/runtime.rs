@@ -94,6 +94,11 @@ impl<A: App> Ui<A> {
         self.rt.redraw = true;
     }
 
+    /// Modifier keys currently held, as reported by the platform.
+    pub fn set_modifiers(&mut self, m: crate::event::Modifiers) {
+        self.rt.modifiers = m;
+    }
+
     /// Text to hand to widgets on the next paste shortcut.
     pub fn set_clipboard(&mut self, text: Option<String>) {
         self.rt.clipboard_in = text;
@@ -172,6 +177,9 @@ impl<A: App> Ui<A> {
     /// Routes an input event, then applies any resulting messages.
     pub fn event(&mut self, text: &mut TextSystem, event: Event) {
         self.ensure(text);
+        if let Event::Key(k) = &event {
+            self.rt.modifiers = k.modifiers;
+        }
         match &event {
             Event::PointerLeft => self.rt.pointer = None,
             Event::PointerPressed { .. } => self.rt.focus_visible = false,
@@ -193,9 +201,15 @@ impl<A: App> Ui<A> {
             root.event(&mut cx, &event)
         };
         if let Event::Key(k) = &event
-            && status == Status::Ignored && k.pressed && k.key == Key::Tab {
+            && status == Status::Ignored
+            && k.pressed
+        {
+            if let Some(m) = self.app.on_key(k) {
+                messages.push(m);
+            } else if k.key == Key::Tab {
                 self.move_focus(!k.modifiers.shift);
             }
+        }
         for m in messages {
             self.app.update(m);
             self.needs_view = true;
