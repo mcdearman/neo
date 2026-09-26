@@ -1,6 +1,8 @@
 //! Drive an app without a window: send input, inspect state, save screenshots.
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use neo_render::{Point, Renderer, Size};
@@ -16,13 +18,18 @@ pub struct Harness<A: App> {
     renderer: Renderer,
     size: Size,
     clock: Instant,
+    clipboard: Rc<RefCell<Option<String>>>,
 }
 
 impl<A: App> Harness<A> {
     /// Creates a harness with a window of `size` logical pixels.
     pub fn new(app: A, size: Size) -> Result<Self, String> {
         let renderer = Renderer::headless()?;
-        Ok(Self { ui: Ui::new(app, size, Scheme::Light), renderer, size, clock: Instant::now() })
+        let clipboard = Rc::new(RefCell::new(None));
+        let mut ui = Ui::new(app, size, Scheme::Light);
+        let reader = clipboard.clone();
+        ui.set_clipboard_reader(Box::new(move || reader.borrow().clone()));
+        Ok(Self { ui, renderer, size, clock: Instant::now(), clipboard })
     }
 
     pub fn app(&self) -> &A {
@@ -44,6 +51,20 @@ impl<A: App> Harness<A> {
 
     pub fn event(&mut self, e: Event) {
         self.ui.event(self.renderer.text(), e);
+        self.ui.refresh(self.renderer.text());
+        if let Some(t) = self.ui.take_clipboard() {
+            *self.clipboard.borrow_mut() = Some(t);
+        }
+    }
+
+    /// The simulated system clipboard: what widgets last copied, or what
+    /// [`set_clipboard`](Self::set_clipboard) put there.
+    pub fn clipboard(&self) -> Option<String> {
+        self.clipboard.borrow().clone()
+    }
+
+    pub fn set_clipboard(&mut self, text: &str) {
+        *self.clipboard.borrow_mut() = Some(text.to_owned());
     }
 
     pub fn move_to(&mut self, p: Point) {

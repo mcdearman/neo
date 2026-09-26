@@ -22,7 +22,7 @@ mod toggle;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
-pub use document::{Action, Document, Motion, Pos, INDENT};
+pub use document::{Action, BlockSelection, ClipboardNeed, Document, Mode as VimMode, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::Language;
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use flex::{column, row, Column, Flex, Justify, Row};

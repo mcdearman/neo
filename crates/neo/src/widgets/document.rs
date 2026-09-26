@@ -1,5 +1,9 @@
 //! The text model behind [`TextEditor`](super::TextEditor).
 
+mod vim;
+
+pub use vim::{BlockSelection, ClipboardNeed, Mode, Scroll, VimRequest, VimStatus, VimView};
+
 use std::fmt;
 
 /// A position in a document. `col` is a byte offset into the line and always
@@ -57,6 +61,13 @@ pub enum Action {
     Outdent,
     Undo,
     Redo,
+    /// A key press for Vim mode. Ignored unless Vim mode is on.
+    Key(crate::event::KeyEvent),
+    /// The system clipboard's text, sent before a Vim command that reads
+    /// the `+` register.
+    Clipboard(String),
+    /// The lines on screen, so Vim can scroll by pages and use `H M L`.
+    Viewport { top: usize, lines: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +95,9 @@ pub struct Document {
     redo: Vec<Snapshot>,
     last_edit: EditKind,
     revision: u64,
+    /// While set, edits join the current undo step (a Vim command or insert session).
+    grouped: bool,
+    vim: Option<Box<vim::Vim>>,
 }
 
 /// Spaces per indentation level. Tabs are expanded to this many spaces.
@@ -125,7 +139,51 @@ impl Default for Document {
 impl Document {
     pub fn new(text: &str) -> Self {
         let lines: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
-        Self { lines, cursor: Pos::default(), anchor: Pos::default(), goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0 }
+        Self { lines, cursor: Pos::default(), anchor: Pos::default(), goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0, grouped: false, vim: None }
+    }
+
+    /// Turns Vim-style modal editing on or off. It starts in Normal mode.
+    pub fn set_vim(&mut self, on: bool) {
+        if on == self.vim.is_some() {
+            return;
+        }
+        self.grouped = false;
+        self.vim = on.then(|| Box::new(vim::Vim::default()));
+        self.anchor = self.cursor;
+        if on {
+            self.cursor = vim::normal_clamp(&self.lines, self.cursor);
+            self.anchor = self.cursor;
+        }
+    }
+
+    /// Vim mode, pending keys, command line and messages, when Vim is on.
+    pub fn vim(&self) -> Option<VimStatus> {
+        self.vim.as_ref().map(|v| v.status())
+    }
+
+    /// Commands such as `:w` and `:q` that the application should carry out.
+    pub fn take_vim_requests(&mut self) -> Vec<VimRequest> {
+        self.vim.as_mut().map(|v| v.take_requests()).unwrap_or_default()
+    }
+
+    /// The range to highlight as selected. The flag is true for whole-line
+    /// selections (Vim's Visual Line mode).
+    pub fn display_selection(&self) -> Option<(Pos, Pos, bool)> {
+        match &self.vim {
+            Some(v) => v.display_selection(self),
+            None => self.selection().map(|(a, b)| (a, b, false)),
+        }
+    }
+
+    /// Vim state the editor widget needs: block selections, clipboard
+    /// traffic, scroll requests and the last known viewport.
+    pub fn vim_view(&self) -> Option<VimView> {
+        self.vim.as_ref().map(|v| v.view(self))
+    }
+
+    /// Whether the caret should be drawn as a block (Vim Normal and Visual modes).
+    pub fn block_caret(&self) -> bool {
+        self.vim.as_ref().is_some_and(|v| v.block_caret())
     }
 
     /// The whole text, lines joined with `\n`.
@@ -159,16 +217,36 @@ impl Document {
         (self.cursor != self.anchor).then(|| (self.cursor.min(self.anchor), self.cursor.max(self.anchor)))
     }
 
+    /// The text shown as selected. In Vim's Visual modes this includes the
+    /// character under the cursor, or whole lines.
     pub fn selected_text(&self) -> String {
-        match self.selection() {
-            Some((a, b)) => text_between(&self.lines, a, b),
+        if let Some(b) = self.vim_view().and_then(|v| v.block) {
+            return b.text(&self.lines);
+        }
+        match self.display_selection() {
+            Some((a, b, true)) => self.lines[a.line..=b.line].join("\n") + "\n",
+            Some((a, b, false)) => text_between(&self.lines, a, b),
             None => String::new(),
         }
     }
 
     /// Applies an action. Returns true when the text changed.
     pub fn apply(&mut self, action: Action) -> bool {
+        if let Some(mut vim) = self.vim.take() {
+            let before = self.revision;
+            let handled = vim.intercept(self, &action);
+            self.vim = Some(vim);
+            if handled {
+                return self.revision != before;
+            }
+        }
+        self.apply_plain(action)
+    }
+
+    /// Applies an action without Vim's interpretation.
+    fn apply_plain(&mut self, action: Action) -> bool {
         match action {
+            Action::Key(_) | Action::Clipboard(_) | Action::Viewport { .. } => false,
             Action::Insert(t) => {
                 let t = normalize(&t);
                 let typing = t.chars().count() == 1 && !t.chars().any(char::is_whitespace);
@@ -371,6 +449,13 @@ impl Document {
     }
 
     fn begin(&mut self, kind: EditKind) {
+        if self.grouped {
+            self.redo.clear();
+            self.last_edit = kind;
+            self.goal = None;
+            self.revision += 1;
+            return;
+        }
         let coalesce = kind == EditKind::Typing && self.last_edit == EditKind::Typing && self.selection().is_none();
         if !coalesce {
             self.undo.push(Snapshot { lines: self.lines.clone(), cursor: self.cursor, anchor: self.anchor });

@@ -1,4 +1,4 @@
-//! Neo Code: a small code editor built with Neo.
+//! Neo Code: a small code editor built with Neo, with optional Vim keys.
 //!
 //!     cargo run -p neo --example editor                 # sample project
 //!     cargo run -p neo --example editor -- path/to/dir  # a real folder (Cmd/Ctrl+S saves)
@@ -184,6 +184,7 @@ struct NeoCode {
     style: Style,
     dark: Option<bool>,
     toast: Option<String>,
+    vim: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +198,7 @@ enum Msg {
     Style(Style),
     ToggleScheme,
     ClearToast,
+    Vim(bool),
 }
 
 impl NeoCode {
@@ -216,7 +218,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None, vim: true };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -250,7 +252,7 @@ impl NeoCode {
         let mut nodes = vec![];
         walk(root, "", 0, &mut nodes);
         let project = root.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| root.display().to_string());
-        Self { project, nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None }
+        Self { project, nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None, vim: true }
     }
 
     fn visible_nodes(&self) -> Vec<usize> {
@@ -351,7 +353,8 @@ impl App for NeoCode {
                     },
                     None => return,
                 };
-                let doc = Document::new(&text);
+                let mut doc = Document::new(&text);
+                doc.set_vim(self.vim);
                 self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk });
                 self.active = Some(self.tabs.len() - 1);
             }
@@ -372,8 +375,32 @@ impl App for NeoCode {
                 }
             }
             Msg::Edit(a) => {
-                if let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-                    t.doc.apply(a);
+                let Some(i) = self.active else { return };
+                let Some(t) = self.tabs.get_mut(i) else { return };
+                t.doc.apply(a);
+                for r in t.doc.take_vim_requests() {
+                    match r {
+                        VimRequest::Write => self.update(Msg::Save),
+                        VimRequest::WriteQuit => {
+                            self.update(Msg::Save);
+                            if self.tabs.get(i).is_some_and(|t| !t.dirty()) {
+                                self.update(Msg::Close(i));
+                            }
+                        }
+                        VimRequest::Quit { force } => {
+                            if !force && self.tabs.get(i).is_some_and(Tab::dirty) {
+                                self.toast = Some("No write since last change. Use :q! to discard it.".into());
+                            } else {
+                                self.update(Msg::Close(i));
+                            }
+                        }
+                    }
+                }
+            }
+            Msg::Vim(on) => {
+                self.vim = on;
+                for t in &mut self.tabs {
+                    t.doc.set_vim(on);
                 }
             }
             Msg::Save => {
@@ -480,7 +507,7 @@ impl NeoCode {
                     .align(Align::Center)
                     .push(icon(icons::FILE_CODE).size(40.0).tone(Tone::Faint))
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
-                    .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs").role(TextRole::Caption).tone(Tone::Faint)),
+                    .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work in Vim mode").role(TextRole::Caption).tone(Tone::Faint)),
             )
             .surface(if self.style == Style::Soft { Surface::Well } else { Surface::Card })
             .center()
@@ -493,12 +520,33 @@ impl NeoCode {
 
     fn status_bar(&self) -> Element<Msg> {
         let mut left = row().spacing(18.0).align(Align::Center);
+        if let Some(v) = self.active_tab().and_then(|t| t.doc.vim()) {
+            let insert = v.mode == VimMode::Insert;
+            let badge = container(text(v.mode.label()).role(TextRole::Label))
+                .padding([4.0, 10.0])
+                .radius(6.0)
+                .background(if insert { Background::Surface(Surface::Accent) } else { Background::Surface(Surface::Pressed) });
+            left = left.push(badge);
+            if let Some(cmd) = v.command_line {
+                left = left.push(text(format!("{cmd}▏")).mono().role(TextRole::Body));
+            } else if !v.pending.is_empty() {
+                left = left.push(text(v.pending).mono().role(TextRole::Caption).tone(Tone::Accent));
+            }
+            if let Some(r) = v.recording {
+                left = left.push(row().spacing(6.0).align(Align::Center).push(icon(icons::CIRCLE).size(10.0).tone(Tone::Bad)).push(text(format!("recording @{r}")).role(TextRole::Caption).tone(Tone::Bad)));
+            }
+            if let Some(m) = v.message.filter(|m| !m.starts_with("recording @")) {
+                let tone = if m.starts_with("search hit") || m.ends_with("yanked") || m.ends_with("fewer lines") { Tone::Muted } else { Tone::Warn };
+                left = left.push(text(m).role(TextRole::Caption).tone(tone));
+            }
+        }
         if let Some(t) = self.active_tab() {
             let c = t.doc.cursor();
             let col = t.doc.lines()[c.line][..c.col].chars().count() + 1;
             left = left.push(text(format!("Ln {}, Col {}", c.line + 1, col)).mono().role(TextRole::Caption).tone(Tone::Muted));
-            if t.doc.selection().is_some() {
-                let n = t.doc.selected_text().chars().count();
+            let selected = t.doc.selected_text();
+            if !selected.is_empty() {
+                let n = selected.chars().filter(|c| *c != '\n').count();
                 left = left.push(text(format!("{n} selected")).mono().role(TextRole::Caption).tone(Tone::Muted));
             }
             left = left
@@ -519,6 +567,7 @@ impl NeoCode {
             .padding([0.0, 6.0])
             .push(left)
             .push(Space::fill_x())
+            .push(row().spacing(8.0).align(Align::Center).push(text("Vim").role(TextRole::Caption).tone(Tone::Muted)).push(toggle(self.vim, Msg::Vim)))
             .push(segmented(["Flat", "Soft"], Some(style_idx), |i| Msg::Style(if i == 0 { Style::Flat } else { Style::Soft })))
             .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 34.0).on_press(Msg::ToggleScheme))
             .into()
@@ -567,13 +616,19 @@ fn snapshots(dir: PathBuf) {
         app.style = style;
         app.dark = Some(dark);
         let mut h = Harness::new(app, Size::new(1280.0, 820.0)).expect("GPU");
-        // Focus the editor, put the cursor on a line and select a word.
+        // Focus the editor, then use Vim keys: move down, select to the end of a word.
         h.click(Point::new(700.0, 300.0));
-        h.key(Key::Down, Modifiers::default());
-        h.key(Key::End, Modifiers::default());
-        h.key(Key::Left, Modifiers { shift: true, ..Default::default() });
-        h.key(Key::Left, Modifiers { shift: true, ..Default::default() });
-        h.type_text("s");
+        match name {
+            "editor-flat-light" => {
+                // Visual Block over three lines.
+                h.type_text("7jw");
+                h.key(Key::Character("v".into()), Modifiers { ctrl: true, ..Default::default() });
+                h.type_text("2je");
+            }
+            "editor-flat-dark" => h.type_text("jVj"),
+            "editor-soft-light" => h.type_text("jA // edited"),
+            _ => h.type_text("qad2"),
+        }
         let path = dir.join(format!("{name}.png"));
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());

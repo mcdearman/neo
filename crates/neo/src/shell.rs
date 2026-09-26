@@ -39,8 +39,12 @@ impl std::error::Error for Error {}
 pub fn run<A: App>(app: A) -> Result<(), Error> {
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
     let settings = app.window();
+    let mut ui = Ui::new(app, settings.size, Scheme::Light);
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        ui.set_clipboard_reader(Box::new(move || clipboard.get_text().ok()));
+    }
     let mut shell = Shell {
-        ui: Ui::new(app, settings.size, Scheme::Light),
+        ui,
         settings,
         gpu: None,
         error: None,
@@ -237,6 +241,11 @@ impl<A: App> Shell<A> {
         gpu.window.pre_present_notify();
         gpu.renderer.render(&scene, &view, gpu.target, gpu.config.width, gpu.config.height, scale);
         gpu.renderer.queue().present(frame);
+        // Widgets may copy while laying out (for example Vim yanks).
+        if let Some(t) = self.ui.take_clipboard()
+            && let Some(c) = &mut self.clipboard {
+                let _ = c.set_text(t);
+            }
         self.sync_blur_strength();
     }
 

@@ -279,6 +279,8 @@ pub(crate) struct RuntimeState {
     pub content_color: Option<Color>,
     pub window_focused: bool,
     pub modifiers: crate::event::Modifiers,
+    /// Reads the system clipboard on demand. Set by the windowing shell.
+    pub clipboard_reader: Option<Box<dyn FnMut() -> Option<String>>>,
 }
 
 /// Context handed to every widget method.
@@ -384,6 +386,15 @@ impl<'a, 'b> Cx<'a, 'b> {
     /// Put text on the system clipboard.
     pub fn copy(&mut self, text: String) {
         self.shared.runtime.clipboard_out = Some(text);
+    }
+
+    /// Reads the system clipboard now. Slower than [`clipboard`](Self::clipboard),
+    /// so call it only when the text is needed.
+    pub fn read_clipboard(&mut self) -> Option<String> {
+        if let Some(t) = &self.shared.runtime.clipboard_in {
+            return Some(t.clone());
+        }
+        self.shared.runtime.clipboard_reader.as_mut().and_then(|r| r())
     }
 
     /// Text from the system clipboard, read when a paste shortcut arrives.

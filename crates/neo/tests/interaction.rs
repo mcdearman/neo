@@ -275,3 +275,96 @@ mod editor {
         assert_eq!(h.app().doc.text(), "three\nfour");
     }
 }
+
+mod vim_editor {
+    use super::*;
+    use neo::widgets::{Action, Document, VimMode, VimRequest};
+
+    struct Ed {
+        doc: Document,
+        requests: Vec<VimRequest>,
+    }
+
+    impl App for Ed {
+        type Message = Action;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, a: Action) {
+            self.doc.apply(a);
+            self.requests.extend(self.doc.take_vim_requests());
+        }
+        fn view(&self) -> Element<Action> {
+            text_editor(&self.doc).on_action(|a| a).into()
+        }
+    }
+
+    #[test]
+    fn vim_keys_flow_through_the_widget() {
+        let mut doc = Document::new("alpha beta\ngamma");
+        doc.set_vim(true);
+        let mut h = Harness::new(Ed { doc, requests: vec![] }, Size::new(600.0, 300.0)).unwrap();
+        h.click(Point::new(80.0, 20.0));
+        h.key(Key::Character("0".into()), Modifiers::default());
+        h.type_text("dw");
+        assert_eq!(h.app().doc.text(), "beta\ngamma");
+        h.type_text("ciwdelta");
+        assert_eq!(h.app().doc.vim().unwrap().mode, VimMode::Insert);
+        h.key(Key::Escape, Modifiers::default());
+        assert_eq!(h.app().doc.text(), "delta\ngamma");
+        assert_eq!(h.app().doc.vim().unwrap().mode, VimMode::Normal);
+        h.type_text("vey");
+        assert_eq!(h.app().doc.vim().unwrap().mode, VimMode::Normal);
+        h.type_text(":w");
+        h.key(Key::Enter, Modifiers::default());
+        assert_eq!(h.app().requests, vec![VimRequest::Write]);
+        // Ctrl-R redoes in Vim mode instead of going to the application.
+        h.type_text("u");
+        assert_eq!(h.app().doc.text(), "beta\ngamma");
+        h.key(Key::Character("r".into()), Modifiers { ctrl: true, ..Default::default() });
+        assert_eq!(h.app().doc.text(), "delta\ngamma");
+    }
+}
+
+mod vim_clipboard {
+    use super::*;
+    use neo::widgets::{Action, Document};
+
+    struct Ed {
+        doc: Document,
+    }
+
+    impl App for Ed {
+        type Message = Action;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, a: Action) {
+            self.doc.apply(a);
+        }
+        fn view(&self) -> Element<Action> {
+            text_editor(&self.doc).on_action(|a| a).into()
+        }
+    }
+
+    #[test]
+    fn plus_register_uses_the_system_clipboard() {
+        let mut doc = Document::new("first line\nsecond");
+        doc.set_vim(true);
+        let mut h = Harness::new(Ed { doc }, Size::new(600.0, 300.0)).unwrap();
+        h.click(Point::new(40.0, 20.0));
+        h.type_text("\"+yy");
+        assert_eq!(h.clipboard().as_deref(), Some("first line\n"));
+        h.set_clipboard("pasted");
+        h.type_text("j0\"+P");
+        assert_eq!(h.app().doc.lines()[1], "pastedsecond");
+        // With clipboard=unnamedplus, plain y and p use it too.
+        h.type_text(":set clipboard=unnamedplus");
+        h.key(Key::Enter, Modifiers::default());
+        h.set_clipboard("X");
+        h.type_text("0p");
+        assert_eq!(h.app().doc.lines()[1], "pXastedsecond");
+        h.type_text("yiw");
+        assert_eq!(h.clipboard().as_deref(), Some("pXastedsecond"));
+    }
+}

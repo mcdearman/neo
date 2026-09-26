@@ -99,6 +99,11 @@ impl<A: App> Ui<A> {
         self.rt.modifiers = m;
     }
 
+    /// Lets widgets read the system clipboard on demand.
+    pub fn set_clipboard_reader(&mut self, reader: Box<dyn FnMut() -> Option<String>>) {
+        self.rt.clipboard_reader = Some(reader);
+    }
+
     /// Text to hand to widgets on the next paste shortcut.
     pub fn set_clipboard(&mut self, text: Option<String>) {
         self.rt.clipboard_in = text;
@@ -157,6 +162,11 @@ impl<A: App> Ui<A> {
             root.place(Point::ZERO);
             self.needs_layout = false;
         }
+    }
+
+    /// Rebuilds and lays out the view if anything changed.
+    pub fn refresh(&mut self, text: &mut TextSystem) {
+        self.ensure(text);
     }
 
     /// Draws a frame.

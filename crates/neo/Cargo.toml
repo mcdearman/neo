@@ -11,6 +11,7 @@ neo-render.workspace = true
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 winit = "0.30"
 pollster = "1.0.1"
+regex = "1.13.1"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 window-vibrancy = "0.8.1"

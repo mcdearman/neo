@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use neo_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::Color;
 
-use super::document::{text_between, Action, Document, Motion, Pos};
+use super::document::{text_between, Action, ClipboardNeed, Document, Motion, Pos, Scroll, VimView};
 use super::highlight::{highlight, Language, SyntaxColors};
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
 use crate::event::{Event, Key, PointerButton, Status};
@@ -16,6 +16,9 @@ struct EditorState {
     last_click: Option<(Instant, Pos)>,
     blink_origin: Option<Instant>,
     view: Size,
+    /// Serials of the last Vim clipboard write and scroll request handled.
+    clip_serial: u64,
+    scroll_serial: u64,
 }
 
 /// A multi-line code editor with line numbers and syntax highlighting.
@@ -25,8 +28,12 @@ struct EditorState {
 pub struct TextEditor<M> {
     lines: Vec<String>,
     cursor: Pos,
-    anchor: Pos,
+    selection: Option<(Pos, Pos, bool)>,
+    block_caret: bool,
+    vim: Option<VimView>,
     revision: u64,
+    /// First visible line and number of whole visible lines, for Vim.
+    viewport: (usize, usize),
     language: Language,
     on_action: Option<Box<dyn Fn(Action) -> M>>,
     width: Length,
@@ -47,8 +54,11 @@ impl<M> TextEditor<M> {
         Self {
             lines: doc.lines().to_vec(),
             cursor: doc.cursor(),
-            anchor: doc.anchor(),
+            selection: doc.display_selection(),
+            block_caret: doc.block_caret(),
+            vim: doc.vim_view(),
             revision: doc.revision(),
+            viewport: (0, 0),
             language: Language::Plain,
             on_action: None,
             width: Length::Fill,
@@ -92,12 +102,26 @@ impl<M> TextEditor<M> {
     }
 
     fn selection(&self) -> Option<(Pos, Pos)> {
-        (self.cursor != self.anchor).then(|| (self.cursor.min(self.anchor), self.cursor.max(self.anchor)))
+        self.selection.map(|(a, b, _)| (a, b))
+    }
+
+    /// The selected text as the document would copy it.
+    fn selected_text(&self) -> Option<String> {
+        if let Some(block) = self.vim.as_ref().and_then(|v| v.block) {
+            return Some(block.text(&self.lines));
+        }
+        let (a, b, linewise) = self.selection?;
+        Some(if linewise { self.lines[a.line..=b.line].join("\n") + "\n" } else { text_between(&self.lines, a, b) })
     }
 
     fn row(&self, line: usize) -> Option<&TextLayout> {
         line.checked_sub(self.first).and_then(|i| self.rows.get(i))
     }
+}
+
+/// Ctrl keys that Vim mode handles; the rest go to the application.
+fn vim_ctrl(key: &Key) -> bool {
+    matches!(key, Key::Character(c) if matches!(c.as_str(), "r" | "d" | "u" | "f" | "b" | "n" | "p" | "w" | "h" | "[" | "c" | "e" | "y" | "v"))
 }
 
 /// Shorthand for [`TextEditor::new`].
@@ -195,8 +219,28 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         };
         let (line_h, cursor, revision) = (self.line_h, self.cursor, self.revision);
         let caret = if cursor.col > 0 { cursor_line_layout.caret(cursor.col).x } else { 0.0 };
+        // Vim: copy yanks to the system clipboard once each.
+        if let Some((serial, text)) = self.vim.as_ref().and_then(|v| v.clipboard.clone())
+            && cx.state::<EditorState>().clip_serial != serial {
+                cx.state::<EditorState>().clip_serial = serial;
+                cx.copy(text);
+            }
+        let scroll_request = self.vim.as_ref().and_then(|v| v.scroll);
         let st = cx.state::<EditorState>();
         st.view = size;
+        // Vim scroll requests (`zz`, `Ctrl-e`, `Ctrl-d`) come before keeping the cursor in view.
+        if let Some((serial, request)) = scroll_request
+            && st.scroll_serial != serial {
+                st.scroll_serial = serial;
+                let cursor_top = cursor.line as f32 * line_h;
+                match request {
+                    Scroll::Center => st.scroll.y = cursor_top + PAD_Y + line_h * 0.5 - size.h * 0.5,
+                    Scroll::Top => st.scroll.y = cursor_top,
+                    Scroll::Bottom => st.scroll.y = cursor_top + line_h + PAD_Y * 2.0 - size.h,
+                    Scroll::Lines(n) => st.scroll.y += n as f32 * line_h,
+                }
+                st.scroll.y = st.scroll.y.clamp(0.0, max_y);
+            }
         if st.last_cursor != Some((cursor, revision as usize)) {
             let moved = st.last_cursor.is_some_and(|(p, _)| p != cursor) || st.last_cursor.is_none_or(|(_, r)| r != revision as usize);
             st.last_cursor = Some((cursor, revision as usize));
@@ -218,6 +262,10 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         st.scroll.y = st.scroll.y.clamp(0.0, max_y);
         st.scroll.x = st.scroll.x.clamp(0.0, max_x);
         let scroll = st.scroll;
+
+        let top = ((scroll.y - PAD_Y).max(0.0) / self.line_h).ceil() as usize;
+        let whole = ((size.h - PAD_Y * 2.0) / self.line_h).floor().max(1.0) as usize;
+        self.viewport = (top.min(self.lines.len() - 1), whole);
 
         // Lay out only the visible lines.
         self.first = ((scroll.y - PAD_Y) / self.line_h).floor().max(0.0) as usize;
@@ -261,8 +309,9 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let sel = self.selection();
 
         cx.scene.push_clip(b);
+        let block = self.vim.as_ref().and_then(|v| v.block);
         // Current line.
-        if sel.is_none() {
+        if sel.is_none() && block.is_none() {
             let y = self.line_y(b, scroll, self.cursor.line);
             cx.scene.fill(Rect::new(b.x, y, b.w, self.line_h), 0.0, p.accent.with_alpha(if focused { 0.08 } else { 0.04 }), None);
         }
@@ -270,12 +319,29 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         cx.scene.push_clip(text_area);
         let tx = self.text_x(b, scroll);
         if let Some((s, e)) = sel {
+            let linewise = self.selection.is_some_and(|x| x.2);
             let sel_color = p.accent.with_alpha(if focused { 0.28 } else { 0.16 });
             for line in s.line.max(self.first)..=e.line.min(self.first + self.rows.len().saturating_sub(1)) {
-                let from = if line == s.line { self.caret_x(line, s.col) } else { 0.0 };
-                let to = if line == e.line { self.caret_x(line, e.col) } else { self.caret_x(line, self.lines[line].len()) + self.char_w * 0.6 };
+                let from = if line == s.line && !linewise { self.caret_x(line, s.col) } else { 0.0 };
+                let to = if line == e.line && !linewise { self.caret_x(line, e.col) } else { self.caret_x(line, self.lines[line].len()) + self.char_w * 0.6 };
                 if to > from {
                     let y = self.line_y(b, scroll, line);
+                    cx.scene.fill(Rect::new(tx + from, y, to - from, self.line_h), 3.0, sel_color, None);
+                }
+            }
+        }
+        if let Some(bl) = block {
+            let sel_color = p.accent.with_alpha(if focused { 0.28 } else { 0.16 });
+            for line in bl.first_line.max(self.first)..=bl.last_line.min(self.first + self.rows.len().saturating_sub(1)) {
+                let text = &self.lines[line];
+                let y = self.line_y(b, scroll, line);
+                let (from, to) = match bl.bytes(text) {
+                    Some((a, e)) => (self.caret_x(line, a), if e >= text.len() && !bl.to_end { self.caret_x(line, text.len()) } else { self.caret_x(line, e) }),
+                    // Short lines: show the block's columns as empty space.
+                    None => (bl.first_col as f32 * self.char_w, bl.first_col as f32 * self.char_w),
+                };
+                let to = if bl.to_end { to + self.char_w * 0.6 } else { to };
+                if to > from {
                     cx.scene.fill(Rect::new(tx + from, y, to - from, self.line_h), 3.0, sel_color, None);
                 }
             }
@@ -285,7 +351,24 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let y = self.line_y(b, scroll, self.first + i);
             cx.scene.text(layout, Point::new(tx.round(), (y + (self.line_h - layout.size().h) * 0.5).round()), default);
         }
-        if focused {
+        if self.block_caret {
+            // Vim Normal and Visual modes: a steady block over the character.
+            let line = &self.lines[self.cursor.line];
+            let x0 = self.caret_x(self.cursor.line, self.cursor.col);
+            let x1 = if self.cursor.col < line.len() {
+                let next = line[self.cursor.col..].chars().next().map_or(line.len(), |c| self.cursor.col + c.len_utf8());
+                self.caret_x(self.cursor.line, next)
+            } else {
+                x0 + self.char_w
+            };
+            let y = self.line_y(b, scroll, self.cursor.line);
+            let rect = Rect::new((tx + x0).round(), y + 1.0, (x1 - x0).max(self.char_w * 0.5).round(), self.line_h - 2.0);
+            if focused {
+                cx.scene.fill(rect, 2.0, p.accent_text.with_alpha(0.45), None);
+            } else {
+                cx.scene.fill(rect, 2.0, Color::TRANSPARENT, Some((1.0, p.accent_text.with_alpha(0.7))));
+            }
+        } else if focused {
             let since = blink_origin.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
             if theme.reduce_motion || since % 1.06 < 0.53 {
                 let x = tx + self.caret_x(self.cursor.line, self.cursor.col);
@@ -391,6 +474,28 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 send(cx, Action::Insert(t.clone()));
                 Status::Captured
             }
+            Event::Key(k) if k.pressed && cx.is_focused() && self.vim.is_some() && !k.modifiers.logo && (!k.modifiers.ctrl || vim_ctrl(&k.key)) => {
+                // Vim mode: the document interprets every key. Cmd/Super
+                // shortcuts, and Ctrl keys Vim does not use, fall through
+                // to the clipboard and application shortcuts below.
+                let view = self.vim.as_ref().expect("vim view present in vim mode");
+                if view.viewport != self.viewport {
+                    let (top, lines) = self.viewport;
+                    send(cx, Action::Viewport { top, lines });
+                }
+                let paste = matches!(&k.key, Key::Character(c) if c == "p") && !k.modifiers.ctrl;
+                let needs = match view.clipboard_need {
+                    ClipboardNeed::Always => true,
+                    ClipboardNeed::OnPaste => paste,
+                    ClipboardNeed::None => false,
+                };
+                if needs
+                    && let Some(text) = cx.read_clipboard() {
+                        send(cx, Action::Clipboard(text));
+                    }
+                send(cx, Action::Key(k.clone()));
+                Status::Captured
+            }
             Event::Key(k) if k.pressed && cx.is_focused() => {
                 let m = k.modifiers;
                 let cmd = m.command();
@@ -440,8 +545,8 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                         "z" => Action::Undo,
                         "y" => Action::Redo,
                         "c" | "x" => {
-                            let Some((a, e)) = self.selection() else { return Status::Captured };
-                            cx.copy(text_between(&self.lines, a, e));
+                            let Some(text) = self.selected_text() else { return Status::Captured };
+                            cx.copy(text);
                             if c == "c" {
                                 return Status::Captured;
                             }
