@@ -64,12 +64,13 @@ impl Accent {
     /// The fill tone for this scheme: buttons, toggles, slider fills and gauges.
     pub fn tone(self, scheme: Scheme) -> Color {
         let (l, d) = match self {
+            // Dark teal, coral and amber are Monokai Pro's cyan, orange and yellow.
             // Dark royal is deliberately deep so it reads like the light-scheme blue
             // against a dark surround. Text uses the lighter `text_tone`.
             Accent::Royal => (Color::hex(0x3F5BC4), Color::hex(0x546ED8)),
-            Accent::Teal => (Color::hex(0x1C7F72), Color::hex(0x5CCAB8)),
-            Accent::Coral => (Color::hex(0xC0533B), Color::hex(0xF29A83)),
-            Accent::Amber => (Color::hex(0x9A6A0E), Color::hex(0xE8B64E)),
+            Accent::Teal => (Color::hex(0x1C7F72), Color::hex(0x78DCE8)),
+            Accent::Coral => (Color::hex(0xC0533B), Color::hex(0xFC9867)),
+            Accent::Amber => (Color::hex(0x9A6A0E), Color::hex(0xFFD866)),
             Accent::Custom { light, dark } => (light, dark),
         };
         match scheme {
@@ -208,22 +209,23 @@ impl Palette {
                 shadow_dark: Color::hex(0xB6BECB),
                 shadow_light: Color::WHITE,
             },
+            // Monokai Pro colours over a #181818 background.
             Scheme::Dark => Self {
-                bg: Color::hex(0x2B3038),
-                surface: Color::hex(0x333945),
-                well: Color::hex(0x252930),
-                line: Color::hex(0x4A5263),
-                text: Color::hex(0xE4E8EF),
-                muted: Color::hex(0xA3ACBA),
-                faint: Color::hex(0x7C8595),
+                bg: Color::hex(0x181818),
+                surface: Color::hex(0x211F22),
+                well: Color::hex(0x141314),
+                line: Color::hex(0x3A383B),
+                text: Color::hex(0xFCFCFA),
+                muted: Color::hex(0x939293),
+                faint: Color::hex(0x727072),
                 accent,
                 accent_text,
                 on_accent,
-                good: Color::hex(0x5CCB92),
-                warn: Color::hex(0xE6B35A),
-                bad: Color::hex(0xEE8176),
-                shadow_dark: Color::hex(0x1B1E23),
-                shadow_light: Color::hex(0x3A404B),
+                good: Color::hex(0xA9DC76),
+                warn: Color::hex(0xFFD866),
+                bad: Color::hex(0xFF6188),
+                shadow_dark: Color::hex(0x0B0B0B),
+                shadow_light: Color::hex(0x272528),
             },
         }
     }

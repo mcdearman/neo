@@ -59,35 +59,58 @@ pub(crate) struct SyntaxColors {
     number: Color,
     comment: Color,
     macro_: Color,
+    attribute: Color,
     punct: Color,
+    heading: Color,
 }
 
 impl SyntaxColors {
     pub fn new(p: &Palette, scheme: Scheme, accent: Accent) -> Self {
-        // Types use teal, unless teal is the accent, in which case royal blue.
-        let ty = if accent == Accent::Teal { Accent::Royal } else { Accent::Teal };
-        Self {
-            keyword: p.accent_text,
-            ty: ty.text_tone(scheme),
-            function: Accent::Amber.text_tone(scheme),
-            string: p.good,
-            number: Accent::Coral.text_tone(scheme),
-            comment: p.muted,
-            macro_: Accent::Coral.text_tone(scheme),
-            punct: p.muted,
+        match scheme {
+            // Monokai Pro. Comments are brightened from #727072 to reach 4.5:1.
+            Scheme::Dark => Self {
+                keyword: Color::hex(0xFF6188),
+                ty: Color::hex(0x78DCE8),
+                function: Color::hex(0xA9DC76),
+                string: Color::hex(0xFFD866),
+                number: Color::hex(0xAB9DF2),
+                comment: Color::hex(0x8C898D),
+                macro_: Color::hex(0xA9DC76),
+                attribute: Color::hex(0xFC9867),
+                punct: Color::hex(0x939293),
+                heading: Color::hex(0xFF6188),
+            },
+            Scheme::Light => {
+                // Types use teal, unless teal is the accent, in which case royal blue.
+                let ty = if accent == Accent::Teal { Accent::Royal } else { Accent::Teal };
+                Self {
+                    keyword: p.accent_text,
+                    ty: ty.text_tone(scheme),
+                    function: Accent::Amber.text_tone(scheme),
+                    string: p.good,
+                    number: Accent::Coral.text_tone(scheme),
+                    comment: p.muted,
+                    macro_: Accent::Coral.text_tone(scheme),
+                    attribute: Accent::Coral.text_tone(scheme),
+                    punct: p.muted,
+                    heading: p.accent_text,
+                }
+            }
         }
     }
 
     pub fn color(&self, k: Kind) -> Option<Color> {
         match k {
             Kind::Plain => None,
-            Kind::Keyword | Kind::Heading => Some(self.keyword),
+            Kind::Keyword => Some(self.keyword),
+            Kind::Heading => Some(self.heading),
             Kind::Type => Some(self.ty),
             Kind::Function => Some(self.function),
             Kind::String => Some(self.string),
             Kind::Number => Some(self.number),
             Kind::Comment => Some(self.comment),
-            Kind::Macro | Kind::Attribute => Some(self.macro_),
+            Kind::Macro => Some(self.macro_),
+            Kind::Attribute => Some(self.attribute),
             Kind::Punct => Some(self.punct),
         }
     }
