@@ -1,27 +1,35 @@
 # Neo
 
-A cross-platform GUI toolkit in Rust, and the foundation for the Neo Linux desktop.
+A cross-platform GUI toolkit in Rust, a suite of desktop apps built with it, and the foundation for the Neo Linux desktop.
 
-Every widget paints through a theme, so one codebase renders in two styles:
+Every widget paints through a theme: a flat design with hairline borders and higher contrast, in light and dark schemes (dark uses Monokai Pro colours on #181818), with four accents: royal blue (default), teal, coral and amber. Users can adjust corner radius, text size and motion. **Glass** windows are translucent, and the compositor blurs what is behind them.
 
-- **Flat** (default): borders and fills with higher contrast.
-- **Soft**: neumorphic surfaces that are extruded from, or pressed into, the background.
+## The apps
 
-Both styles come in light and dark schemes with four accents: royal blue (default), teal, coral and amber. Users can adjust shadow depth, corner radius, text size and motion. **Glass** windows are translucent, and the compositor blurs what is behind them.
-
-## Try it
+| App | Package | What it does |
+|---|---|---|
+| Files | `neo-files` | Browse folders with places, breadcrumbs, back and forward, search, sortable columns and hidden files. Double-click or Enter opens with the default app. New folder, rename and Move to Trash (freedesktop.org Trash on Linux). |
+| Terminal | `neo-terminal` | A GPU-drawn terminal using `alacritty_terminal` for emulation and the pty: 256 and true colour, bold, underline, inverse, wide characters, scrollback, mouse selection, copy and paste, bracketed paste and window titles. |
+| Settings | `neo-settings` | Colour scheme, accent, corner radius, glass, text size and reduced motion, applied to every open Neo app at once; plus About this computer. |
+| System Monitor | `neo-monitor` | Processes with filter, sort and End process (with confirmation); per-core CPU, memory, swap and network history; disk usage. |
+| Calculator | `neo-calculator` | Type expressions with precedence, brackets, powers, `%`, `!`, functions, `π`, `e` and `ans`; the result previews as you type, and a history panel recalls past results. Basic and scientific keypads. |
+| Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
 
 ```sh
-cargo run -p neo --example gallery                  # live widget gallery
-cargo run -p neo --example gallery -- --glass --blur 24   # start with glass windows on
-cargo run -p neo --example gallery -- --snapshot target/snapshots   # PNGs of every style
-cargo run -p neo --example editor                   # Neo Code, a small code editor
-cargo run -p neo --example editor -- path/to/folder # edit a real folder (Cmd/Ctrl+S saves)
-cargo run -p neo-render --example primitives        # renderer test card
+cargo run -p neo-files [folder]
+cargo run -p neo-terminal [folder]
+cargo run -p neo-settings
+cargo run -p neo-monitor
+cargo run -p neo-calculator
+cargo run -p neo-code [folder]              # Cmd/Ctrl+S saves
+cargo run -p neo-files -- --snapshot target/snapshots   # every app renders PNGs this way
+cargo run -p neo --example gallery          # the widget gallery
 cargo test --workspace
 ```
 
-The gallery's Settings card changes the theme live.
+The apps share their appearance through `~/.config/neo/appearance.conf` (or `$XDG_CONFIG_HOME/neo`, or `$NEO_CONFIG_DIR`). Settings writes it; every app checks it about once a second and restyles itself.
+
+On Linux, `dist/install.sh` builds the apps and installs them with `.desktop` entries into `~/.local`, so they appear in the menus of GNOME, KDE Plasma or any other desktop. `dist/install.sh --uninstall` removes them.
 
 ## Writing an app
 
@@ -57,9 +65,11 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 | Crate | Role |
 |---|---|
-| `neo-theme` | Design tokens: palettes, the Flat and Soft materials, type scale, bundled fonts and 1,539 Lucide icons. No dependencies. |
+| `neo-theme` | Design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. No dependencies. |
 | `neo-render` | wgpu renderer. Every shape is one instanced SDF quad: rounded rects, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Includes dual-Kawase backdrop blur, glyphon text and PNG readback. |
 | `neo` | Widgets, layout, events, focus, animation, the winit shell and a headless test harness. |
+| `neo-desktop` | What the apps share: the appearance file and live reload, file helpers (standard folders, sizes, dates, Trash, open with the default app) and common layout pieces such as the sidebar and settings rows. |
+| `apps/*` | The desktop apps above, one binary each. |
 
 ### Widgets
 
@@ -80,8 +90,8 @@ The application carries out `:w` and `:q` through `Document::take_vim_requests`.
 
 ### How it works
 
-- **Surfaces, not colours.** Widgets ask the theme to paint a role such as card, raised, pressed, well, inset or accent. Flat or Soft is decided in one place, in `Theme::paint`.
-- **Pressed means active.** A raised surface can be pressed. A sunken or pressed surface is on, selected or being pressed. Transitions cross-fade the outer and inner shadows.
+- **Surfaces, not colours.** Widgets ask the theme to paint a role such as card, raised, pressed, well, inset or accent. How each role looks is decided in one place, in `Theme::paint`.
+- **Messages from anywhere.** `App::start` hands the app a `Proxy` that sends messages from other threads, such as the terminal's pty reader, and wakes the event loop. Widgets can report layout results, such as the terminal's size in cells, with `Cx::defer`.
 - **Widget state survives rebuilds.** Hover, focus, caret and animation state is keyed by tree position, or by an explicit `.key()`.
 - **Browser-style blending.** The canvas is sRGB-encoded and blends in sRGB space, so it matches the HTML mock-ups.
 - **Accessibility.** Keyboard focus with Tab and Shift+Tab, visible focus rings, contrast tested against WCAG AA, larger text and reduced motion.
@@ -101,6 +111,4 @@ Tested so far: macOS, both running and with the test suite. Linux and Windows ty
 
 ## Roadmap
 
-1. Toolkit gaps: overlays (menus, popovers, tooltips, dialogs), multi-line text editing, IME, AccessKit screen-reader support, lists with virtualised rows, images and async tasks.
-2. The Neo app suite built on the toolkit: files, music, calculator, system monitor and settings.
-3. The desktop: a Wayland compositor (smithay) that renders with `neo-render`, so glass blur, window shadows and rounded corners work the same for every app.
+See [docs/ROADMAP.md](docs/ROADMAP.md): from apps that run on any distro, to a Neo session on an existing distro, to a Neo distribution.
