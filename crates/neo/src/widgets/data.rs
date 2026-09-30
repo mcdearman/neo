@@ -3,18 +3,29 @@
 use neo_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::{Color, Surface, TextRole};
 
+use super::style::Tone;
 use crate::core::{Cx, DrawCx, Length, Limits, Widget};
+
+/// The fill colour for a data widget: the accent fill for `Tone::Accent`,
+/// otherwise the tone's colour.
+fn fill_color(tone: Tone, p: &neo_theme::Palette) -> Color {
+    match tone {
+        Tone::Accent | Tone::Inherit => p.accent,
+        t => t.resolve(p.accent, p),
+    }
+}
 
 /// A horizontal bar showing progress from 0 to 1.
 pub struct ProgressBar {
     value: f32,
     width: Length,
     height: f32,
+    tone: Tone,
 }
 
 impl ProgressBar {
     pub fn new(value: f32) -> Self {
-        Self { value: value.clamp(0.0, 1.0), width: Length::Fill, height: 10.0 }
+        Self { value: value.clamp(0.0, 1.0), width: Length::Fill, height: 10.0, tone: Tone::Accent }
     }
 
     pub fn width(mut self, w: impl Into<Length>) -> Self {
@@ -24,6 +35,12 @@ impl ProgressBar {
 
     pub fn height(mut self, h: f32) -> Self {
         self.height = h;
+        self
+    }
+
+    /// The fill colour. Accent by default.
+    pub fn tone(mut self, t: Tone) -> Self {
+        self.tone = t;
         self
     }
 }
@@ -50,7 +67,7 @@ impl<M> Widget<M> for ProgressBar {
         cx.scene.paint(b, r, &theme.paint(Surface::Inset));
         let inner = b.inset(2.0);
         let w = (inner.w * self.value).max(if self.value > 0.0 { inner.h } else { 0.0 });
-        cx.scene.fill(Rect::new(inner.x, inner.y, w, inner.h), inner.h * 0.5, theme.palette().accent, None);
+        cx.scene.fill(Rect::new(inner.x, inner.y, w, inner.h), inner.h * 0.5, fill_color(self.tone, &theme.palette()), None);
     }
 }
 
@@ -103,17 +120,15 @@ impl<M> Widget<M> for Gauge {
         cx.scene.paint(disc, d * 0.5, &theme.paint(Surface::Raised));
         let ring = disc.inset(d * 0.09);
         let thick = d * 0.08;
-        let track = if theme.is_soft() { p.bg.mix(p.shadow_dark, 0.45) } else { p.well.mix(p.line, 0.4) };
+        let track = p.well.mix(p.line, 0.4);
         cx.scene.arc(ring, thick, 0.0, std::f32::consts::TAU, track);
         if self.value > 0.0 {
             cx.scene.arc(ring, thick, 0.0, std::f32::consts::TAU * self.value, self.color.unwrap_or(p.accent));
         }
         let core = disc.inset(d * 0.21);
         let mut inset = theme.paint(Surface::Inset);
-        if !theme.is_soft() {
-            inset.border = None;
-            inset.fill = p.surface;
-        }
+        inset.border = None;
+        inset.fill = p.surface;
         cx.scene.paint(core, core.w * 0.5, &inset);
         if let Some(l) = &self.layout {
             let s = l.size();
@@ -130,12 +145,13 @@ pub struct Sparkline {
     max: f32,
     width: Length,
     height: f32,
+    tone: Tone,
 }
 
 impl Sparkline {
     /// Plots `values` against the range `min..max`.
     pub fn new(values: impl Into<Vec<f32>>, min: f32, max: f32) -> Self {
-        Self { values: values.into(), min, max, width: Length::Fill, height: 84.0 }
+        Self { values: values.into(), min, max, width: Length::Fill, height: 84.0, tone: Tone::Accent }
     }
 
     pub fn width(mut self, w: impl Into<Length>) -> Self {
@@ -145,6 +161,12 @@ impl Sparkline {
 
     pub fn height(mut self, h: f32) -> Self {
         self.height = h;
+        self
+    }
+
+    /// The line colour. Accent by default.
+    pub fn tone(mut self, t: Tone) -> Self {
+        self.tone = t;
         self
     }
 }
@@ -186,9 +208,10 @@ impl<M> Widget<M> for Sparkline {
                 Point::new(b.x + b.w * i as f32 / n as f32, b.y + 3.0 + (b.h - 6.0) * (1.0 - t))
             })
             .collect();
-        cx.scene.area(&pts, b.bottom(), p.accent.with_alpha(0.26), p.accent.with_alpha(0.02));
-        cx.scene.polyline(&pts, 2.0, p.accent);
+        let c = fill_color(self.tone, &p);
+        cx.scene.area(&pts, b.bottom(), c.with_alpha(0.26), c.with_alpha(0.02));
+        cx.scene.polyline(&pts, 2.0, c);
         let last = *pts.last().unwrap();
-        cx.scene.fill(Rect::new(last.x - 4.0, last.y - 4.0, 8.0, 8.0), 4.0, p.accent, Some((2.0, p.surface)));
+        cx.scene.fill(Rect::new(last.x - 4.0, last.y - 4.0, 8.0, 8.0), 4.0, c, Some((2.0, p.surface)));
     }
 }

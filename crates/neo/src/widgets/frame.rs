@@ -66,7 +66,7 @@ impl<M: 'static> Widget<M> for Frame<M> {
         let p = theme.palette();
         let radius = if self.rounded { theme.window_radius() } else { 0.0 };
         let mut window = theme.paint(Surface::Window);
-        if self.rounded && !theme.is_soft() {
+        if self.rounded {
             window.border = Some((1.0, p.line.with_alpha(if theme.glass.enabled { 0.5 } else { 1.0 })));
         }
         cx.scene.paint(b, radius, &window);

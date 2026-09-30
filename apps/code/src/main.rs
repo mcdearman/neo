@@ -1,14 +1,15 @@
 //! Neo Code: a small code editor built with Neo, with optional Vim keys.
 //!
-//!     cargo run -p neo --example editor                 # sample project
-//!     cargo run -p neo --example editor -- path/to/dir  # a real folder (Cmd/Ctrl+S saves)
-//!     cargo run -p neo --example editor -- --snapshot target/snapshots
+//!     cargo run -p neo-code                  # sample project
+//!     cargo run -p neo-code -- path/to/dir   # a real folder (Cmd/Ctrl+S saves)
+//!     cargo run -p neo-code -- --snapshot target/snapshots
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use neo::prelude::*;
 use neo::{Key, KeyEvent, Size};
+use neo_desktop::Desktop;
 
 // ---------------------------------------------------------------------------
 // Sample project, shown when no folder is given.
@@ -181,10 +182,10 @@ struct NeoCode {
     nodes: Vec<Node>,
     tabs: Vec<Tab>,
     active: Option<usize>,
-    style: Style,
     dark: Option<bool>,
     toast: Option<String>,
     vim: bool,
+    desktop: Desktop,
 }
 
 #[derive(Clone, Debug)]
@@ -195,9 +196,9 @@ enum Msg {
     Close(usize),
     Edit(Action),
     Save,
-    Style(Style),
     ToggleScheme,
     ClearToast,
+    Poll,
     Vim(bool),
 }
 
@@ -218,7 +219,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None, vim: true };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, vim: true, desktop: Desktop::load() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -252,7 +253,7 @@ impl NeoCode {
         let mut nodes = vec![];
         walk(root, "", 0, &mut nodes);
         let project = root.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| root.display().to_string());
-        Self { project, nodes, tabs: vec![], active: None, style: Style::Flat, dark: None, toast: None, vim: true }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, vim: true, desktop: Desktop::load() }
     }
 
     fn visible_nodes(&self) -> Vec<usize> {
@@ -287,6 +288,13 @@ fn file_icon(name: &str) -> neo::theme::Icon {
     }
 }
 
+impl NeoCode {
+    /// Whether the window is dark: the override if set, else the desktop setting.
+    fn is_dark(&self) -> bool {
+        self.dark.unwrap_or(self.desktop.appearance.scheme == neo_desktop::SchemePref::Dark)
+    }
+}
+
 impl App for NeoCode {
     type Message = Msg;
 
@@ -298,20 +306,26 @@ impl App for NeoCode {
     }
 
     fn window(&self) -> WindowSettings {
-        WindowSettings { size: Size::new(1280.0, 820.0), ..Default::default() }
+        WindowSettings { size: Size::new(1280.0, 820.0), app_id: Some("org.neo.Code".into()), ..Default::default() }
     }
 
     fn theme(&self, system: Scheme) -> Theme {
-        let scheme = match self.dark {
-            Some(true) => Scheme::Dark,
-            Some(false) => Scheme::Light,
-            None => system,
-        };
-        Theme { style: self.style, scheme, radius: 14.0, ..Theme::default() }
+        let mut theme = self.desktop.theme(system);
+        // The sun and moon button overrides the desktop's scheme for this window.
+        match self.dark {
+            Some(true) => theme.scheme = Scheme::Dark,
+            Some(false) => theme.scheme = Scheme::Light,
+            None => {}
+        }
+        theme
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
-        if self.toast.is_some() { vec![Subscription::every(Duration::from_secs(3), Msg::ClearToast)] } else { vec![] }
+        let mut subs = vec![Desktop::subscription(Msg::Poll)];
+        if self.toast.is_some() {
+            subs.push(Subscription::every(Duration::from_secs(3), Msg::ClearToast));
+        }
+        subs
     }
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
@@ -417,11 +431,13 @@ impl App for NeoCode {
                     Err(e) => self.toast = Some(format!("Couldn't save {}: {e}", t.name)),
                 }
             }
-            Msg::Style(s) => self.style = s,
             Msg::ToggleScheme => {
-                self.dark = Some(!self.dark.unwrap_or(false));
+                self.dark = Some(!self.is_dark());
             }
             Msg::ClearToast => self.toast = None,
+            Msg::Poll => {
+                self.desktop.poll();
+            }
         }
     }
 
@@ -496,7 +512,7 @@ impl NeoCode {
 
         let editor: Element<Msg> = match self.active_tab() {
             Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).into_element_keyed(&t.path))
-                .surface(if self.style == Style::Soft { Surface::Well } else { Surface::Card })
+                .surface(Surface::Card)
                 .padding(4.0)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -509,7 +525,7 @@ impl NeoCode {
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
                     .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work in Vim mode").role(TextRole::Caption).tone(Tone::Faint)),
             )
-            .surface(if self.style == Style::Soft { Surface::Well } else { Surface::Card })
+            .surface(Surface::Card)
             .center()
             .width(Length::Fill)
             .height(Length::Fill)
@@ -558,8 +574,7 @@ impl NeoCode {
         if let Some(msg) = &self.toast {
             left = left.push(row().spacing(6.0).align(Align::Center).push(icon(icons::CIRCLE_CHECK).size(14.0).tone(Tone::Good)).push(text(msg.clone()).role(TextRole::Caption).tone(Tone::Good)));
         }
-        let style_idx = if self.style == Style::Flat { 0 } else { 1 };
-        let dark = self.dark.unwrap_or(false);
+        let dark = self.is_dark();
         row()
             .width(Length::Fill)
             .align(Align::Center)
@@ -568,7 +583,6 @@ impl NeoCode {
             .push(left)
             .push(Space::fill_x())
             .push(row().spacing(8.0).align(Align::Center).push(text("Vim").role(TextRole::Caption).tone(Tone::Muted)).push(toggle(self.vim, Msg::Vim)))
-            .push(segmented(["Flat", "Soft"], Some(style_idx), |i| Msg::Style(if i == 0 { Style::Flat } else { Style::Soft })))
             .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 34.0).on_press(Msg::ToggleScheme))
             .into()
     }
@@ -594,7 +608,7 @@ fn main() {
         Some(dir) => {
             let p = PathBuf::from(dir);
             if !p.is_dir() {
-                eprintln!("editor: {dir} is not a folder");
+                eprintln!("neo-code: {dir} is not a folder");
                 std::process::exit(2);
             }
             NeoCode::folder(&p)
@@ -602,7 +616,7 @@ fn main() {
         None => NeoCode::sample(),
     };
     if let Err(e) = neo::run(app) {
-        eprintln!("editor: {e}");
+        eprintln!("neo-code: {e}");
         std::process::exit(1);
     }
 }
@@ -611,22 +625,21 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     use neo::{Modifiers, Point};
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, style, dark) in [("editor-flat-light", Style::Flat, false), ("editor-flat-dark", Style::Flat, true), ("editor-soft-light", Style::Soft, false), ("editor-soft-dark", Style::Soft, true)] {
+    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true)] {
         let mut app = NeoCode::sample();
-        app.style = style;
         app.dark = Some(dark);
         let mut h = Harness::new(app, Size::new(1280.0, 820.0)).expect("GPU");
         // Focus the editor, then use Vim keys: move down, select to the end of a word.
         h.click(Point::new(700.0, 300.0));
         match name {
-            "editor-flat-light" => {
+            "editor-light" => {
                 // Visual Block over three lines.
                 h.type_text("7jw");
                 h.key(Key::Character("v".into()), Modifiers { ctrl: true, ..Default::default() });
                 h.type_text("2je");
             }
-            "editor-flat-dark" => h.type_text("jVj"),
-            "editor-soft-light" => h.type_text("jA // edited"),
+            "editor-dark" => h.type_text("jVj"),
+            "editor-insert" => h.type_text("jA // edited"),
             _ => h.type_text("qad2"),
         }
         let path = dir.join(format!("{name}.png"));

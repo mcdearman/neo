@@ -1,21 +1,21 @@
 //! Renders every primitive to `target/primitives.png`.
 
 use neo_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
-use neo_theme::{Color, Style, Surface, Theme};
+use neo_theme::{Color, Scheme, Surface, Theme};
 
 fn main() {
     let mut r = Renderer::headless().expect("GPU");
     let (w, h, scale) = (900.0, 520.0, 2.0);
     let mut scene = Scene::new(Color::TRANSPARENT);
 
-    for (col, style) in [Style::Soft, Style::Flat].into_iter().enumerate() {
-        let theme = Theme { style, ..Theme::default() };
+    for (col, scheme) in [Scheme::Light, Scheme::Dark].into_iter().enumerate() {
+        let theme = Theme { scheme, ..Theme::default() };
         let p = theme.palette();
         let x0 = col as f32 * 450.0;
         let panel = Rect::new(x0, 0.0, 450.0, h);
         scene.fill(panel, 0.0, p.bg, None);
 
-        let title = r.text().layout(if col == 0 { "Soft" } else { "Flat" }, &TextStyle { size: 22.0, weight: 800, ..Default::default() }, None);
+        let title = r.text().layout(if col == 0 { "Light" } else { "Dark" }, &TextStyle { size: 22.0, weight: 800, ..Default::default() }, None);
         scene.text(&title, Point::new(x0 + 30.0, 24.0), p.text);
 
         let surfaces = [(Surface::Card, "Card"), (Surface::Raised, "Raised"), (Surface::Pressed, "Pressed"), (Surface::Well, "Well"), (Surface::Accent, "Accent")];

@@ -1,0 +1,10 @@
+[package]
+name = "neo-files"
+description = "Neo Files: browse, open and organise files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "neo-code"
+description = "Neo Code: a code editor with optional Vim keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true

@@ -40,6 +40,10 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
     let settings = app.window();
     let mut ui = Ui::new(app, settings.size, Scheme::Light);
+    let waker = event_loop.create_proxy();
+    ui.start(Arc::new(move || {
+        let _ = waker.send_event(());
+    }));
     if let Ok(mut clipboard) = arboard::Clipboard::new() {
         ui.set_clipboard_reader(Box::new(move || clipboard.get_text().ok()));
     }
@@ -108,6 +112,13 @@ impl<A: App> Shell<A> {
             .with_resizable(s.resizable);
         if let Some(m) = s.min_size {
             attrs = attrs.with_min_inner_size(LogicalSize::new(m.w as f64, m.h as f64));
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "ios")))]
+        if let Some(id) = &s.app_id {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs = WindowAttributesExtWayland::with_name(attrs, id.clone(), id.clone());
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = WindowAttributesExtX11::with_name(attrs, id.clone(), id.clone());
         }
         #[cfg(target_os = "macos")]
         {

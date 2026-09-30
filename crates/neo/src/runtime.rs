@@ -1,9 +1,11 @@
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use neo_render::{Point, Rect, Scene, Size, TextSystem};
 use neo_theme::{Color, Scheme, Theme};
 
-use crate::app::{App, Decorations};
+use crate::app::{App, Decorations, Proxy};
 use crate::core::{CursorIcon, Cx, DrawCx, Element, EventCx, IdPass, Limits, Node, RuntimeState, Shared, StateStore, WidgetId, WindowRequest};
 use crate::event::{Event, Key, Status};
 use crate::widgets::frame::Frame;
@@ -24,6 +26,7 @@ pub struct Ui<A: App> {
     needs_view: bool,
     needs_layout: bool,
     timers: Vec<(Duration, Instant)>,
+    inbox: Option<Receiver<A::Message>>,
 }
 
 impl<A: App> Ui<A> {
@@ -43,7 +46,16 @@ impl<A: App> Ui<A> {
             needs_view: true,
             needs_layout: true,
             timers: vec![],
+            inbox: None,
         }
+    }
+
+    /// Calls [`App::start`] with a proxy whose sends call `wake`.
+    pub fn start(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let (tx, rx) = channel();
+        self.inbox = Some(rx);
+        self.app.start(Proxy { tx, wake });
+        self.needs_view = true;
     }
 
     pub fn app(&self) -> &A {
@@ -162,6 +174,20 @@ impl<A: App> Ui<A> {
             root.place(Point::ZERO);
             self.needs_layout = false;
         }
+        self.apply_deferred();
+    }
+
+    /// Applies messages widgets sent with [`Cx::defer`](crate::Cx::defer).
+    fn apply_deferred(&mut self) {
+        if self.rt.deferred.is_empty() {
+            return;
+        }
+        for m in std::mem::take(&mut self.rt.deferred) {
+            if let Ok(m) = m.downcast::<A::Message>() {
+                self.app.update(*m);
+                self.needs_view = true;
+            }
+        }
     }
 
     /// Rebuilds and lays out the view if anything changed.
@@ -224,6 +250,7 @@ impl<A: App> Ui<A> {
             self.app.update(m);
             self.needs_view = true;
         }
+        self.apply_deferred();
         if self.rt.relayout {
             self.needs_layout = true;
         }
@@ -249,6 +276,15 @@ impl<A: App> Ui<A> {
 
     /// Fires due timers. Returns when the runtime next needs to wake up.
     pub fn tick(&mut self, now: Instant) -> Option<Instant> {
+        if let Some(rx) = &self.inbox {
+            let messages: Vec<_> = rx.try_iter().collect();
+            if !messages.is_empty() {
+                for m in messages {
+                    self.app.update(m);
+                }
+                self.needs_view = true;
+            }
+        }
         let subs = self.app.subscriptions();
         if subs.len() != self.timers.len() || subs.iter().zip(&self.timers).any(|(s, t)| s.period != t.0) {
             self.timers = subs.iter().map(|s| (s.period, now + s.period)).collect();

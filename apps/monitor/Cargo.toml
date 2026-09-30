@@ -1,0 +1,11 @@
+[package]
+name = "neo-monitor"
+description = "Neo System Monitor: processes, CPU, memory, disks and network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+sysinfo = { version = "0.37", default-features = false, features = ["system", "disk", "network", "user"] }

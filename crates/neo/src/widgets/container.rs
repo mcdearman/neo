@@ -159,7 +159,7 @@ impl<M: 'static> Widget<M> for Container<M> {
                 let r = self.radius.unwrap_or(theme.control_radius());
                 let p = theme.palette();
                 cx.scene.backdrop(b, r, theme.glass.blur, p.bg.with_alpha(0.45));
-                cx.scene.fill(b, r, Color::TRANSPARENT, Some((1.0, p.shadow_light.with_alpha(0.45))));
+                cx.scene.fill(b, r, Color::TRANSPARENT, Some((1.0, p.surface.with_alpha(0.45))));
                 self.child[0].draw(cx);
                 // Keep later siblings above the glass content.
                 cx.scene.push_layer();

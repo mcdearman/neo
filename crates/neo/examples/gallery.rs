@@ -20,10 +20,8 @@ enum SchemePref {
 
 struct Gallery {
     // Appearance
-    style: Style,
     scheme: SchemePref,
     accent: Accent,
-    depth: f32,
     radius: f32,
     large_text: bool,
     reduce_motion: bool,
@@ -62,10 +60,8 @@ impl Default for Gallery {
     fn default() -> Self {
         let cpu = (0..40).map(|i| 34.0 + 14.0 * (i as f32 / 4.0).sin() + ((i * 7) % 10) as f32).collect();
         Self {
-            style: Style::Flat,
             scheme: SchemePref::Auto,
             accent: Accent::Royal,
-            depth: 6.0,
             radius: 18.0,
             large_text: false,
             reduce_motion: false,
@@ -93,10 +89,8 @@ impl Default for Gallery {
 
 #[derive(Clone, Debug)]
 enum Msg {
-    Style(Style),
     Scheme(SchemePref),
     Accent(Accent),
-    Depth(f32),
     Radius(f32),
     LargeText(bool),
     ReduceMotion(bool),
@@ -141,14 +135,12 @@ impl App for Gallery {
 
     fn theme(&self, system: Scheme) -> Theme {
         Theme {
-            style: self.style,
             scheme: match self.scheme {
                 SchemePref::Auto => system,
                 SchemePref::Light => Scheme::Light,
                 SchemePref::Dark => Scheme::Dark,
             },
             accent: self.accent,
-            depth: self.depth,
             radius: self.radius,
             text_scale: if self.large_text { 1.18 } else { 1.0 },
             reduce_motion: self.reduce_motion,
@@ -166,10 +158,8 @@ impl App for Gallery {
 
     fn update(&mut self, m: Msg) {
         match m {
-            Msg::Style(s) => self.style = s,
             Msg::Scheme(s) => self.scheme = s,
             Msg::Accent(a) => self.accent = a,
-            Msg::Depth(d) => self.depth = d,
             Msg::Radius(r) => self.radius = r,
             Msg::LargeText(b) => self.large_text = b,
             Msg::ReduceMotion(b) => self.reduce_motion = b,
@@ -376,7 +366,7 @@ impl Gallery {
                 Button::new(row().spacing(10.0).align(Align::Center).push(icon(*g).size(17.0)).push(text(*name).role(TextRole::Strong)))
                     .kind(ButtonKind::Ghost)
                     .selected(i == 0)
-                    .on_press(Msg::Style(self.style))
+                    .on_press(Msg::Scheme(self.scheme))
                     .width(Length::Fill)
                     .padding([12.0, 10.0])
                     .align_x(Align::Start),
@@ -391,7 +381,6 @@ impl Gallery {
                     .on_press(Msg::Accent(*a)),
             )
         });
-        let style_idx = if self.style == Style::Flat { 0 } else { 1 };
         let scheme_idx = match self.scheme {
             SchemePref::Auto => 0,
             SchemePref::Light => 1,
@@ -400,11 +389,9 @@ impl Gallery {
         let pane = column()
             .spacing(18.0)
             .width(Length::Fill)
-            .push(setting("Style", "Flat uses borders and fills, with higher contrast. Soft uses light and shadow for depth.", segmented(["Flat", "Soft"], Some(style_idx), |i| Msg::Style(if i == 0 { Style::Flat } else { Style::Soft }))))
             .push(setting("Colour scheme", "Auto follows your system setting.", segmented(["Auto", "Light", "Dark"], Some(scheme_idx), |i| Msg::Scheme([SchemePref::Auto, SchemePref::Light, SchemePref::Dark][i]))))
             .push(setting("Accent", self.accent.name(), swatches))
             .push(Divider::horizontal())
-            .push(setting("Shadow depth", &format!("{} px. How far soft surfaces lift off the background.", self.depth), container(slider(2.0..=12.0, self.depth, Msg::Depth).step(1.0)).width(220.0)))
             .push(setting("Corner radius", &format!("{} px. Applies to windows and controls.", self.radius), container(slider(6.0..=32.0, self.radius, Msg::Radius).step(1.0)).width(220.0)))
             .push(Divider::horizontal())
             .push(setting("Glass windows", "Makes windows translucent and blurs what is behind them.", toggle(self.glass, Msg::Glass)))
@@ -527,14 +514,12 @@ fn main() {
         let dir = std::path::PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "target/snapshots".into()));
         std::fs::create_dir_all(&dir).expect("create snapshot dir");
         let variants = [
-            ("flat-light", Style::Flat, SchemePref::Light, false),
-            ("flat-dark", Style::Flat, SchemePref::Dark, false),
-            ("soft-light", Style::Soft, SchemePref::Light, false),
-            ("soft-dark", Style::Soft, SchemePref::Dark, false),
-            ("soft-light-glass", Style::Soft, SchemePref::Light, true),
+            ("light", SchemePref::Light, false),
+            ("dark", SchemePref::Dark, false),
+            ("light-glass", SchemePref::Light, true),
         ];
-        for (name, style, scheme, glass) in variants {
-            let app = Gallery { style, scheme, glass, playing: true, ..Default::default() };
+        for (name, scheme, glass) in variants {
+            let app = Gallery { scheme, glass, playing: true, ..Default::default() };
             let mut h = Harness::new(app, Size::new(1240.0, 900.0)).expect("GPU");
             h.click(neo::Point::new(800.0, 300.0));
             for k in ["1", "2", "8", "0", "×", "0", ".", "1", "5", "="] {

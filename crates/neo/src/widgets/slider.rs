@@ -107,9 +107,7 @@ impl<M: Clone + 'static> Widget<M> for Slider<M> {
         let thumb = Rect::new(cxpos - THUMB * 0.5, b.y + (b.h - THUMB) * 0.5, THUMB, THUMB);
         let paint = lerp_paint(&theme.paint(Surface::Raised), &theme.paint(Surface::Hovered), h);
         cx.scene.paint(thumb, THUMB * 0.5, &paint);
-        if !theme.is_soft() {
-            cx.scene.fill(thumb.inset(7.0), 4.0, p.accent.with_alpha(0.25 + 0.75 * h), None);
-        }
+        cx.scene.fill(thumb.inset(7.0), 4.0, p.accent.with_alpha(0.25 + 0.75 * h), None);
         cx.focus_ring(thumb, THUMB * 0.5);
     }
 

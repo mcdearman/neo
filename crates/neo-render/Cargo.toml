@@ -1,6 +1,6 @@
 [package]
 name = "neo-render"
-description = "GPU renderer for the Neo toolkit: SDF shapes, soft shadows, backdrop blur and text"
+description = "GPU renderer for the Neo toolkit: SDF shapes, Gaussian shadows, backdrop blur and text"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

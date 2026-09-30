@@ -1,0 +1,11 @@
+[package]
+name = "neo-settings"
+description = "Neo Settings: appearance, accessibility and system information"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }

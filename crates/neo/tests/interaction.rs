@@ -121,28 +121,28 @@ fn dragging_the_slider_snaps_to_steps() {
 }
 
 #[test]
-fn renders_every_style_without_panicking() {
-    for style in [Style::Flat, Style::Soft] {
+fn renders_every_scheme_without_panicking() {
+    {
         for scheme in [Scheme::Light, Scheme::Dark] {
-            struct One(Style, Scheme);
+            struct One(Scheme);
             impl App for One {
                 type Message = ();
                 fn update(&mut self, _: ()) {}
                 fn theme(&self, _: Scheme) -> Theme {
-                    Theme { style: self.0, scheme: self.1, ..Theme::default() }
+                    Theme { scheme: self.0, ..Theme::default() }
                 }
                 fn view(&self) -> Element<()> {
                     column().push(button("A")).push(gauge(0.5, "50%")).push(sparkline(vec![1.0, 3.0, 2.0], 0.0, 4.0)).into()
                 }
             }
-            let mut h = Harness::new(One(style, scheme), Size::new(200.0, 300.0)).unwrap();
+            let mut h = Harness::new(One(scheme), Size::new(200.0, 300.0)).unwrap();
             let px = h.render(1.0);
-            let bg = Theme { style, scheme, ..Theme::default() }.palette().bg.to_rgba8();
+            let bg = Theme { scheme, ..Theme::default() }.palette().bg.to_rgba8();
             // A pixel inside the window but away from widgets is the window background.
             let i = ((290 * 200 + 190) * 4) as usize;
             let got = &px[i..i + 4];
             let close = got.iter().zip(bg.iter()).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 2);
-            assert!(close, "{style:?}/{scheme:?}: expected background {bg:?}, got {got:?}");
+            assert!(close, "{scheme:?}: expected background {bg:?}, got {got:?}");
         }
     }
 }
@@ -366,5 +366,88 @@ mod vim_clipboard {
         assert_eq!(h.app().doc.lines()[1], "pXastedsecond");
         h.type_text("yiw");
         assert_eq!(h.clipboard().as_deref(), Some("pXastedsecond"));
+    }
+}
+
+mod runtime {
+    use super::*;
+    use neo::{Cx, DrawCx, Limits, Proxy, Widget};
+    use std::time::Duration;
+
+    /// Receives a message from another thread through its proxy.
+    #[derive(Default)]
+    struct Worker {
+        got: Vec<u32>,
+    }
+
+    impl App for Worker {
+        type Message = u32;
+        fn start(&mut self, proxy: Proxy<u32>) {
+            std::thread::spawn(move || {
+                proxy.send(7);
+                proxy.send(8);
+            });
+        }
+        fn update(&mut self, m: u32) {
+            self.got.push(m);
+        }
+        fn view(&self) -> Element<u32> {
+            text(format!("{:?}", self.got)).into()
+        }
+    }
+
+    #[test]
+    fn proxy_delivers_messages_from_other_threads() {
+        let mut h = Harness::new(Worker::default(), Size::new(200.0, 100.0)).unwrap();
+        for _ in 0..100 {
+            if h.app().got.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            h.advance(Duration::from_millis(5));
+        }
+        assert_eq!(h.app().got, [7, 8]);
+    }
+
+    /// A widget that reports its width during layout.
+    struct Measure;
+
+    impl Widget<f32> for Measure {
+        fn width(&self) -> Length {
+            Length::Fill
+        }
+        fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
+            cx.defer(limits.max.w);
+            Size::new(limits.max.w, 10.0)
+        }
+        fn draw(&self, _cx: &mut DrawCx) {}
+    }
+
+    #[derive(Default)]
+    struct Sized {
+        width: f32,
+    }
+
+    impl App for Sized {
+        type Message = f32;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, w: f32) {
+            self.width = w;
+        }
+        fn view(&self) -> Element<f32> {
+            Element::new(Measure)
+        }
+    }
+
+    #[test]
+    fn deferred_messages_reach_the_app_after_layout() {
+        let mut h = Harness::new(Sized::default(), Size::new(300.0, 100.0)).unwrap();
+        h.render(1.0);
+        assert_eq!(h.app().width, 300.0);
+        h.resize(Size::new(420.0, 100.0));
+        h.render(1.0);
+        assert_eq!(h.app().width, 420.0);
     }
 }

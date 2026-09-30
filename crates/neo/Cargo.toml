@@ -1,6 +1,6 @@
 [package]
 name = "neo"
-description = "A cross-platform GUI toolkit with Flat and Soft (neumorphic) styles"
+description = "A cross-platform GUI toolkit for the Neo desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

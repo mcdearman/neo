@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+GenericName=System Settings
+Comment=Change appearance and accessibility, and see information about this computer
+Exec=neo-settings
+Icon=preferences-system
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=preferences;appearance;accent;dark;theme;accessibility;about;
+StartupNotify=true
+StartupWMClass=org.neo.Settings

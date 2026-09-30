@@ -281,6 +281,8 @@ pub(crate) struct RuntimeState {
     pub modifiers: crate::event::Modifiers,
     /// Reads the system clipboard on demand. Set by the windowing shell.
     pub clipboard_reader: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// Messages sent outside the event pass, as the app's message type.
+    pub deferred: Vec<Box<dyn std::any::Any>>,
 }
 
 /// Context handed to every widget method.
@@ -381,6 +383,14 @@ impl<'a, 'b> Cx<'a, 'b> {
 
     pub fn is_hovered(&self) -> bool {
         self.pointer().is_some_and(|p| self.bounds.contains(p))
+    }
+
+    /// Sends a message to the app after the current pass, for example when
+    /// layout finds that a widget's size changed. `M` must be the app's
+    /// message type; anything else is dropped.
+    pub fn defer<M: 'static>(&mut self, message: M) {
+        self.shared.runtime.deferred.push(Box::new(message));
+        self.shared.runtime.redraw = true;
     }
 
     /// Put text on the system clipboard.

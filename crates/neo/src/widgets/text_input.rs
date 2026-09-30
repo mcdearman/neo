@@ -19,6 +19,12 @@ struct InputState {
     focus: Anim,
     scroll: f32,
     blink_origin: Option<Instant>,
+    /// Set once the field has been laid out, so autofocus happens only once.
+    mounted: bool,
+    /// The value as of the last layout or edit. A different value arriving
+    /// from the app means it was changed from outside, so the caret moves
+    /// to the end.
+    seen: Option<String>,
 }
 
 /// A single-line text field. The application owns the text: edits arrive
@@ -29,6 +35,8 @@ pub struct TextInput<M> {
     secure: bool,
     on_input: Option<Box<dyn Fn(String) -> M>>,
     on_submit: Option<M>,
+    on_cancel: Option<M>,
+    autofocus: bool,
     width: Length,
     padding: Padding,
     layout: Option<TextLayout>,
@@ -43,6 +51,8 @@ impl<M: Clone> TextInput<M> {
             secure: false,
             on_input: None,
             on_submit: None,
+            on_cancel: None,
+            autofocus: false,
             width: Length::Fill,
             padding: Padding::xy(14.0, 10.0),
             layout: None,
@@ -58,6 +68,18 @@ impl<M: Clone> TextInput<M> {
     /// Sent when the user presses Enter.
     pub fn on_submit(mut self, m: M) -> Self {
         self.on_submit = Some(m);
+        self
+    }
+
+    /// Sent when the user presses Escape.
+    pub fn on_cancel(mut self, m: M) -> Self {
+        self.on_cancel = Some(m);
+        self
+    }
+
+    /// Take keyboard focus, with all text selected, when the field first appears.
+    pub fn autofocus(mut self, a: bool) -> Self {
+        self.autofocus = a;
         self
     }
 
@@ -154,6 +176,7 @@ impl<M: Clone + 'static> TextInput<M> {
             st.cursor = new_cursor;
             st.anchor = new_cursor;
             st.blink_origin = Some(Instant::now());
+            st.seen = Some(v.clone());
         }
         if let Some(f) = &self.on_input {
             let m = f(v.clone());
@@ -184,8 +207,21 @@ impl<M: Clone + 'static> Widget<M> for TextInput<M> {
         self.placeholder_layout = Some(cx.text().layout(&self.placeholder, &style, None));
         let n = self.char_count();
         let st = cx.state::<InputState>();
+        if st.seen.as_ref().is_some_and(|s| *s != self.value) {
+            st.cursor = n;
+            st.anchor = n;
+        }
+        st.seen = Some(self.value.clone());
         st.cursor = st.cursor.min(n);
         st.anchor = st.anchor.min(n);
+        if self.autofocus && !st.mounted {
+            st.cursor = n;
+            st.anchor = 0;
+        }
+        let first = !std::mem::replace(&mut st.mounted, true);
+        if self.autofocus && first {
+            cx.request_focus();
+        }
         let h = style.size * style.line_height + self.padding.vertical();
         let l = limits.constrain(self.width, Length::Shrink);
         l.resolve(Size::new(if l.max.w.is_finite() { l.max.w } else { 220.0 }, h.round()))
@@ -207,7 +243,7 @@ impl<M: Clone + 'static> Widget<M> for TextInput<M> {
         }
         let radius = theme.control_radius() * 0.8;
         let mut focus_paint = theme.paint(Surface::Inset);
-        focus_paint.border = Some((if theme.is_soft() { 1.5 } else { 1.0 }, p.accent_text));
+        focus_paint.border = Some((1.0, p.accent_text));
         let paint = lerp_paint(&theme.paint(Surface::Inset), &focus_paint, f);
         cx.scene.paint(b, radius, &paint);
 
@@ -355,6 +391,9 @@ impl<M: Clone + 'static> Widget<M> for TextInput<M> {
                     Key::Escape => {
                         cx.release_focus();
                         cx.request_redraw();
+                        if let Some(m) = self.on_cancel.clone() {
+                            cx.emit(m);
+                        }
                     }
                     Key::Tab => return Status::Ignored,
                     Key::Character(c) if cmd => match c.as_str() {

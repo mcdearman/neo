@@ -29,6 +29,7 @@ impl<A: App> Harness<A> {
         let mut ui = Ui::new(app, size, Scheme::Light);
         let reader = clipboard.clone();
         ui.set_clipboard_reader(Box::new(move || reader.borrow().clone()));
+        ui.start(std::sync::Arc::new(|| {}));
         Ok(Self { ui, renderer, size, clock: Instant::now(), clipboard })
     }
 

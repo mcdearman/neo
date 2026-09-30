@@ -383,7 +383,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
 
         // Gutter: separator and line numbers.
         let sep = Rect::new(b.x + self.gutter_w - 1.0, b.y, 1.0, b.h);
-        cx.scene.fill(sep, 0.0, if theme.is_soft() { p.shadow_dark.with_alpha(0.6) } else { p.line.with_alpha(0.7) }, None);
+        cx.scene.fill(sep, 0.0, p.line.with_alpha(0.7), None);
         for (i, n) in self.numbers.iter().enumerate() {
             let line = self.first + i;
             let y = self.line_y(b, scroll, line);

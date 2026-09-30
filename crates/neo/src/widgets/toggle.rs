@@ -63,8 +63,7 @@ impl<M: 'static> Widget<M> for Toggle<M> {
         let track = Rect::new(b.x, b.y + (b.h - SWITCH.h) * 0.5, SWITCH.w, SWITCH.h);
         let r = track.h * 0.5;
         let mut paint = theme.paint(Surface::Inset);
-        let on_fill = if theme.is_soft() { p.bg.mix(p.accent, 0.75) } else { p.accent };
-        paint.fill = paint.fill.mix(on_fill, t);
+        paint.fill = paint.fill.mix(p.accent, t);
         if let Some((w, c)) = paint.border {
             paint.border = Some((w, c.mix(p.accent, t)));
         }
@@ -75,10 +74,8 @@ impl<M: 'static> Widget<M> for Toggle<M> {
         let x = track.x + 4.0 + (track.w - d - 8.0) * t;
         let knob = Rect::new(x, track.y + 4.0, d, d);
         let mut kp = theme.paint(Surface::Raised);
-        if !theme.is_soft() {
-            kp.fill = kp.fill.mix(Color::WHITE, t);
-            kp.border = kp.border.map(|(w, c)| (w, c.mix(p.accent, t)));
-        }
+        kp.fill = kp.fill.mix(Color::WHITE, t);
+        kp.border = kp.border.map(|(w, c)| (w, c.mix(p.accent, t)));
         cx.scene.paint(knob, d * 0.5, &kp);
     }
 

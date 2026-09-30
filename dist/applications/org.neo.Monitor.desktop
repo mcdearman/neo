@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=System Monitor
+GenericName=Task Manager
+Comment=See running processes and how your computer's resources are used
+Exec=neo-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;Utility;
+Keywords=process;task;cpu;memory;kill;network;disk;
+StartupNotify=true
+StartupWMClass=org.neo.Monitor

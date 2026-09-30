@@ -1,0 +1,10 @@
+[package]
+name = "neo-desktop"
+description = "Shared pieces of the Neo desktop apps: appearance settings, file helpers and common UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

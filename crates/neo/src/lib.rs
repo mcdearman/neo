@@ -7,7 +7,6 @@
 //! rebuilds.
 //!
 //! Every widget paints through the [`Theme`], so the same code renders in
-//! the **Flat** style (the default) or the neumorphic **Soft** style, in
 //! light or dark, with any accent, and with translucent **glass** windows.
 //!
 //! ```no_run
@@ -50,17 +49,17 @@ pub mod testing;
 pub mod widgets;
 
 pub use anim::Anim;
-pub use app::{App, Decorations, Subscription, WindowSettings};
+pub use app::{App, Decorations, Proxy, Subscription, WindowSettings};
 pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use runtime::Ui;
 pub use shell::{run, Error};
 
-pub use neo_render::{Corners, Point, Rect, Scene, Size};
-pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Style, Surface, TextRole, Theme, Weight};
+pub use neo_render::{Corners, FontFamily, Point, Rect, Scene, Size, TextLayout, TextStyle};
+pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, TextRole, Theme, Weight};
 
 /// Everything an application usually needs.
 pub mod prelude {
     pub use crate::widgets::*;
-    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, Glass, Length, Padding, Scheme, Style, Subscription, Surface, TextRole, Theme, Weight, WindowSettings};
+    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, Weight, WindowSettings};
 }

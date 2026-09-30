@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Calculator
+GenericName=Calculator
+Comment=Calculate with expressions, functions and history
+Exec=neo-calculator
+Icon=accessories-calculator
+Terminal=false
+Categories=Utility;Calculator;
+Keywords=math;arithmetic;scientific;
+StartupNotify=true
+StartupWMClass=org.neo.Calculator

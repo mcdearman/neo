@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,3 +11,5 @@ repository = "https://github.com/mcdearman/neo"
 [workspace.dependencies]
 neo-theme = { path = "crates/neo-theme" }
 neo-render = { path = "crates/neo-render" }
+neo = { path = "crates/neo" }
+neo-desktop = { path = "crates/neo-desktop" }

@@ -98,7 +98,7 @@ impl<M: 'static> Widget<M> for Segmented<M> {
             let r = r.translate(b.origin());
             let selected = self.selected == Some(i) || pressed == Some(i);
             let color = if selected {
-                let mut paint = if theme.is_soft() { theme.paint(Surface::Raised) } else { theme.paint(Surface::Pressed) };
+                let mut paint = theme.paint(Surface::Pressed);
                 paint.content = p.accent_text;
                 cx.scene.paint(r, theme.small_radius(), &paint);
                 p.accent_text

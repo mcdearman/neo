@@ -1,0 +1,11 @@
+[package]
+name = "neo-terminal"
+description = "Neo Terminal: a GPU-drawn terminal emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+alacritty_terminal = "0.25"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Neo Code
+GenericName=Code Editor
+Comment=Edit code and text, with optional Vim keys
+Exec=neo-code
+Icon=accessories-text-editor
+Terminal=false
+Categories=Development;TextEditor;Utility;
+Keywords=text;editor;code;vim;programming;
+StartupNotify=true
+StartupWMClass=org.neo.Code
