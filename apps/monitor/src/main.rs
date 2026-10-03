@@ -3,11 +3,17 @@
 //!     cargo run -p neo-monitor
 //!     cargo run -p neo-monitor -- --snapshot target/snapshots
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod detail;
+mod inspect;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use neo::prelude::*;
-use neo::{Key, KeyEvent, Size};
+use neo::{Key, KeyEvent, Proxy, Size};
 use neo_desktop::fs::{human_bytes_binary, human_size};
 use neo_desktop::ui::{nav_item, notice, section, split};
 use neo_desktop::Desktop;
@@ -30,6 +36,8 @@ enum SortBy {
     User,
     Cpu,
     Memory,
+    Swap,
+    Threads,
     Pid,
 }
 
@@ -42,6 +50,10 @@ struct Proc {
     /// Percent of the whole machine, 0 to 100.
     cpu: f32,
     memory: u64,
+    virtual_memory: u64,
+    threads: Option<u32>,
+    /// Swapped-out bytes, on systems that report it cheaply for every process.
+    swap: Option<u64>,
 }
 
 struct Monitor {
@@ -63,6 +75,9 @@ struct Monitor {
     selected: Option<Pid>,
     confirm_end: bool,
     status: Option<(Tone, String)>,
+    /// The process whose threads are shown in place of the process list.
+    inspect: Option<detail::Inspect>,
+    proxy: Option<Proxy<Msg>>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +87,12 @@ enum Msg {
     Query(String),
     Sort(SortBy),
     Select(Pid),
+    /// Show the selected process's threads, memory and swap.
+    Inspect,
+    CloseInspect,
+    ThreadSort(detail::ThreadSort),
+    /// A swap measurement finished, for the process with this ID.
+    Swap(u32, Option<u64>),
     Move(isize),
     End,
     ConfirmEnd,
@@ -111,6 +132,8 @@ impl Monitor {
             selected: None,
             confirm_end: false,
             status: None,
+            inspect: None,
+            proxy: None,
         };
         m.sample();
         m
@@ -131,6 +154,8 @@ impl Monitor {
         let (rx, tx) = self.networks.list().values().fold((0u64, 0u64), |(r, t), n| (r + n.received(), t + n.transmitted()));
         push(&mut self.rx, rx as f32 / secs);
         push(&mut self.tx, tx as f32 / secs);
+        let pids: Vec<u32> = self.sys.processes().values().filter(|p| p.thread_kind().is_none()).map(|p| p.pid().as_u32()).collect();
+        let quick = inspect::quick(&pids);
         self.procs = self
             .sys
             .processes()
@@ -142,8 +167,14 @@ impl Monitor {
                 user: p.user_id().and_then(|u| self.users.get_user_by_id(u)).map(|u| u.name().to_string()).unwrap_or_default(),
                 cpu: p.cpu_usage() / cores,
                 memory: p.memory(),
+                virtual_memory: p.virtual_memory(),
+                threads: quick.get(&p.pid().as_u32()).and_then(|q| q.threads),
+                swap: quick.get(&p.pid().as_u32()).and_then(|q| q.swap),
             })
             .collect();
+        if let Some(i) = &mut self.inspect {
+            i.refresh(self.proxy.as_ref());
+        }
     }
 
     fn sorted(&self) -> Vec<&Proc> {
@@ -155,6 +186,8 @@ impl Monitor {
                 SortBy::User => a.user.cmp(&b.user).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
                 SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
                 SortBy::Memory => a.memory.cmp(&b.memory),
+                SortBy::Swap => a.swap.cmp(&b.swap),
+                SortBy::Threads => a.threads.cmp(&b.threads),
                 SortBy::Pid => a.pid.cmp(&b.pid),
             };
             if self.descending { o.reverse() } else { o }
@@ -186,8 +219,16 @@ impl App for Monitor {
         vec![Desktop::subscription(Msg::Poll), Subscription::every(SAMPLE, Msg::Sample)]
     }
 
+    fn start(&mut self, proxy: Proxy<Msg>) {
+        self.proxy = Some(proxy);
+    }
+
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
+        if self.inspect.is_some() {
+            return matches!(k.key, Key::Escape | Key::Backspace).then_some(Msg::CloseInspect);
+        }
         match k.key {
+            Key::Enter => self.selected.map(|_| Msg::Inspect),
             Key::Up => Some(Msg::Move(-1)),
             Key::Down => Some(Msg::Move(1)),
             Key::Delete => self.selected.map(|_| Msg::End),
@@ -206,7 +247,7 @@ impl App for Monitor {
                     self.descending = !self.descending;
                 } else {
                     self.sort = s;
-                    self.descending = matches!(s, SortBy::Cpu | SortBy::Memory);
+                    self.descending = matches!(s, SortBy::Cpu | SortBy::Memory | SortBy::Swap | SortBy::Threads);
                 }
             }
             Msg::Select(pid) => {
@@ -225,6 +266,31 @@ impl App for Monitor {
                 if let Some(p) = v.get(next) {
                     self.selected = Some(p.pid);
                     self.confirm_end = false;
+                }
+            }
+            Msg::Inspect => {
+                if let Some(pid) = self.selected {
+                    let mut inspect = detail::Inspect::new(pid);
+                    inspect.refresh(self.proxy.as_ref());
+                    self.inspect = Some(inspect);
+                    self.confirm_end = false;
+                }
+            }
+            Msg::CloseInspect => self.inspect = None,
+            Msg::ThreadSort(s) => {
+                if let Some(i) = &mut self.inspect {
+                    if i.sort == s {
+                        i.descending = !i.descending;
+                    } else {
+                        i.sort = s;
+                        i.descending = matches!(s, detail::ThreadSort::Cpu | detail::ThreadSort::Time);
+                    }
+                }
+            }
+            Msg::Swap(pid, bytes) => {
+                // A result for a process that is no longer open is dropped.
+                if let Some(i) = self.inspect.as_mut().filter(|i| i.pid.as_u32() == pid) {
+                    i.set_swap(bytes);
                 }
             }
             Msg::End => self.confirm_end = self.selected.is_some(),
@@ -262,7 +328,10 @@ impl App for Monitor {
         };
         side = side.push(Space::fill_y()).push(container(column().spacing(12.0).width(Length::Fill).push(mini("CPU", cpu, Tone::Accent)).push(mini("Memory", mem, Tone::Good))).padding([10.0, 12.0]));
         let body = match self.page {
-            Page::Processes => self.processes(),
+            Page::Processes => match &self.inspect {
+                Some(inspect) => self.detail(inspect),
+                None => self.processes(),
+            },
             Page::Resources => self.resources(),
             Page::Storage => self.storage(),
         };
@@ -299,26 +368,34 @@ impl Monitor {
             }
             Button::new(r).kind(ButtonKind::Ghost).padding([6.0, 6.0]).width(width).align_x(align).on_press(Msg::Sort(by)).into()
         };
-        let header = row()
+        let mut header = row()
             .spacing(12.0)
             .width(Length::Fill)
             .padding([4.0, 22.0, 4.0, 14.0])
             .push(header_cell("Name", SortBy::Name, Length::Fill, Align::Start))
             .push(header_cell("User", SortBy::User, Length::Fixed(110.0), Align::Start))
             .push(header_cell("CPU", SortBy::Cpu, Length::Fixed(120.0), Align::End))
-            .push(header_cell("Memory", SortBy::Memory, Length::Fixed(90.0), Align::End))
-            .push(header_cell("PID", SortBy::Pid, Length::Fixed(70.0), Align::End));
+            .push(header_cell("Memory", SortBy::Memory, Length::Fixed(90.0), Align::End));
+        if inspect::QUICK_SWAP {
+            header = header.push(header_cell("Swap", SortBy::Swap, Length::Fixed(80.0), Align::End));
+        }
+        let header = header.push(header_cell("Threads", SortBy::Threads, Length::Fixed(76.0), Align::End)).push(header_cell("PID", SortBy::Pid, Length::Fixed(70.0), Align::End));
         let mut rows = column().spacing(1.0).width(Length::Fill).padding([10.0, 4.0, 10.0, 10.0]);
         for p in v.iter().take(MAX_PROCESSES) {
             let cpu = row().spacing(8.0).align(Align::Center).width(120.0).push(Space::fill_x()).push(progress_bar((p.cpu / 50.0).min(1.0)).width(44.0).height(6.0)).push(text(format!("{:.1}%", p.cpu)).mono().role(TextRole::Caption).align(Align::End).width(50.0));
-            let content = row()
+            let mut content = row()
                 .spacing(12.0)
                 .align(Align::Center)
                 .width(Length::Fill)
                 .push(text(p.name.clone()).no_wrap().width(Length::Fill))
                 .push(text(p.user.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap().width(110.0))
                 .push(cpu)
-                .push(text(human_bytes_binary(p.memory)).mono().role(TextRole::Caption).align(Align::End).width(90.0))
+                .push(text(human_bytes_binary(p.memory)).mono().role(TextRole::Caption).align(Align::End).width(90.0));
+            if inspect::QUICK_SWAP {
+                content = content.push(text(p.swap.map_or("—".into(), human_bytes_binary)).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(80.0));
+            }
+            let content = content
+                .push(text(p.threads.map_or("—".into(), |n| n.to_string())).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(76.0))
                 .push(text(p.pid.to_string()).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(70.0));
             rows = rows.push(Button::new(content).kind(ButtonKind::Ghost).selected(self.selected == Some(p.pid)).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Select(p.pid)));
         }
@@ -346,9 +423,11 @@ impl Monitor {
                 let mut r = row().spacing(10.0).align(Align::Center).width(Length::Fill).padding([16.0, 10.0]);
                 r = match &self.status {
                     Some((tone, msg)) => r.push(notice(*tone, msg.clone())),
-                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to end it.".into())).role(TextRole::Caption).tone(Tone::Muted)),
+                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads or end it.".into())).role(TextRole::Caption).tone(Tone::Muted)),
                 };
-                r.push(Space::fill_x()).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
+                r.push(Space::fill_x())
+                    .push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect)))
+                    .push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
             }
         };
         column().width(Length::Fill).height(Length::Fill).push(toolbar).push(Divider::horizontal()).push(header).push(scrollable(rows).height(Length::Fill)).push(Divider::horizontal()).push(footer).into()
@@ -472,4 +551,21 @@ fn snapshots(dir: std::path::PathBuf) {
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());
     }
+
+    // The detail view, for the readable process with the most threads.
+    let mut app = Monitor::new();
+    app.desktop.appearance.scheme = neo_desktop::SchemePref::Dark;
+    let busiest = app.procs.iter().filter(|p| inspect::threads(p.pid.as_u32()).is_ok()).max_by_key(|p| p.threads).map(|p| p.pid);
+    app.selected = busiest;
+    let mut h = Harness::new(app, Size::new(1060.0, 700.0)).expect("GPU");
+    h.app_mut().update(Msg::Inspect);
+    // Two samples give each thread a processor share; the swap figure arrives from a worker.
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(250));
+        h.app_mut().update(Msg::Sample);
+        h.advance(Duration::from_millis(250));
+    }
+    let path = dir.join("monitor-threads.png");
+    h.save_png(&path, 1.0).expect("write png");
+    println!("wrote {}", path.display());
 }

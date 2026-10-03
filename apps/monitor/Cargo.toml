@@ -9,3 +9,9 @@ license.workspace = true
 neo.workspace = true
 neo-desktop.workspace = true
 sysinfo = { version = "0.37", default-features = false, features = ["system", "disk", "network", "user"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
