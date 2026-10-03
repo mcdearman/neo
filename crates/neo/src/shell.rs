@@ -1,7 +1,7 @@
 //! Connects a [`Ui`] to a real window with winit and wgpu.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use neo_render::{wgpu, Point, Renderer, Size, SurfaceTarget};
 use neo_theme::Scheme;
@@ -59,6 +59,8 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         close: false,
         blur_strength: None,
         blur_attempts: 0,
+        hidden: false,
+        retry_at: None,
     };
     event_loop.run_app(&mut shell).map_err(Error::EventLoop)?;
     match shell.error {
@@ -92,6 +94,12 @@ struct Shell<A: App> {
     /// the platform's blur layers to appear.
     blur_strength: Option<f32>,
     blur_attempts: u32,
+    /// The window is fully covered, minimised or on a sleeping display, so
+    /// nothing is drawn until it is visible again.
+    hidden: bool,
+    /// The surface had no frame to give; try again at this time rather than
+    /// straight away, which would spin a processor core.
+    retry_at: Option<Instant>,
 }
 
 fn scheme_of(t: winit::window::Theme) -> Scheme {
@@ -162,7 +170,7 @@ impl<A: App> Shell<A> {
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
@@ -219,12 +227,23 @@ impl<A: App> Shell<A> {
         }
     }
 
+    /// Whether a redraw request would lead to a frame.
+    fn can_draw(&self) -> bool {
+        !self.hidden && self.retry_at.is_none()
+    }
+
     fn render(&mut self) {
+        if self.hidden {
+            return;
+        }
         let Some(gpu) = &mut self.gpu else { return };
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                gpu.window.request_redraw();
+            status @ (wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded) => {
+                // Asking again at once would loop at full speed while the window
+                // is covered. Wait; `Occluded(false)` also restarts drawing.
+                let wait = if matches!(status, wgpu::CurrentSurfaceTexture::Occluded) { Duration::from_secs(1) } else { Duration::from_millis(100) };
+                self.retry_at = Some(Instant::now() + wait);
                 return;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
@@ -246,6 +265,7 @@ impl<A: App> Shell<A> {
                 return;
             }
         };
+        self.retry_at = None;
         let scale = gpu.window.scale_factor() as f32;
         let scene = self.ui.draw(gpu.renderer.text(), Instant::now());
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -288,7 +308,8 @@ impl<A: App> Shell<A> {
         gpu.window.set_cursor(cursor_icon(self.ui.cursor()));
         self.sync_window();
         if let Some(gpu) = &self.gpu
-            && self.ui.needs_redraw() {
+            && self.ui.needs_redraw()
+            && self.can_draw() {
                 gpu.window.request_redraw();
             }
     }
@@ -409,6 +430,13 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 self.sync_window();
             }
             WindowEvent::ScaleFactorChanged { .. } => gpu.window.request_redraw(),
+            WindowEvent::Occluded(hidden) => {
+                self.hidden = hidden;
+                if !hidden {
+                    self.retry_at = None;
+                    gpu.window.request_redraw();
+                }
+            }
             WindowEvent::ThemeChanged(t) => {
                 self.blur_strength = None;
                 self.blur_attempts = 0;
@@ -491,11 +519,18 @@ impl<A: App> ApplicationHandler for Shell<A> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let wake = self.ui.tick(now);
+        let mut wake = self.ui.tick(now);
+        if self.retry_at.is_some_and(|t| t <= now) {
+            self.retry_at = None;
+        }
         if let Some(gpu) = &self.gpu
-            && self.ui.needs_redraw() {
+            && self.ui.needs_redraw()
+            && self.can_draw() {
                 gpu.window.request_redraw();
             }
+        if let Some(t) = self.retry_at.filter(|_| !self.hidden) {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
         self.sync_window();
         event_loop.set_control_flow(match wake {
             Some(t) => ControlFlow::WaitUntil(t),
