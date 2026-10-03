@@ -44,11 +44,16 @@ impl Default for Appearance {
     }
 }
 
-/// Where Neo keeps its settings: `$NEO_CONFIG_DIR`, else
-/// `$XDG_CONFIG_HOME/neo`, else `~/.config/neo`.
+/// Where Neo keeps its settings: `$NEO_CONFIG_DIR`, else `%APPDATA%\Neo`
+/// on Windows, else `$XDG_CONFIG_HOME/neo`, else `~/.config/neo`.
 pub fn config_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("NEO_CONFIG_DIR") {
         return PathBuf::from(d);
+    }
+    if cfg!(windows)
+        && let Some(d) = std::env::var_os("APPDATA")
+    {
+        return PathBuf::from(d).join("Neo");
     }
     if let Some(d) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
         return PathBuf::from(d).join("neo");

@@ -7,6 +7,9 @@
 //! `π e ans` and implicit multiplication such as `2π`. The result updates
 //! as you type; Enter keeps it in the history.
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod expr;
 
 use neo::prelude::*;

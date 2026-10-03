@@ -381,7 +381,7 @@ impl Renderer {
     /// pixels with the given scale factor.
     fn draw(&mut self, scene: &Scene, width: u32, height: u32, scale: f32) -> wgpu::CommandEncoder {
         self.ensure_canvas(width, height);
-        let scale = scale.max(0.1);
+        let scale = scale.max(1e-3);
         let logical = [width as f32 / scale, height as f32 / scale];
         self.queue.write_buffer(
             &self.globals,

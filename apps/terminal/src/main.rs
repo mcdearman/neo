@@ -9,6 +9,9 @@
 //! Copy and paste with Command+C and Command+V on macOS, Ctrl+Shift+C and
 //! Ctrl+Shift+V elsewhere. Shift+Page Up and Page Down scroll the history.
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod colors;
 mod keys;
 mod view;

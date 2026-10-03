@@ -11,7 +11,7 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 | Files | `neo-files` | Browse folders with places, breadcrumbs, back and forward, search, sortable columns and hidden files. Double-click or Enter opens with the default app. New folder, rename and Move to Trash (freedesktop.org Trash on Linux). |
 | Terminal | `neo-terminal` | A GPU-drawn terminal using `alacritty_terminal` for emulation and the pty: 256 and true colour, bold, underline, inverse, wide characters, scrollback, mouse selection, copy and paste, bracketed paste and window titles. |
 | Settings | `neo-settings` | Colour scheme, accent, corner radius, glass, text size and reduced motion, applied to every open Neo app at once; plus About this computer. |
-| System Monitor | `neo-monitor` | Processes with filter, sort and End process (with confirmation); per-core CPU, memory, swap and network history; disk usage. |
+| System Monitor | `neo-monitor` | Processes with filter, sort, thread counts and End process (with confirmation). Open a process to see its memory, its swap and a live table of its threads with each one's CPU use. Per-core CPU, memory, swap and network history; disk usage. |
 | Calculator | `neo-calculator` | Type expressions with precedence, brackets, powers, `%`, `!`, functions, `π`, `e` and `ans`; the result previews as you type, and a history panel recalls past results. Basic and scientific keypads. |
 | Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
 
@@ -27,9 +27,22 @@ cargo run -p neo --example gallery          # the widget gallery
 cargo test --workspace
 ```
 
-The apps share their appearance through `~/.config/neo/appearance.conf` (or `$XDG_CONFIG_HOME/neo`, or `$NEO_CONFIG_DIR`). Settings writes it; every app checks it about once a second and restyles itself.
+The apps share their appearance through `appearance.conf` in `~/.config/neo` (`%APPDATA%\Neo` on Windows; `$XDG_CONFIG_HOME` and `$NEO_CONFIG_DIR` override it). Settings writes it; every app checks it about once a second and restyles itself.
 
-On Linux, `dist/install.sh` builds the apps and installs them with `.desktop` entries into `~/.local`, so they appear in the menus of GNOME, KDE Plasma or any other desktop. `dist/install.sh --uninstall` removes them.
+### Install
+
+```sh
+cargo xtask install     # build the apps and add them to this computer's app launcher
+cargo xtask uninstall   # remove them
+```
+
+| | Where they go | Where they appear |
+|---|---|---|
+| macOS | `~/Applications/Neo Files.app` and so on | Launchpad, Spotlight, the Dock and Finder |
+| Linux | `~/.local/bin`, with `.desktop` entries and icons under `~/.local/share` (set `PREFIX` to change) | The app menu of GNOME, KDE Plasma or any freedesktop.org desktop |
+| Windows | `%LOCALAPPDATA%\Programs\Neo` | The Start menu's Neo folder |
+
+On macOS and Windows the apps are named Neo Files, Neo Terminal and so on, so they don't sit next to the system's own Files and Terminal with the same name. `cargo xtask icons` redraws the app icons in `dist/icons` with `neo-render`.
 
 ## Writing an app
 

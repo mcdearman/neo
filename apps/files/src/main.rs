@@ -7,13 +7,16 @@
 //! the selection to the Trash, and typing in the search field filters the
 //! current folder.
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use neo::prelude::*;
 use neo::{KeyEvent, Key, Size};
-use neo_desktop::fs::{file_icon, friendly_time, home_dir, human_size, move_to_trash, open, user_dir};
+use neo_desktop::fs::{file_icon, friendly_time, home_dir, human_size, move_to_trash, open, roots, user_dir};
 use neo_desktop::ui::{nav_item, notice, section, split};
 use neo_desktop::Desktop;
 
@@ -420,7 +423,11 @@ impl Files {
             let here = self.dir == path;
             col = col.push(nav_item(glyph, name, here, Msg::Go(path)));
         }
-        col = col.push(section("Devices")).push(nav_item(icons::HARD_DRIVE, "Computer", self.dir == Path::new("/"), Msg::Go(PathBuf::from("/"))));
+        col = col.push(section("Devices"));
+        for (name, root) in roots() {
+            let here = self.dir == root;
+            col = col.push(nav_item(icons::HARD_DRIVE, name, here, Msg::Go(root)));
+        }
         scrollable(col).into()
     }
 

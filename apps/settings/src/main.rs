@@ -6,6 +6,9 @@
 //!     cargo run -p neo-settings
 //!     cargo run -p neo-settings -- --snapshot target/snapshots
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use neo::prelude::*;
 use neo::Size;
 use neo_desktop::fs::human_bytes_binary;

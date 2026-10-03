@@ -22,13 +22,27 @@ pub fn user_dir(xdg_name: &str) -> PathBuf {
         }
         home.join(if xdg_name == "DOWNLOAD" { "Downloads".into() } else { name })
     };
-    let dirs = crate::config_dir().parent().map(|p| p.join("user-dirs.dirs")).unwrap_or_default();
+    let config = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+    let dirs = config.join("user-dirs.dirs");
     let Ok(src) = std::fs::read_to_string(dirs) else { return fallback() };
     let key = format!("XDG_{xdg_name}_DIR=");
     src.lines()
         .find_map(|l| l.trim().strip_prefix(&key))
         .map(|v| PathBuf::from(v.trim_matches('"').replace("$HOME", &home.to_string_lossy())))
         .unwrap_or_else(fallback)
+}
+
+/// The tops of the file system: `/` on Unix, each drive on Windows.
+pub fn roots() -> Vec<(String, PathBuf)> {
+    if cfg!(windows) {
+        (b'A'..=b'Z')
+            .map(|l| PathBuf::from(format!("{}:\\", l as char)))
+            .filter(|p| p.exists())
+            .map(|p| (format!("Local Disk ({})", p.to_string_lossy().trim_end_matches('\\')), p))
+            .collect()
+    } else {
+        vec![("Computer".into(), PathBuf::from("/"))]
+    }
 }
 
 /// `1.4 MB` style sizes, in powers of 1000 like most desktop file managers.

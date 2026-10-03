@@ -4,6 +4,9 @@
 //!     cargo run -p neo-code -- path/to/dir   # a real folder (Cmd/Ctrl+S saves)
 //!     cargo run -p neo-code -- --snapshot target/snapshots
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

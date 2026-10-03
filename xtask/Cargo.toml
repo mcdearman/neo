@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+description = "Project tasks: install the Neo apps on macOS, Linux or Windows, and draw their icons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+neo-theme.workspace = true
+neo-render.workspace = true
