@@ -32,6 +32,8 @@ struct Entry {
     link: bool,
     size: u64,
     modified: Option<SystemTime>,
+    /// When the file was created. Some Linux file systems do not record it.
+    created: Option<SystemTime>,
 }
 
 impl Entry {
@@ -45,6 +47,7 @@ enum SortBy {
     Name,
     Size,
     Modified,
+    Created,
 }
 
 /// An inline name field for a new folder or a rename.
@@ -99,11 +102,11 @@ fn read_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
         let link = e.file_type().is_ok_and(|t| t.is_symlink());
         // Follow links for size and kind, but keep broken ones.
         let meta = std::fs::metadata(&path).or_else(|_| e.metadata());
-        let (dir, size, modified) = match &meta {
-            Ok(m) => (m.is_dir(), if m.is_dir() { 0 } else { m.len() }, m.modified().ok()),
-            Err(_) => (false, 0, None),
+        let (dir, size, modified, created) = match &meta {
+            Ok(m) => (m.is_dir(), if m.is_dir() { 0 } else { m.len() }, m.modified().ok(), m.created().ok()),
+            Err(_) => (false, 0, None, None),
         };
-        out.push(Entry { name: e.file_name().to_string_lossy().into_owned(), path, dir, link, size, modified });
+        out.push(Entry { name: e.file_name().to_string_lossy().into_owned(), path, dir, link, size, modified, created });
     }
     Ok(out)
 }
@@ -179,6 +182,7 @@ impl Files {
                 SortBy::Name => natural_cmp(&a.name, &b.name),
                 SortBy::Size => a.size.cmp(&b.size).then_with(|| natural_cmp(&a.name, &b.name)),
                 SortBy::Modified => a.modified.cmp(&b.modified),
+                SortBy::Created => a.created.cmp(&b.created),
             };
             dirs_first.then(if self.descending { by.reverse() } else { by })
         });
@@ -483,7 +487,8 @@ impl Files {
             .padding([4.0, 12.0, 4.0, 40.0])
             .push(col("Name", SortBy::Name, Length::Fill, Align::Start))
             .push(col("Size", SortBy::Size, Length::Fixed(90.0), Align::End))
-            .push(col("Modified", SortBy::Modified, Length::Fixed(150.0), Align::Start))
+            .push(col("Modified", SortBy::Modified, Length::Fixed(130.0), Align::Start))
+            .push(col("Created", SortBy::Created, Length::Fixed(130.0), Align::Start))
             .into()
     }
 
@@ -497,6 +502,7 @@ impl Files {
         let glyph = if e.link && e.dir { icons::FOLDER_SYMLINK } else if e.link { icons::FILE_SYMLINK } else { file_icon(&e.path, e.dir) };
         let size = if e.dir { "—".to_string() } else { human_size(e.size) };
         let when = e.modified.map(friendly_time).unwrap_or_default();
+        let created = e.created.map(friendly_time).unwrap_or_else(|| "—".into());
         let faded = if e.hidden() { Tone::Muted } else { Tone::Inherit };
         let content = row()
             .spacing(12.0)
@@ -505,7 +511,8 @@ impl Files {
             .push(icon(glyph).size(17.0).tone(if e.dir { Tone::Accent } else { Tone::Muted }))
             .push(text(e.name.clone()).no_wrap().tone(faded).width(Length::Fill))
             .push(text(size).role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(90.0))
-            .push(text(when).role(TextRole::Caption).tone(Tone::Muted).width(150.0));
+            .push(text(when).role(TextRole::Caption).tone(Tone::Muted).no_wrap().width(130.0))
+            .push(text(created).role(TextRole::Caption).tone(Tone::Muted).no_wrap().width(130.0));
         Button::new(content).kind(ButtonKind::Ghost).selected(selected).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Click(e.path.clone())).into()
     }
 
