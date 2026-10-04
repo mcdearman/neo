@@ -13,7 +13,7 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 | Settings | `neo-settings` | Colour scheme, accent, corner radius, glass, text size and reduced motion, applied to every open Neo app at once; plus About this computer. |
 | System Monitor | `neo-monitor` | Processes with filter, sort, thread counts and End process (with confirmation). Open a process to see its memory, its swap and a live table of its threads with each one's CPU use. Per-core CPU, memory, swap and network history; disk usage. |
 | Calculator | `neo-calculator` | Type expressions with precedence, brackets, powers, `%`, `!`, functions, `π`, `e` and `ans`; the result previews as you type, and a history panel recalls past results. Basic and scientific keypads. |
-| Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. ⌘⇧R (Ctrl+Shift+R elsewhere) shows it from anywhere and stops a recording; the window hides while recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
+| Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. While recording, a small bar shows the time with Pause and Stop, and is left out of the recording where the system allows. Options for the microphone and for saving a GIF. It keeps an icon in the menu bar or system tray, and the installed app starts at login (a setting, on by default) so the shortcut is always ready. ⌘⇧R (Ctrl+Shift+R elsewhere) brings up the area frame from anywhere and stops a recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
 | Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
 
 ```sh
@@ -22,7 +22,7 @@ cargo run -p neo-terminal [folder]
 cargo run -p neo-settings
 cargo run -p neo-monitor
 cargo run -p neo-calculator
-cargo run -p neo-recorder [--mode area --record --for 10]
+cargo run -p neo-recorder [--mode area --record --for 10 --gif]
 cargo run -p neo-code [folder]              # Cmd/Ctrl+S saves
 cargo run -p neo-files -- --snapshot target/snapshots   # every app renders PNGs this way
 cargo run -p neo --example gallery          # the widget gallery
