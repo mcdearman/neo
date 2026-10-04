@@ -13,6 +13,7 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 | Settings | `neo-settings` | Colour scheme, accent, corner radius, glass, text size and reduced motion, applied to every open Neo app at once; plus About this computer. |
 | System Monitor | `neo-monitor` | Processes with filter, sort, thread counts and End process (with confirmation). Open a process to see its memory, its swap and a live table of its threads with each one's CPU use. Per-core CPU, memory, swap and network history; disk usage. |
 | Calculator | `neo-calculator` | Type expressions with precedence, brackets, powers, `%`, `!`, functions, `π`, `e` and `ans`; the result previews as you type, and a history panel recalls past results. Basic and scientific keypads. |
+| Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. ⌘⇧R (Ctrl+Shift+R elsewhere) shows it from anywhere and stops a recording; the window hides while recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
 | Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
 
 ```sh
@@ -21,6 +22,7 @@ cargo run -p neo-terminal [folder]
 cargo run -p neo-settings
 cargo run -p neo-monitor
 cargo run -p neo-calculator
+cargo run -p neo-recorder [--mode area --record --for 10]
 cargo run -p neo-code [folder]              # Cmd/Ctrl+S saves
 cargo run -p neo-files -- --snapshot target/snapshots   # every app renders PNGs this way
 cargo run -p neo --example gallery          # the widget gallery
@@ -104,6 +106,7 @@ The application carries out `:w` and `:q` through `Document::take_vim_requests`.
 ### How it works
 
 - **Surfaces, not colours.** Widgets ask the theme to paint a role such as card, raised, pressed, well, inset or accent. How each role looks is decided in one place, in `Theme::paint`.
+- **Windows that follow app state.** `App::window_state` says whether the window is shown, on top, or bare and see-through; `on_close` lets an app hide instead of quitting; `on_window_frame` tells it where the window is. Recorder uses all three.
 - **Messages from anywhere.** `App::start` hands the app a `Proxy` that sends messages from other threads, such as the terminal's pty reader, and wakes the event loop. Widgets can report layout results, such as the terminal's size in cells, with `Cx::defer`.
 - **Widget state survives rebuilds.** Hover, focus, caret and animation state is keyed by tree position, or by an explicit `.key()`.
 - **Browser-style blending.** The canvas is sRGB-encoded and blends in sRGB space, so it matches the HTML mock-ups.

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Recorder
+GenericName=Screen Recorder
+Comment=Record the screen, a window or an area
+Exec=neo-recorder
+Icon=org.neo.Recorder
+Terminal=false
+Categories=AudioVideo;Video;Recorder;Utility;
+Keywords=screen;record;capture;video;screencast;
+StartupNotify=true
+StartupWMClass=org.neo.Recorder

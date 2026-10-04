@@ -28,5 +28,6 @@ pub const APPS: &[AppInfo] = &[
     AppInfo { bin: "neo-settings", id: "org.neo.Settings", name: "Settings", long_name: "Neo Settings", glyph: icons::SETTINGS, top: Color::hex(0x9AA3B2), bottom: Color::hex(0x5C6576), ink: Color::WHITE },
     AppInfo { bin: "neo-monitor", id: "org.neo.Monitor", name: "System Monitor", long_name: "Neo System Monitor", glyph: icons::ACTIVITY, top: Color::hex(0x35B3A2), bottom: Color::hex(0x16706A), ink: Color::WHITE },
     AppInfo { bin: "neo-calculator", id: "org.neo.Calculator", name: "Calculator", long_name: "Neo Calculator", glyph: icons::CALCULATOR, top: Color::hex(0xF79A6C), bottom: Color::hex(0xC0533B), ink: Color::WHITE },
+    AppInfo { bin: "neo-recorder", id: "org.neo.Recorder", name: "Recorder", long_name: "Neo Recorder", glyph: icons::VIDEO, top: Color::hex(0xFF7A9C), bottom: Color::hex(0xC0443A), ink: Color::WHITE },
     AppInfo { bin: "neo-code", id: "org.neo.Code", name: "Neo Code", long_name: "Neo Code", glyph: icons::CODE, top: Color::hex(0x2F3542), bottom: Color::hex(0x14171C), ink: Color::hex(0x889FEC) },
 ];
