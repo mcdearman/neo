@@ -122,6 +122,39 @@ pub fn open(path: &Path) -> std::io::Result<()> {
     cmd.arg(path).spawn().map(|_| ())
 }
 
+/// Where the Neo Files program might be: beside this program, in a macOS
+/// app bundle next to this one or in `~/Applications`, then on the `PATH`.
+fn neo_files_candidates() -> Vec<PathBuf> {
+    let name = format!("neo-files{}", std::env::consts::EXE_SUFFIX);
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        out.push(dir.join(&name));
+        // Inside `Some.app/Contents/MacOS`, look for a sibling bundle.
+        if let Some(apps) = dir.ancestors().nth(3).filter(|_| dir.ends_with("Contents/MacOS")) {
+            out.push(apps.join("Neo Files.app/Contents/MacOS").join(&name));
+        }
+    }
+    if cfg!(target_os = "macos") {
+        out.push(home_dir().join("Applications/Neo Files.app/Contents/MacOS").join(&name));
+    }
+    out.retain(|p| p.is_file());
+    out.push(PathBuf::from(name));
+    out
+}
+
+/// Shows a file in Neo Files, selected in its folder. Falls back to the
+/// system's file manager, opened on the folder, when Neo Files is not installed.
+pub fn reveal(path: &Path) -> std::io::Result<()> {
+    for files in neo_files_candidates() {
+        if std::process::Command::new(files).arg(path).spawn().is_ok() {
+            return Ok(());
+        }
+    }
+    open(path.parent().unwrap_or(path))
+}
+
 /// Moves a file or folder to the Trash, so it can be restored later.
 ///
 /// Follows the freedesktop.org Trash specification on Linux and uses

@@ -49,7 +49,7 @@ pub mod testing;
 pub mod widgets;
 
 pub use anim::Anim;
-pub use app::{App, Decorations, Proxy, Subscription, WindowSettings};
+pub use app::{App, Decorations, Proxy, Subscription, WindowSettings, WindowState};
 pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use runtime::Ui;
@@ -61,5 +61,5 @@ pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface,
 /// Everything an application usually needs.
 pub mod prelude {
     pub use crate::widgets::*;
-    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, Weight, WindowSettings};
+    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, Weight, WindowSettings, WindowState};
 }

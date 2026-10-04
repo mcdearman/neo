@@ -2,6 +2,17 @@
 
 use winit::window::Window;
 
+/// Makes the window a plain rectangle with no system frame, or gives the
+/// frame back. macOS rounds the corners of every titled window, so a bare,
+/// see-through window drops its title bar to get square corners. Other
+/// platforms' Neo windows are already undecorated rectangles.
+pub(crate) fn set_square(window: &Window, square: bool) {
+    #[cfg(target_os = "macos")]
+    macos::set_square(window, square);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, square);
+}
+
 /// Sets the strength of the platform blur set up by [`set_blur`], in logical
 /// pixels. Returns false when the platform's blur layers do not exist yet
 /// (macOS builds them lazily), so the caller should try again after the next
@@ -144,6 +155,47 @@ mod macos {
             }
         }
         found
+    }
+
+    /// Swaps the titled style, whose corners the system rounds, for a
+    /// borderless one. winit's `set_decorations` would also drop the
+    /// full-size content view the Neo title bar relies on, so the style mask
+    /// is set here.
+    pub(super) fn set_square(window: &Window, square: bool) {
+        const TITLED: usize = 1 << 0;
+        const CLOSABLE: usize = 1 << 1;
+        const MINIATURIZABLE: usize = 1 << 2;
+        const RESIZABLE: usize = 1 << 3;
+        const FULL_SIZE_CONTENT: usize = 1 << 15;
+        let Ok(handle) = window.window_handle() else { return };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+        // SAFETY: winit hands out a valid NSView and this runs on the main thread.
+        unsafe {
+            let view = h.ns_view.as_ptr().cast::<AnyObject>();
+            let ns_window: *mut AnyObject = msg_send![view, window];
+            if ns_window.is_null() {
+                return;
+            }
+            let old: usize = msg_send![ns_window, styleMask];
+            let frame = TITLED | CLOSABLE | MINIATURIZABLE | FULL_SIZE_CONTENT;
+            let new = if square { old & !frame } else { old | frame };
+            let new = if window.is_resizable() { new | RESIZABLE } else { new };
+            if new == old {
+                return;
+            }
+            let _: () = msg_send![ns_window, setStyleMask: new];
+            if !square {
+                // The title bar buttons come back with the frame; Neo draws its own.
+                for button in 0..3usize {
+                    let b: *mut AnyObject = msg_send![ns_window, standardWindowButton: button];
+                    if !b.is_null() {
+                        let _: () = msg_send![b, setHidden: true];
+                    }
+                }
+            }
+            // Changing the style mask drops keyboard focus from the view.
+            let _: bool = msg_send![ns_window, makeFirstResponder: view];
+        }
     }
 
     pub(super) fn raise_metal_layer(window: &Window) {

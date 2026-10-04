@@ -28,12 +28,14 @@ pub(crate) struct Frame<M> {
     title: String,
     chrome: bool,
     rounded: bool,
+    /// Paint the window background. Off for see-through windows.
+    background: bool,
     title_layout: Option<TextLayout>,
 }
 
 impl<M: 'static> Frame<M> {
-    pub fn new(content: Element<M>, title: String, chrome: bool, rounded: bool) -> Self {
-        Self { content: [content], title, chrome, rounded, title_layout: None }
+    pub fn new(content: Element<M>, title: String, chrome: bool, rounded: bool, background: bool) -> Self {
+        Self { content: [content], title, chrome, rounded, background, title_layout: None }
     }
 
     fn controls(&self, b: Rect) -> [Rect; 3] {
@@ -69,7 +71,9 @@ impl<M: 'static> Widget<M> for Frame<M> {
         if self.rounded {
             window.border = Some((1.0, p.line.with_alpha(if theme.glass.enabled { 0.5 } else { 1.0 })));
         }
-        cx.scene.paint(b, radius, &window);
+        if self.background {
+            cx.scene.paint(b, radius, &window);
+        }
 
         if self.chrome {
             if let Some(l) = &self.title_layout {

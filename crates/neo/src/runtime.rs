@@ -82,6 +82,34 @@ impl<A: App> Ui<A> {
         self.app.title()
     }
 
+    pub fn window_state(&self) -> crate::app::WindowState {
+        self.app.window_state()
+    }
+
+    pub fn should_exit(&self) -> bool {
+        self.app.should_exit()
+    }
+
+    /// The user asked to close the window. Returns true if the app should end.
+    pub fn close_requested(&mut self) -> bool {
+        match self.app.on_close() {
+            Some(m) => {
+                self.app.update(m);
+                self.needs_view = true;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Tells the app where its window is on the screen.
+    pub fn window_frame(&mut self, frame: Rect, scale: f32) {
+        if let Some(m) = self.app.on_window_frame(frame, scale) {
+            self.app.update(m);
+            self.needs_view = true;
+        }
+    }
+
     pub fn resize(&mut self, size: Size) {
         if size != self.size {
             self.size = size;
@@ -150,9 +178,10 @@ impl<A: App> Ui<A> {
     fn ensure(&mut self, text: &mut TextSystem) {
         self.refresh_theme();
         if self.needs_view {
-            let chrome = self.decorations == Decorations::Neo;
+            let bare = self.app.window_state().bare;
+            let chrome = self.decorations == Decorations::Neo && !bare;
             let rounded = chrome && !self.maximized;
-            let mut root = Element::new(Frame::new(self.app.view(), self.app.title(), chrome, rounded));
+            let mut root = Element::new(Frame::new(self.app.view(), self.app.title(), chrome, rounded, !bare));
             let mut pass = IdPass::default();
             root.assign_ids(WidgetId(1), 0, &mut pass);
             self.states.sweep(&pass.live);

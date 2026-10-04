@@ -2,7 +2,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use neo_render::Size;
+use neo_render::{Rect, Size};
 use neo_theme::{Scheme, Theme};
 
 use crate::core::Element;
@@ -41,6 +41,32 @@ pub trait App: 'static {
     /// Timers that send messages periodically.
     fn subscriptions(&self) -> Vec<Subscription<Self::Message>> {
         vec![]
+    }
+
+    /// How the window presents itself right now: shown or hidden, on top,
+    /// see-through. Read after every update, so it can follow app state.
+    fn window_state(&self) -> WindowState {
+        WindowState::default()
+    }
+
+    /// Called when the user asks to close the window. Return a message to
+    /// handle it yourself, for example by hiding the window; `None` closes
+    /// the window and ends the app.
+    fn on_close(&self) -> Option<Self::Message> {
+        None
+    }
+
+    /// Called when the window moves or changes size. `frame` is its content
+    /// area on the screen in logical pixels, and `scale` converts those to
+    /// physical pixels. Compositors that hide window positions, such as
+    /// Wayland ones, report the origin as zero.
+    fn on_window_frame(&self, _frame: Rect, _scale: f32) -> Option<Self::Message> {
+        None
+    }
+
+    /// Return true to end the app. Checked after every update.
+    fn should_exit(&self) -> bool {
+        false
     }
 
     /// Initial window settings. Read once at startup.
@@ -82,6 +108,26 @@ pub struct Subscription<M> {
 impl<M> Subscription<M> {
     pub fn every(period: Duration, message: M) -> Self {
         Self { period, message }
+    }
+}
+
+/// How a window presents itself. See [`App::window_state`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowState {
+    /// Hidden windows keep running, for example to wait for a global shortcut.
+    pub visible: bool,
+    /// Stay above other apps' windows.
+    pub always_on_top: bool,
+    /// Draw no window background or title bar. Only what the view paints
+    /// shows; the rest of the window is see-through.
+    pub bare: bool,
+    /// Resize the window's content area to this whenever the value changes.
+    pub size: Option<Size>,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self { visible: true, always_on_top: false, bare: false, size: None }
     }
 }
 

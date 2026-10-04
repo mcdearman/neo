@@ -10,7 +10,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
-use winit::window::{ResizeDirection, Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId, WindowLevel};
 
 use crate::app::{App, Decorations};
 use crate::core::{CursorIcon, ResizeEdge, WindowRequest};
@@ -61,6 +61,8 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         blur_attempts: 0,
         hidden: false,
         retry_at: None,
+        state: None,
+        resizing: None,
     };
     event_loop.run_app(&mut shell).map_err(Error::EventLoop)?;
     match shell.error {
@@ -100,6 +102,19 @@ struct Shell<A: App> {
     /// The surface had no frame to give; try again at this time rather than
     /// straight away, which would spin a processor core.
     retry_at: Option<Instant>,
+    /// The app's window state as last applied to the window.
+    state: Option<crate::app::WindowState>,
+    /// An edge drag Neo is carrying out itself, where the platform cannot.
+    resizing: Option<ManualResize>,
+}
+
+/// A resize in progress: the edge held, where the pointer grabbed it on the
+/// screen, and the window's frame at that moment, all in physical pixels.
+struct ManualResize {
+    edge: ResizeEdge,
+    grab: (f64, f64),
+    origin: (f64, f64),
+    size: (f64, f64),
 }
 
 fn scheme_of(t: winit::window::Theme) -> Scheme {
@@ -157,7 +172,9 @@ impl<A: App> Shell<A> {
         let (alpha_mode, unpremultiply) = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
             (wgpu::CompositeAlphaMode::PreMultiplied, false)
         } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            (wgpu::CompositeAlphaMode::PostMultiplied, true)
+            // Metal reports this mode, but Core Animation composites the layer
+            // as premultiplied, so on macOS the canvas goes out unchanged.
+            (wgpu::CompositeAlphaMode::PostMultiplied, !cfg!(target_os = "macos"))
         } else {
             (caps.alpha_modes[0], false)
         };
@@ -184,6 +201,7 @@ impl<A: App> Shell<A> {
             instance,
             window,
         });
+        self.report_frame();
         self.sync_window();
         if let Some(gpu) = &self.gpu {
             gpu.window.request_redraw();
@@ -194,7 +212,37 @@ impl<A: App> Shell<A> {
     /// Applies theme-driven window state such as glass blur.
     fn sync_window(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let glass = (self.ui.theme().glass.enabled, self.ui.window_radius());
+        let state = self.ui.window_state();
+        if self.state != Some(state) {
+            let old = self.state.replace(state);
+            if old.map(|o| o.always_on_top) != Some(state.always_on_top) {
+                gpu.window.set_window_level(if state.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+            }
+            if old.map(|o| o.bare) != Some(state.bare) {
+                // A see-through window's shadow would outline whatever it draws.
+                #[cfg(target_os = "macos")]
+                {
+                    use winit::platform::macos::WindowExtMacOS;
+                    gpu.window.set_has_shadow(!state.bare);
+                }
+                crate::platform::set_square(&gpu.window, state.bare);
+            }
+            if old.and_then(|o| o.size) != state.size
+                && let Some(s) = state.size
+            {
+                let _ = gpu.window.request_inner_size(LogicalSize::new(s.w as f64, s.h as f64));
+            }
+            if old.map(|o| o.visible) != Some(state.visible) {
+                gpu.window.set_visible(state.visible);
+                if state.visible {
+                    // Windows shown from a global shortcut should come to the front.
+                    gpu.window.focus_window();
+                    gpu.window.request_redraw();
+                }
+            }
+        }
+        // Platform blur would fill a see-through window.
+        let glass = (self.ui.theme().glass.enabled && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
         if self.glass != Some(glass) {
             crate::platform::set_blur(&gpu.window, glass.0, glass.1);
             self.glass = Some(glass);
@@ -232,8 +280,19 @@ impl<A: App> Shell<A> {
         !self.hidden && self.retry_at.is_none()
     }
 
+    /// Tells the app where its window is on the screen.
+    fn report_frame(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let scale = gpu.window.scale_factor() as f32;
+        let size = gpu.window.inner_size();
+        // Wayland does not tell clients where their windows are.
+        let pos = gpu.window.inner_position().unwrap_or_default();
+        let frame = neo_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
+        self.ui.window_frame(frame, scale);
+    }
+
     fn render(&mut self) {
-        if self.hidden {
+        if self.hidden || self.state.is_some_and(|s| !s.visible) {
             return;
         }
         let Some(gpu) = &mut self.gpu else { return };
@@ -294,11 +353,23 @@ impl<A: App> Shell<A> {
                     let _ = gpu.window.drag_window();
                 }
                 WindowRequest::Resize(edge) => {
-                    let _ = gpu.window.drag_resize_window(resize_dir(edge));
+                    // macOS has no call to start an edge drag, so follow the pointer here.
+                    if gpu.window.drag_resize_window(resize_dir(edge)).is_err()
+                        && let (Some(p), Ok(origin)) = (self.pointer, gpu.window.outer_position())
+                    {
+                        let scale = gpu.window.scale_factor();
+                        let size = gpu.window.inner_size();
+                        let origin = (origin.x as f64, origin.y as f64);
+                        self.resizing = Some(ManualResize { edge, grab: (origin.0 + p.x as f64 * scale, origin.1 + p.y as f64 * scale), origin, size: (size.width as f64, size.height as f64) });
+                    }
                 }
                 WindowRequest::Minimize => gpu.window.set_minimized(true),
                 WindowRequest::ToggleMaximize => gpu.window.set_maximized(!gpu.window.is_maximized()),
-                WindowRequest::Close => self.close = true,
+                WindowRequest::Close => {
+                    if self.ui.close_requested() {
+                        self.close = true;
+                    }
+                }
             }
         }
         if let Some(t) = self.ui.take_clipboard()
@@ -417,7 +488,17 @@ impl<A: App> ApplicationHandler for Shell<A> {
         let Some(gpu) = &mut self.gpu else { return };
         let scale = gpu.window.scale_factor() as f32;
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.ui.close_requested() {
+                    event_loop.exit();
+                } else {
+                    self.after_input();
+                }
+            }
+            WindowEvent::Moved(_) => {
+                self.report_frame();
+                self.after_input();
+            }
             WindowEvent::Resized(size) => {
                 gpu.config.width = size.width.max(1);
                 gpu.config.height = size.height.max(1);
@@ -427,6 +508,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 gpu.window.request_redraw();
                 self.blur_strength = None;
                 self.blur_attempts = 0;
+                self.report_frame();
                 self.sync_window();
             }
             WindowEvent::ScaleFactorChanged { .. } => gpu.window.request_redraw(),
@@ -454,6 +536,30 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 let mods = self.modifiers();
                 self.ui.set_modifiers(mods);
             }
+            WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } if self.resizing.is_some() => {
+                let Some(r) = &self.resizing else { return };
+                let Ok(now) = gpu.window.outer_position() else { return };
+                // The pointer's place on the screen, since the window moves under it.
+                let (dx, dy) = (now.x as f64 + x - r.grab.0, now.y as f64 + y - r.grab.1);
+                let min = self.settings.min_size.unwrap_or(Size::new(120.0, 80.0));
+                let (min_w, min_h) = (min.w as f64 * scale as f64, min.h as f64 * scale as f64);
+                let (mut left, mut top, mut right, mut bottom) = (r.origin.0, r.origin.1, r.origin.0 + r.size.0, r.origin.1 + r.size.1);
+                use ResizeEdge::*;
+                if matches!(r.edge, West | NorthWest | SouthWest) {
+                    left = (left + dx).min(right - min_w);
+                }
+                if matches!(r.edge, East | NorthEast | SouthEast) {
+                    right = (right + dx).max(left + min_w);
+                }
+                if matches!(r.edge, North | NorthWest | NorthEast) {
+                    top = (top + dy).min(bottom - min_h);
+                }
+                if matches!(r.edge, South | SouthWest | SouthEast) {
+                    bottom = (bottom + dy).max(top + min_h);
+                }
+                gpu.window.set_outer_position(PhysicalPosition::new(left.round(), top.round()));
+                let _ = gpu.window.request_inner_size(winit::dpi::PhysicalSize::new((right - left).round().max(1.0), (bottom - top).round().max(1.0)));
+            }
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => {
                 let p = Point::new(x as f32 / scale, y as f32 / scale);
                 self.pointer = Some(p);
@@ -465,6 +571,11 @@ impl<A: App> ApplicationHandler for Shell<A> {
             WindowEvent::CursorLeft { .. } => {
                 self.pointer = None;
                 self.dispatch(Event::PointerLeft);
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, .. } if self.resizing.is_some() => {
+                self.resizing = None;
+                self.report_frame();
+                self.after_input();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(pos) = self.pointer else { return };
@@ -532,6 +643,10 @@ impl<A: App> ApplicationHandler for Shell<A> {
             wake = Some(wake.map_or(t, |w| w.min(t)));
         }
         self.sync_window();
+        if self.close || self.ui.should_exit() {
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(match wake {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
