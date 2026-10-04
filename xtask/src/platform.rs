@@ -68,7 +68,7 @@ fn info_plist(app: &AppInfo) -> String {
     <key>CFBundleVersion</key><string>{version}</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
-    <key>NSHighResolutionCapable</key><true/>
+    <key>NSHighResolutionCapable</key><true/>{usage}
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>
 </plist>
@@ -77,6 +77,9 @@ fn info_plist(app: &AppInfo) -> String {
         bin = app.bin,
         id = app.id,
         version = env!("CARGO_PKG_VERSION"),
+        // macOS refuses microphone access to apps that do not say why they want it.
+        // The Recorder lives in the menu bar, so it has no Dock icon.
+        usage = if app.bin == "neo-recorder" { "\n    <key>LSUIElement</key><true/>\n    <key>NSMicrophoneUsageDescription</key><string>Neo Recorder records sound from the microphone when you turn that option on.</string>" } else { "" },
     )
 }
 
@@ -97,7 +100,12 @@ pub fn install() -> Result<(), String> {
             eprintln!("warning: could not make {}; {} will have a generic icon", icns.display(), app.long_name);
         }
         // An ad-hoc signature, so macOS treats the bundle as one signed app.
-        try_run("codesign", &["--force", "--deep", "--sign", "-", &b.to_string_lossy()]);
+        // By default such a signature is identified by a hash of the binary,
+        // so every rebuild would look like a new app and lose its privacy
+        // permissions (screen recording, microphone). Naming the app ID as
+        // the requirement keeps them across reinstalls.
+        let requirement = format!("=designated => identifier \"{}\"", app.id);
+        try_run("codesign", &["--force", "--deep", "--sign", "-", "--identifier", app.id, "-r", &requirement, &b.to_string_lossy()]);
         try_run("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", &["-f", &b.to_string_lossy()]);
         println!("installed {}", b.display());
     }
@@ -108,6 +116,8 @@ pub fn install() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 pub fn uninstall() -> Result<(), String> {
     for app in APPS {
+        // A removed app must not be started at login.
+        let _ = std::fs::remove_file(home().join("Library/LaunchAgents").join(format!("{}.plist", app.id)));
         let b = bundle(app);
         if b.exists() {
             std::fs::remove_dir_all(&b).map_err(io(b.display()))?;
@@ -159,6 +169,9 @@ pub fn uninstall() -> Result<(), String> {
     for app in APPS {
         let _ = std::fs::remove_file(prefix.join("bin").join(app.bin));
         let _ = std::fs::remove_file(prefix.join("share/applications").join(format!("{}.desktop", app.id)));
+        // A removed app must not be started at login.
+        let config = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".config"));
+        let _ = std::fs::remove_file(config.join("autostart").join(format!("{}.desktop", app.id)));
         for px in crate::icons::SIZES {
             let _ = std::fs::remove_file(prefix.join(format!("share/icons/hicolor/{px}x{px}/apps/{}.png", app.id)));
         }

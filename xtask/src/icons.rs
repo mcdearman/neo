@@ -41,9 +41,24 @@ fn save(r: &mut Renderer, scene: &Scene, px: u32, path: &Path) -> std::io::Resul
     r.save_png(scene, px, px, px as f32 / 1024.0, path)
 }
 
+/// Icons for the Recorder's place in the menu bar or system tray: a
+/// template glyph that the system tints, and a red dot shown while recording.
+fn tray(r: &mut Renderer, out: &Path) -> std::io::Result<()> {
+    let mut idle = Scene::new(Color::TRANSPARENT);
+    let glyph = r.text().layout(&neo_theme::icons::VIDEO.0.to_string(), &TextStyle { size: 800.0, family: FontFamily::Icons, line_height: 1.0, ..Default::default() }, None);
+    let s = glyph.size();
+    idle.text(&glyph, Point::new(512.0 - s.w * 0.5, 512.0 - s.h * 0.5), Color::BLACK);
+    save(r, &idle, 44, &out.join("tray/recorder.png"))?;
+
+    let mut recording = Scene::new(Color::TRANSPARENT);
+    recording.fill(Rect::new(192.0, 192.0, 640.0, 640.0), 320.0, Color::hex(0xFF3B30), None);
+    save(r, &recording, 44, &out.join("tray/recorder-recording.png"))
+}
+
 /// Writes `hicolor/NxN/apps/<id>.png` and `macos/<id>.iconset/*.png` under `out`.
 pub fn render_all(out: &Path) -> Result<(), String> {
     let mut r = Renderer::headless()?;
+    tray(&mut r, out).map_err(|e| e.to_string())?;
     for app in APPS {
         let flat = scene(&mut r, app, false);
         for px in SIZES {
