@@ -24,6 +24,7 @@
 //! ```
 
 mod appearance;
+pub mod autostart;
 pub mod fs;
 pub mod ui;
 

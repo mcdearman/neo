@@ -132,7 +132,9 @@ impl<A: App> Shell<A> {
             .with_inner_size(LogicalSize::new(s.size.w as f64, s.size.h as f64))
             .with_transparent(true)
             .with_decorations(s.decorations == Decorations::System)
-            .with_resizable(s.resizable);
+            .with_resizable(s.resizable)
+            // An app that starts in the background never flashes a window.
+            .with_visible(self.ui.window_state().visible);
         if let Some(m) = s.min_size {
             attrs = attrs.with_min_inner_size(LogicalSize::new(m.w as f64, m.h as f64));
         }
@@ -232,6 +234,14 @@ impl<A: App> Shell<A> {
             {
                 let _ = gpu.window.request_inner_size(LogicalSize::new(s.w as f64, s.h as f64));
             }
+            if old.and_then(|o| o.position) != state.position
+                && let Some(p) = state.position
+            {
+                gpu.window.set_outer_position(winit::dpi::LogicalPosition::new(p.x as f64, p.y as f64));
+            }
+            if old.map(|o| o.hidden_from_capture) != Some(state.hidden_from_capture) {
+                gpu.window.set_content_protected(state.hidden_from_capture);
+            }
             if old.map(|o| o.visible) != Some(state.visible) {
                 gpu.window.set_visible(state.visible);
                 if state.visible {
@@ -277,7 +287,9 @@ impl<A: App> Shell<A> {
 
     /// Whether a redraw request would lead to a frame.
     fn can_draw(&self) -> bool {
-        !self.hidden && self.retry_at.is_none()
+        // A window the app has hidden gets no frames, so asking for one
+        // would never be satisfied and the loop would spin.
+        !self.hidden && self.retry_at.is_none() && self.state.is_none_or(|s| s.visible)
     }
 
     /// Tells the app where its window is on the screen.
@@ -288,7 +300,11 @@ impl<A: App> Shell<A> {
         // Wayland does not tell clients where their windows are.
         let pos = gpu.window.inner_position().unwrap_or_default();
         let frame = neo_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
-        self.ui.window_frame(frame, scale);
+        let screen = gpu.window.current_monitor().map_or(frame, |m| {
+            let (p, s) = (m.position(), m.size());
+            neo_render::Rect::new(p.x as f32 / scale, p.y as f32 / scale, s.width as f32 / scale, s.height as f32 / scale)
+        });
+        self.ui.window_geometry(crate::app::WindowGeometry { frame, screen, scale });
     }
 
     fn render(&mut self) {

@@ -103,8 +103,8 @@ impl<A: App> Ui<A> {
     }
 
     /// Tells the app where its window is on the screen.
-    pub fn window_frame(&mut self, frame: Rect, scale: f32) {
-        if let Some(m) = self.app.on_window_frame(frame, scale) {
+    pub fn window_geometry(&mut self, geometry: crate::app::WindowGeometry) {
+        if let Some(m) = self.app.on_window_geometry(geometry) {
             self.app.update(m);
             self.needs_view = true;
         }

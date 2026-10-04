@@ -49,7 +49,7 @@ pub mod testing;
 pub mod widgets;
 
 pub use anim::Anim;
-pub use app::{App, Decorations, Proxy, Subscription, WindowSettings, WindowState};
+pub use app::{App, Decorations, Proxy, Subscription, WindowGeometry, WindowSettings, WindowState};
 pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use runtime::Ui;

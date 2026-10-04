@@ -2,7 +2,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use neo_render::{Rect, Size};
+use neo_render::{Point, Rect, Size};
 use neo_theme::{Scheme, Theme};
 
 use crate::core::Element;
@@ -56,11 +56,9 @@ pub trait App: 'static {
         None
     }
 
-    /// Called when the window moves or changes size. `frame` is its content
-    /// area on the screen in logical pixels, and `scale` converts those to
-    /// physical pixels. Compositors that hide window positions, such as
-    /// Wayland ones, report the origin as zero.
-    fn on_window_frame(&self, _frame: Rect, _scale: f32) -> Option<Self::Message> {
+    /// Called when the window moves or changes size, with where it is on
+    /// the screen.
+    fn on_window_geometry(&self, _geometry: WindowGeometry) -> Option<Self::Message> {
         None
     }
 
@@ -123,12 +121,32 @@ pub struct WindowState {
     pub bare: bool,
     /// Resize the window's content area to this whenever the value changes.
     pub size: Option<Size>,
+    /// Move the window's top-left corner here, in logical screen pixels,
+    /// whenever the value changes. Ignored where the compositor places
+    /// windows itself, as on Wayland.
+    pub position: Option<Point>,
+    /// Leave the window out of screenshots and screen recordings, where the
+    /// platform can.
+    pub hidden_from_capture: bool,
 }
 
 impl Default for WindowState {
     fn default() -> Self {
-        Self { visible: true, always_on_top: false, bare: false, size: None }
+        Self { visible: true, always_on_top: false, bare: false, size: None, position: None, hidden_from_capture: false }
     }
+}
+
+/// Where a window is. See [`App::on_window_geometry`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowGeometry {
+    /// The window's content area on the screen, in logical pixels.
+    /// Compositors that hide window positions, such as Wayland ones, report
+    /// the origin as zero.
+    pub frame: Rect,
+    /// The screen the window is on, in the same coordinates.
+    pub screen: Rect,
+    /// Physical pixels per logical pixel.
+    pub scale: f32,
 }
 
 /// Who draws the title bar and window border.
