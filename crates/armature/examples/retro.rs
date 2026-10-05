@@ -50,10 +50,9 @@ pub struct PushButton<M> {
 #[derive(Default)]
 struct Held(bool);
 
-impl<M: Clone + 'static> PushButton<M> {
-    pub fn new(label: impl Into<String>, on_press: M) -> Element<M> {
-        Element::new(Self { label: label.into(), on_press, text: None })
-    }
+/// A [`PushButton`] that sends `on_press`.
+pub fn push_button<M: Clone + 'static>(label: impl Into<String>, on_press: M) -> Element<M> {
+    Element::new(PushButton { label: label.into(), on_press, text: None })
 }
 
 impl<M: Clone + 'static> Widget<M> for PushButton<M> {
@@ -180,7 +179,7 @@ impl App for Counter {
             .padding(24.0)
             .spacing(16.0)
             .push(format!("COUNT {}", self.count))
-            .push(row().spacing(16.0).push(PushButton::new("LESS", Msg::Less)).push(PushButton::new("MORE", Msg::More)))
+            .push(row().spacing(16.0).push(push_button("LESS", Msg::Less)).push(push_button("MORE", Msg::More)))
             .into()
     }
 }
