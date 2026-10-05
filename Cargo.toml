@@ -10,7 +10,8 @@ repository = "https://github.com/mcdearman/neo"
 
 [workspace.dependencies]
 neo-theme = { path = "crates/neo-theme" }
-armature-render = { path = "crates/armature-render" }
-armature = { path = "crates/armature" }
+# The framework lives in its own repository, checked out next to this one.
+armature-render = { path = "../armature/crates/armature-render" }
+armature = { path = "../armature/crates/armature" }
 neo = { path = "crates/neo" }
 neo-desktop = { path = "crates/neo-desktop" }
