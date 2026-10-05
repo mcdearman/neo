@@ -8,6 +8,10 @@
 
 mod detail;
 mod inspect;
+mod heat;
+mod sensors;
+#[cfg(target_os = "macos")]
+mod smc;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -27,6 +31,7 @@ const MAX_PROCESSES: usize = 150;
 enum Page {
     Processes,
     Resources,
+    Sensors,
     Storage,
 }
 
@@ -78,6 +83,12 @@ struct Monitor {
     /// The process whose threads are shown in place of the process list.
     inspect: Option<detail::Inspect>,
     proxy: Option<Proxy<Msg>>,
+    /// The latest temperatures and fan speeds, once the reader has answered.
+    heat: Option<sensors::Reading>,
+    cpu_heat: VecDeque<f32>,
+    gpu_heat: VecDeque<f32>,
+    /// Tells the sensor thread whether anyone is looking, so it rests otherwise.
+    watching_heat: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +104,8 @@ enum Msg {
     ThreadSort(detail::ThreadSort),
     /// A swap measurement finished, for the process with this ID.
     Swap(u32, Option<u64>),
+    /// A reading from the sensor thread.
+    Heat(sensors::Reading),
     Move(isize),
     End,
     ConfirmEnd,
@@ -133,6 +146,10 @@ impl Monitor {
             confirm_end: false,
             status: None,
             inspect: None,
+            heat: None,
+            cpu_heat: VecDeque::new(),
+            gpu_heat: VecDeque::new(),
+            watching_heat: Default::default(),
             proxy: None,
         };
         m.sample();
@@ -220,7 +237,29 @@ impl App for Monitor {
     }
 
     fn start(&mut self, proxy: Proxy<Msg>) {
-        self.proxy = Some(proxy);
+        self.proxy = Some(proxy.clone());
+        // Reading sensors takes tens of milliseconds, so a thread does it,
+        // and only while the Sensors page is open.
+        let watching = self.watching_heat.clone();
+        let brand = {
+            let sys = System::new_with_specifics(sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::nothing()));
+            sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default()
+        };
+        std::thread::spawn(move || {
+            let mut reader = sensors::Reader::new(&brand);
+            let mut last: Option<Instant> = None;
+            loop {
+                if !watching.load(std::sync::atomic::Ordering::Relaxed) {
+                    last = None;
+                } else if last.is_none_or(|t| t.elapsed() >= heat::EVERY) {
+                    last = Some(Instant::now());
+                    if !proxy.send(Msg::Heat(reader.read())) {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
     }
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
@@ -239,7 +278,20 @@ impl App for Monitor {
 
     fn update(&mut self, m: Msg) {
         match m {
-            Msg::Page(p) => self.page = p,
+            Msg::Page(p) => {
+                self.page = p;
+                self.watching_heat.store(p == Page::Sensors, std::sync::atomic::Ordering::Relaxed);
+            }
+            Msg::Heat(reading) => {
+                // With no core sensor reporting, the chart follows the chips beside them.
+                if let Some(t) = reading.hottest(sensors::Kind::Cpu).or_else(|| reading.beside_cpu()) {
+                    push(&mut self.cpu_heat, t);
+                }
+                if let Some(t) = reading.hottest(sensors::Kind::Gpu) {
+                    push(&mut self.gpu_heat, t);
+                }
+                self.heat = Some(reading);
+            }
             Msg::Sample => self.sample(),
             Msg::Query(q) => self.query = q,
             Msg::Sort(s) => {
@@ -315,7 +367,7 @@ impl App for Monitor {
         let cpu = *self.cpu.back().unwrap_or(&0.0);
         let mem = *self.memory.back().unwrap_or(&0.0);
         let mut side = column().spacing(2.0).width(Length::Fill).push(section("Monitor"));
-        for (page, glyph, name) in [(Page::Processes, icons::LIST, "Processes"), (Page::Resources, icons::ACTIVITY, "Resources"), (Page::Storage, icons::HARD_DRIVE, "Storage")] {
+        for (page, glyph, name) in [(Page::Processes, icons::LIST, "Processes"), (Page::Resources, icons::ACTIVITY, "Resources"), (Page::Sensors, icons::THERMOMETER, "Sensors"), (Page::Storage, icons::HARD_DRIVE, "Storage")] {
             side = side.push(nav_item(glyph, name, self.page == page, Msg::Page(page)));
         }
         let mini = |label: &str, v: f32, tone: Tone| -> Element<Msg> {
@@ -326,20 +378,27 @@ impl App for Monitor {
                 .push(progress_bar(v / 100.0).height(8.0).tone(tone))
                 .into()
         };
-        side = side.push(Space::fill_y()).push(container(column().spacing(12.0).width(Length::Fill).push(mini("CPU", cpu, Tone::Accent)).push(mini("Memory", mem, Tone::Good))).padding([10.0, 12.0]));
+        let mut meters = column().spacing(12.0).width(Length::Fill).push(mini("CPU", cpu, Tone::Accent)).push(mini("Memory", mem, Tone::Good));
+        // Swap across the whole system, on computers that have any.
+        let swap_total = self.sys.total_swap();
+        if swap_total > 0 {
+            meters = meters.push(mini("Swap", self.sys.used_swap() as f32 / swap_total as f32 * 100.0, Tone::Warn));
+        }
+        side = side.push(Space::fill_y()).push(container(meters).padding([10.0, 12.0]));
         let body = match self.page {
             Page::Processes => match &self.inspect {
                 Some(inspect) => self.detail(inspect),
                 None => self.processes(),
             },
             Page::Resources => self.resources(),
+            Page::Sensors => self.sensors(),
             Page::Storage => self.storage(),
         };
         split(side, body)
     }
 }
 
-fn panel<M: 'static>(title: &str, detail: String, body: impl Into<Element<M>>) -> Element<M> {
+pub(crate) fn panel<M: 'static>(title: &str, detail: String, body: impl Into<Element<M>>) -> Element<M> {
     container(
         column()
             .spacing(12.0)
@@ -566,6 +625,19 @@ fn snapshots(dir: std::path::PathBuf) {
         h.advance(Duration::from_millis(250));
     }
     let path = dir.join("monitor-threads.png");
+    h.save_png(&path, 1.0).expect("write png");
+    println!("wrote {}", path.display());
+
+    // The Sensors page, once the sensor thread has answered a few times.
+    let mut app = Monitor::new();
+    app.desktop.appearance.scheme = neo_desktop::SchemePref::Light;
+    let mut h = Harness::new(app, Size::new(1060.0, 700.0)).expect("GPU");
+    h.app_mut().update(Msg::Page(Page::Sensors));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(250));
+        h.advance(Duration::from_millis(250));
+    }
+    let path = dir.join("monitor-sensors.png");
     h.save_png(&path, 1.0).expect("write png");
     println!("wrote {}", path.display());
 }
