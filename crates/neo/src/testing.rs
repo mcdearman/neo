@@ -2,7 +2,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use neo_render::Size;
+use armature_render::Size;
 use neo_theme::{Scheme, Theme};
 
 use crate::app::{App, Themed};

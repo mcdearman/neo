@@ -9,7 +9,7 @@ license.workspace = true
 cc = "1"
 
 [dependencies]
-neo-render.workspace = true
+armature-render.workspace = true
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 winit = "0.30"
 pollster = "1.0.1"

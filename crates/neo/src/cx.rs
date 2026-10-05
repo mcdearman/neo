@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use armature::{Cx, DrawCx};
-use neo_render::{Color, Rect};
+use armature_render::{Color, Rect};
 use neo_theme::Theme;
 
 /// Reads the Neo [`Theme`] inside a widget.

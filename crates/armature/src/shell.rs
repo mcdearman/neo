@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neo_render::{wgpu, Point, Renderer, Size, SurfaceTarget};
+use armature_render::{wgpu, Point, Renderer, Size, SurfaceTarget};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -104,7 +104,7 @@ struct Shell<A: App> {
     retry_at: Option<Instant>,
     /// The app's window state as last applied to the window.
     state: Option<crate::app::WindowState>,
-    /// An edge drag Neo is carrying out itself, where the platform cannot.
+    /// An edge drag the framework is carrying out itself, where the platform cannot.
     resizing: Option<ManualResize>,
     /// Files let go over the window, gathered until the batch is complete.
     dropped: Vec<std::path::PathBuf>,
@@ -299,10 +299,10 @@ impl<A: App> Shell<A> {
         let size = gpu.window.inner_size();
         // Wayland does not tell clients where their windows are.
         let pos = gpu.window.inner_position().unwrap_or_default();
-        let frame = neo_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
+        let frame = armature_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
         let screen = gpu.window.current_monitor().map_or(frame, |m| {
             let (p, s) = (m.position(), m.size());
-            neo_render::Rect::new(p.x as f32 / scale, p.y as f32 / scale, s.width as f32 / scale, s.height as f32 / scale)
+            armature_render::Rect::new(p.x as f32 / scale, p.y as f32 / scale, s.width as f32 / scale, s.height as f32 / scale)
         });
         self.ui.window_geometry(crate::app::WindowGeometry { frame, screen, scale });
     }
@@ -329,14 +329,14 @@ impl<A: App> Shell<A> {
             wgpu::CurrentSurfaceTexture::Lost => {
                 match gpu.instance.create_surface(gpu.window.clone()) {
                     Ok(s) => gpu.surface = s,
-                    Err(e) => eprintln!("neo: could not recreate surface: {e}"),
+                    Err(e) => eprintln!("armature: could not recreate surface: {e}"),
                 }
                 gpu.surface.configure(gpu.renderer.device(), &gpu.config);
                 gpu.window.request_redraw();
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                eprintln!("neo: surface validation error");
+                eprintln!("armature: surface validation error");
                 return;
             }
         };
@@ -418,7 +418,7 @@ impl<A: App> Shell<A> {
         Modifiers { shift: m.shift_key(), ctrl: m.control_key(), alt: m.alt_key(), logo: m.super_key() }
     }
 
-    /// With Neo decorations on Linux and Windows, the window edges resize.
+    /// With custom decorations on Linux and Windows, the window edges resize.
     fn resize_edge(&self, p: Point) -> Option<ResizeEdge> {
         if cfg!(target_os = "macos") || self.settings.decorations != Decorations::Custom || !self.settings.resizable {
             return None;

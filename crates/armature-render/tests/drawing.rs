@@ -2,7 +2,7 @@
 //! pixels. Needs a GPU adapter (any Metal, Vulkan, DX12 or GL device,
 //! including software rasterisers).
 
-use neo_render::{Color, Fonts, Paint, Point, Rect, Renderer, Scene, Shadow};
+use armature_render::{Color, Fonts, Paint, Point, Rect, Renderer, Scene, Shadow};
 
 const W: usize = 100;
 const WHITE: [u8; 3] = [255, 255, 255];

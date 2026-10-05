@@ -1,4 +1,4 @@
-use neo_render::{Point, Size};
+use armature_render::{Point, Size};
 use neo_theme::{Color, Surface};
 
 use super::style::lerp_paint;

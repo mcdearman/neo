@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use neo_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
+use armature_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::Color;
 
 use armature::document::{text_between, Action, ClipboardNeed, Document, Motion, Pos, Scroll, VimView};

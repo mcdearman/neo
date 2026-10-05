@@ -21,7 +21,7 @@ pub(crate) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool 
 /// Where the pointer is in the window, in logical pixels, when the platform
 /// can say without a pointer event. Needed while another app's drag is over
 /// the window, because no pointer events arrive then.
-pub(crate) fn pointer_position(window: &Window) -> Option<neo_render::Point> {
+pub(crate) fn pointer_position(window: &Window) -> Option<armature_render::Point> {
     #[cfg(target_os = "macos")]
     {
         macos::pointer_position(window)
@@ -36,7 +36,7 @@ pub(crate) fn pointer_position(window: &Window) -> Option<neo_render::Point> {
 /// Makes the window a plain rectangle with no system frame, or gives the
 /// frame back. macOS rounds the corners of every titled window, so a bare,
 /// see-through window drops its title bar to get square corners. Other
-/// platforms' Neo windows are already undecorated rectangles.
+/// platforms' windows are already undecorated rectangles.
 pub(crate) fn set_square(window: &Window, square: bool) {
     #[cfg(target_os = "macos")]
     macos::set_square(window, square);
@@ -61,7 +61,7 @@ pub(crate) fn set_blur_strength(window: &Window, radius: f32) -> bool {
 }
 
 /// Turns the compositor's background blur behind a transparent window on or
-/// off. `radius` is the corner radius Neo draws the window with, so the blur
+/// off. `radius` is the corner radius the app draws the window with, so the blur
 /// does not show outside the rounded corners.
 ///
 /// - macOS 26+: clear Liquid Glass clipped to `radius`. Older macOS: a
@@ -84,14 +84,14 @@ pub(crate) fn set_blur(window: &Window, enabled: bool, radius: f32) {
         if enabled {
             let radius = radius as f64;
             // Clear Liquid Glass (macOS 26+) is the most transparent system
-            // blur. Neo paints its own tint on top, so none is set here.
+            // blur. The app paints its own tint on top, so none is set here.
             let result = apply_liquid_glass(window, LiquidGlassOptions::new(NSGlassEffectViewStyle::Clear).radius(radius)).or_else(|_| {
                 // Older macOS: the HUD material is the least tinted blur.
                 apply_vibrancy(window, NSVisualEffectMaterial::HudWindow, Some(NSVisualEffectState::Active), Some(radius))
             });
             match result {
                 Ok(()) => macos::raise_metal_layer(window),
-                Err(e) => eprintln!("neo: window blur unavailable: {e}"),
+                Err(e) => eprintln!("armature: window blur unavailable: {e}"),
             }
         }
     }
@@ -104,7 +104,7 @@ pub(crate) fn set_blur(window: &Window, enabled: bool, radius: f32) {
             window_vibrancy::clear_acrylic(window)
         };
         if let Err(e) = result {
-            eprintln!("neo: window blur unavailable: {e}");
+            eprintln!("armature: window blur unavailable: {e}");
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -124,12 +124,12 @@ mod macos {
     /// wgpu draws into a `CAMetalLayer` added directly to the content view's
     /// layer, and window-vibrancy inserts its blur view into the same view.
     /// AppKit attaches the blur view's layer lazily and places it above the
-    /// Metal layer, hiding Neo's content. Raising the Metal layer's
+    /// Metal layer, hiding the app's content. Raising the Metal layer's
     /// z-position keeps it on top whatever order AppKit chooses.
     /// wgpu draws into a `CAMetalLayer` added directly to the content view's
     /// layer, and window-vibrancy inserts its blur view into the same view.
     /// AppKit attaches the blur view's layer lazily and places it above the
-    /// Metal layer, hiding Neo's content. Raising the Metal layer's
+    /// Metal layer, hiding the app's content. Raising the Metal layer's
     /// z-position keeps it on top whatever order AppKit chooses.
     fn ns_string(s: &std::ffi::CStr) -> *mut AnyObject {
         let cls = objc2::runtime::AnyClass::get(c"NSString").expect("Foundation is loaded");
@@ -190,7 +190,7 @@ mod macos {
 
     /// Swaps the titled style, whose corners the system rounds, for a
     /// borderless one. winit's `set_decorations` would also drop the
-    /// full-size content view the Neo title bar relies on, so the style mask
+    /// full-size content view a custom title bar relies on, so the style mask
     /// is set here.
     pub(super) fn set_square(window: &Window, square: bool) {
         const TITLED: usize = 1 << 0;
@@ -216,7 +216,7 @@ mod macos {
             }
             let _: () = msg_send![ns_window, setStyleMask: new];
             if !square {
-                // The title bar buttons come back with the frame; Neo draws its own.
+                // The title bar buttons come back with the frame; the app draws its own.
                 for button in 0..3usize {
                     let b: *mut AnyObject = msg_send![ns_window, standardWindowButton: button];
                     if !b.is_null() {
@@ -230,8 +230,8 @@ mod macos {
     }
 
     unsafe extern "C" {
-        fn neo_drag_files(ns_view: *mut std::ffi::c_void, paths: *const *const std::ffi::c_char, count: std::ffi::c_int) -> std::ffi::c_int;
-        fn neo_pointer_in_view(ns_view: *mut std::ffi::c_void, x: *mut f64, y: *mut f64) -> std::ffi::c_int;
+        fn armature_drag_files(ns_view: *mut std::ffi::c_void, paths: *const *const std::ffi::c_char, count: std::ffi::c_int) -> std::ffi::c_int;
+        fn armature_pointer_in_view(ns_view: *mut std::ffi::c_void, x: *mut f64, y: *mut f64) -> std::ffi::c_int;
     }
 
     pub(super) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool {
@@ -241,15 +241,15 @@ mod macos {
         let pointers: Vec<*const std::ffi::c_char> = c_paths.iter().map(|p| p.as_ptr()).collect();
         // SAFETY: winit hands out a valid NSView, this runs on the main thread,
         // and the path strings outlive the call.
-        unsafe { neo_drag_files(h.ns_view.as_ptr(), pointers.as_ptr(), pointers.len() as std::ffi::c_int) != 0 }
+        unsafe { armature_drag_files(h.ns_view.as_ptr(), pointers.as_ptr(), pointers.len() as std::ffi::c_int) != 0 }
     }
 
-    pub(super) fn pointer_position(window: &Window) -> Option<neo_render::Point> {
+    pub(super) fn pointer_position(window: &Window) -> Option<armature_render::Point> {
         let handle = window.window_handle().ok()?;
         let RawWindowHandle::AppKit(h) = handle.as_raw() else { return None };
         let (mut x, mut y) = (0.0, 0.0);
         // SAFETY: winit hands out a valid NSView and the out-pointers are valid.
-        (unsafe { neo_pointer_in_view(h.ns_view.as_ptr(), &mut x, &mut y) } != 0).then(|| neo_render::Point::new(x as f32, y as f32))
+        (unsafe { armature_pointer_in_view(h.ns_view.as_ptr(), &mut x, &mut y) } != 0).then(|| armature_render::Point::new(x as f32, y as f32))
     }
 
     pub(super) fn raise_metal_layer(window: &Window) {

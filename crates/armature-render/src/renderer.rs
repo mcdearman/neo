@@ -99,26 +99,26 @@ impl Renderer {
     /// `fonts` are the typefaces text is drawn with.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, fonts: crate::Fonts) -> Self {
         let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("neo shapes"),
+            label: Some("armature shapes"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/shape.wgsl"))),
         });
         let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("neo blur"),
+            label: Some("armature blur"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/blur.wgsl"))),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("neo blit"),
+            label: Some("armature blit"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/blit.wgsl"))),
         });
 
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("neo globals"),
+            label: Some("armature globals"),
             size: std::mem::size_of::<Globals>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let globals_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neo globals"),
+            label: Some("armature globals"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -131,7 +131,7 @@ impl Renderer {
             }],
         });
         let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("neo globals"),
+            label: Some("armature globals"),
             layout: &globals_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
@@ -153,7 +153,7 @@ impl Renderer {
             count: None,
         };
         let backdrop_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neo backdrop"),
+            label: Some("armature backdrop"),
             entries: &[tex_entry(0), samp_entry(1)],
         });
 
@@ -171,7 +171,7 @@ impl Renderer {
         };
 
         let shape_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("neo shapes"),
+            label: Some("armature shapes"),
             bind_group_layouts: &[Some(&globals_bgl), Some(&backdrop_bgl)],
             immediate_size: 0,
         });
@@ -180,7 +180,7 @@ impl Renderer {
             4 => Float32x4, 5 => Float32x4, 6 => Float32x4
         ];
         let shape_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("neo shapes"),
+            label: Some("armature shapes"),
             layout: Some(&shape_layout),
             vertex: wgpu::VertexState {
                 module: &shape_shader,
@@ -216,14 +216,14 @@ impl Renderer {
 
         let instance_capacity = 1024;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("neo instances"),
+            label: Some("armature instances"),
             size: instance_capacity * std::mem::size_of::<Instance>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let linear = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("neo linear"),
+            label: Some("armature linear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -232,7 +232,7 @@ impl Renderer {
         });
 
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neo blur"),
+            label: Some("armature blur"),
             entries: &[
                 tex_entry(0),
                 samp_entry(1),
@@ -249,13 +249,13 @@ impl Renderer {
             ],
         });
         let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("neo blur"),
+            label: Some("armature blur"),
             bind_group_layouts: &[Some(&blur_bgl)],
             immediate_size: 0,
         });
         let blur_pipeline = |entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("neo blur"),
+                label: Some("armature blur"),
                 layout: Some(&blur_layout),
                 vertex: wgpu::VertexState {
                     module: &blur_shader,
@@ -283,15 +283,15 @@ impl Renderer {
         let blur_down = blur_pipeline("fs_down");
         let blur_up = blur_pipeline("fs_up");
         let blur_params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("neo blur params"),
+            label: Some("armature blur params"),
             size: BLUR_SLOT * BLUR_SLOTS,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let dummy = make_target(&device, "neo dummy", 1, 1);
+        let dummy = make_target(&device, "armature dummy", 1, 1);
 
         let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neo blit"),
+            label: Some("armature blit"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -372,13 +372,13 @@ impl Renderer {
         if self.canvas.as_ref().is_some_and(|c| c.width == width && c.height == height) {
             return;
         }
-        self.canvas = Some(make_target(&self.device, "neo canvas", width, height));
+        self.canvas = Some(make_target(&self.device, "armature canvas", width, height));
         self.blur_levels.clear();
         let (mut w, mut h) = (width, height);
         for i in 0..MAX_BLUR_LEVELS {
             w = (w / 2).max(1);
             h = (h / 2).max(1);
-            self.blur_levels.push(make_target(&self.device, &format!("neo blur {i}"), w, h));
+            self.blur_levels.push(make_target(&self.device, &format!("armature blur {i}"), w, h));
         }
     }
 
@@ -399,7 +399,7 @@ impl Renderer {
         if all.len() as u64 > self.instance_capacity {
             self.instance_capacity = (all.len() as u64).next_power_of_two();
             self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("neo instances"),
+                label: Some("armature instances"),
                 size: self.instance_capacity * std::mem::size_of::<Instance>() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -455,11 +455,11 @@ impl Renderer {
                 areas,
                 &mut self.swash,
             ) {
-                eprintln!("neo: text prepare failed: {e:?}");
+                eprintln!("armature: text prepare failed: {e:?}");
             }
         }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("neo frame") });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("armature frame") });
         let clear = {
             let c = scene.clear;
             wgpu::Color { r: (c.r * c.a) as f64, g: (c.g * c.a) as f64, b: (c.b * c.a) as f64, a: c.a as f64 }
@@ -475,7 +475,7 @@ impl Renderer {
             }
             let canvas = self.canvas.as_ref().unwrap();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("neo layer"),
+                label: Some("armature layer"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &canvas.view,
                     depth_slice: None,
@@ -502,7 +502,7 @@ impl Renderer {
             self.images.render(&mut pass, &self.globals_bg, i);
             if !layer.texts.is_empty()
                 && let Err(e) = self.text_renderers[i].render(&self.atlas, &self.viewport, &mut pass) {
-                    eprintln!("neo: text render failed: {e:?}");
+                    eprintln!("armature: text render failed: {e:?}");
                 }
         }
         encoder
@@ -514,7 +514,7 @@ impl Renderer {
             None => &self.dummy.view,
         };
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("neo backdrop"),
+            label: Some("armature backdrop"),
             layout: &self.backdrop_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
@@ -543,7 +543,7 @@ impl Renderer {
             };
             self.queue.write_buffer(&self.blur_params, at, bytemuck::bytes_of(&params));
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("neo blur pass"),
+                label: Some("armature blur pass"),
                 layout: &self.blur_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
@@ -559,7 +559,7 @@ impl Renderer {
                 ],
             });
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("neo blur"),
+                label: Some("armature blur"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &dst.view,
                     depth_slice: None,
@@ -594,7 +594,7 @@ impl Renderer {
             return i;
         }
         let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("neo blit"),
+            label: Some("armature blit"),
             bind_group_layouts: &[Some(&self.blit_bgl)],
             immediate_size: 0,
         });
@@ -603,7 +603,7 @@ impl Renderer {
             ("UNPREMULTIPLY", if target.unpremultiply { 1.0 } else { 0.0 }),
         ];
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("neo blit"),
+            label: Some("armature blit"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &self.blit_shader,
@@ -633,13 +633,13 @@ impl Renderer {
         let pi = self.blit_pipeline(surface);
         let canvas = self.canvas.as_ref().unwrap();
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("neo blit"),
+            label: Some("armature blit"),
             layout: &self.blit_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&canvas.view) }],
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("neo blit"),
+                label: Some("armature blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
                     depth_slice: None,
@@ -666,7 +666,7 @@ impl Renderer {
         let canvas = self.canvas.as_ref().unwrap();
         let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("neo readback"),
+            label: Some("armature readback"),
             size: (row * height) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,

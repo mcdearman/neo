@@ -33,4 +33,4 @@ pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use runtime::Ui;
 pub use shell::{run, Error};
 
-pub use neo_render::{Color, Corners, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};
+pub use armature_render::{Color, Corners, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};

@@ -1,6 +1,6 @@
 use std::ops::RangeInclusive;
 
-use neo_render::{Rect, Size};
+use armature_render::{Rect, Size};
 use neo_theme::Surface;
 
 use super::style::lerp_paint;

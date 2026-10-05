@@ -1,4 +1,4 @@
-use neo_render::{FontFamily, Point, Size, TextLayout};
+use armature_render::{FontFamily, Point, Size, TextLayout};
 use neo_theme::{TextRole, Weight};
 
 use super::style::Tone;

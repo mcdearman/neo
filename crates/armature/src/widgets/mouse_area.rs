@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use neo_render::{Point, Size};
+use armature_render::{Point, Size};
 
 use crate::core::{Cx, DrawCx, Element, EventCx, Length, Limits, Widget, WindowRequest};
 use crate::event::{Event, PointerButton, Status};

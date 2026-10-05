@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::any::Any;
 use std::rc::Rc;
 
-use neo_render::{Color, Fonts, Point, Rect, Size, TextStyle};
+use armature_render::{Color, Fonts, Point, Rect, Size, TextStyle};
 
 use crate::core::Element;
 use crate::event::KeyEvent;
@@ -295,7 +295,7 @@ pub struct WindowSettings {
     pub min_size: Option<Size>,
     pub decorations: Decorations,
     pub resizable: bool,
-    /// Identifies the app to the desktop, such as `org.neo.Files`. On Linux
+    /// Identifies the app to the desktop, such as `org.example.Files`. On Linux
     /// this is the Wayland app ID and X11 class, which must match the name
     /// of the app's `.desktop` file for docks and menus to show its icon.
     pub app_id: Option<String>,

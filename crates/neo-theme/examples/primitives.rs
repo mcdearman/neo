@@ -1,6 +1,6 @@
 //! Renders every primitive to `target/primitives.png`.
 
-use neo_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
+use armature_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
 use neo_theme::{Color, Scheme, Surface, Theme};
 
 fn main() {

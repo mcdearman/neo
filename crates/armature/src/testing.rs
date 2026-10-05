@@ -5,7 +5,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use neo_render::{Point, Renderer, Size};
+use armature_render::{Point, Renderer, Size};
 
 use crate::app::{App, Scheme};
 use crate::event::{Event, Key, KeyEvent, Modifiers, PointerButton};

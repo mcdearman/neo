@@ -1,6 +1,6 @@
 //! Widgets that display values: progress bars, ring gauges and sparklines.
 
-use neo_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
+use armature_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::{Color, Surface, TextRole};
 
 use super::style::Tone;

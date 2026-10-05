@@ -7,7 +7,7 @@
 pub mod fonts;
 pub mod icons;
 
-pub use neo_render::{Color, Paint, Shadow};
+pub use armature_render::{Color, Paint, Shadow};
 
 /// A single glyph from the bundled Lucide icon font. See [`icons`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -266,11 +266,11 @@ pub struct TextSpec {
 
 impl TextSpec {
     /// The renderer's text style for this role, in the interface typeface.
-    pub fn style(self) -> neo_render::TextStyle {
-        neo_render::TextStyle {
+    pub fn style(self) -> armature_render::TextStyle {
+        armature_render::TextStyle {
             size: self.size,
             weight: self.weight.0,
-            family: neo_render::FontFamily::Sans,
+            family: armature_render::FontFamily::Sans,
             line_height: self.line_height,
             letter_spacing: self.letter_spacing,
         }

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use neo_render::{Color, Rect, Scene, Size, TextSystem, Point};
+use armature_render::{Color, Rect, Scene, Size, TextSystem, Point};
 
 use crate::event::{Event, Status};
 
@@ -314,7 +314,7 @@ impl<'a, 'b> Cx<'a, 'b> {
     }
 
     /// The style's default text style, which [`Label`](crate::widgets::Label) uses.
-    pub fn text_style(&self) -> neo_render::TextStyle {
+    pub fn text_style(&self) -> armature_render::TextStyle {
         self.shared.style.text_style()
     }
 

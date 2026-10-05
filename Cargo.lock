@@ -137,14 +137,25 @@ name = "armature"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "armature-render",
  "cc",
- "neo-render",
  "objc2 0.6.4",
  "pollster",
  "raw-window-handle",
  "regex",
  "window-vibrancy",
  "winit",
+]
+
+[[package]]
+name = "armature-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glyphon",
+ "png",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]
@@ -1594,7 +1605,7 @@ name = "neo"
 version = "0.1.0"
 dependencies = [
  "armature",
- "neo-render",
+ "armature-render",
  "neo-theme",
  "png",
 ]
@@ -1684,17 +1695,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "neo-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glyphon",
- "png",
- "pollster",
- "wgpu",
-]
-
-[[package]]
 name = "neo-settings"
 version = "0.1.0"
 dependencies = [
@@ -1716,7 +1716,7 @@ dependencies = [
 name = "neo-theme"
 version = "0.1.0"
 dependencies = [
- "neo-render",
+ "armature-render",
 ]
 
 [[package]]
@@ -4013,7 +4013,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
- "neo-render",
+ "armature-render",
  "neo-theme",
 ]
 

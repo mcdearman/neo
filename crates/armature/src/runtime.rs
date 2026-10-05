@@ -2,7 +2,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neo_render::{Color, Point, Rect, Scene, Size, TextSystem};
+use armature_render::{Color, Point, Rect, Scene, Size, TextSystem};
 
 use crate::app::{App, Chrome, Decorations, Proxy, Scheme, Style};
 use crate::core::{CursorIcon, Cx, DrawCx, Element, EventCx, IdPass, Limits, Node, RuntimeState, Shared, StateStore, WidgetId, WindowRequest};

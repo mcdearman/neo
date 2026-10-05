@@ -1,4 +1,4 @@
-use neo_render::{Point, Rect, Size};
+use armature_render::{Point, Rect, Size};
 
 use crate::ThemeCx;
 use crate::anim::Anim;

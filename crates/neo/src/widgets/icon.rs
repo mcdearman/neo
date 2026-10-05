@@ -1,4 +1,4 @@
-use neo_render::{FontFamily, Point, Size, TextLayout, TextStyle};
+use armature_render::{FontFamily, Point, Size, TextLayout, TextStyle};
 
 use super::style::Tone;
 use crate::ThemeCx;

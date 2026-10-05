@@ -1,4 +1,4 @@
-use neo_render::Size;
+use armature_render::Size;
 
 use crate::core::{Cx, DrawCx, Length, Limits, Widget};
 use crate::ThemeCx;
@@ -37,7 +37,7 @@ impl<M> Widget<M> for Divider {
         let b = cx.bounds();
         let theme = *cx.theme();
         let p = theme.palette();
-        let line = if self.vertical { neo_render::Rect::new(b.x, b.y, 1.0, b.h) } else { neo_render::Rect::new(b.x, b.y, b.w, 1.0) };
+        let line = if self.vertical { armature_render::Rect::new(b.x, b.y, 1.0, b.h) } else { armature_render::Rect::new(b.x, b.y, b.w, 1.0) };
         cx.scene.fill(line, 0.0, p.line, None);
     }
 }

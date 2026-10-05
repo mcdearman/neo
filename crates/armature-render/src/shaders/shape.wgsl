@@ -1,4 +1,4 @@
-// Every non-text primitive in Neo is one instanced quad evaluated with a
+// Every non-text primitive is one instanced quad evaluated with a
 // signed distance function. Coordinates are logical pixels; `g.scale`
 // converts to physical pixels for anti-aliasing.
 

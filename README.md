@@ -49,7 +49,7 @@ cargo xtask uninstall   # remove them
 | Linux | `~/.local/bin`, with `.desktop` entries and icons under `~/.local/share` (set `PREFIX` to change) | The app menu of GNOME, KDE Plasma or any freedesktop.org desktop |
 | Windows | `%LOCALAPPDATA%\Programs\Neo` | The Start menu's Neo folder |
 
-On macOS and Windows the apps are named Neo Files, Neo Terminal and so on, so they don't sit next to the system's own Files and Terminal with the same name. `cargo xtask icons` redraws the app icons in `dist/icons` with `neo-render`.
+On macOS and Windows the apps are named Neo Files, Neo Terminal and so on, so they don't sit next to the system's own Files and Terminal with the same name. `cargo xtask icons` redraws the app icons in `dist/icons` with `armature-render`.
 
 ## Writing an app
 
@@ -85,7 +85,7 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 | Crate | Role |
 |---|---|
-| `neo-render` | wgpu renderer, with no look of its own: the caller supplies colours, shadows and typefaces. Every shape is one instanced SDF quad: rounded rects, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Includes dual-Kawase backdrop blur, images, glyphon text and PNG readback. |
+| `armature-render` | wgpu renderer, with no look of its own: the caller supplies colours, shadows and typefaces. Every shape is one instanced SDF quad: rounded rects, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Includes dual-Kawase backdrop blur, images, glyphon text and PNG readback. |
 | `armature` | The framework (working name): windows, input, layout, the Elm-style app loop, widget state, a headless test harness, and the widgets that only arrange or capture. Carries a toolkit's theme to its widgets without reading it. |
 | `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |
 | `neo` | The Neo toolkit: themed controls (buttons, inputs, toggles, sliders, menus, the code editor), the Neo title bar, and the `App` trait the apps implement, built on `armature`. |

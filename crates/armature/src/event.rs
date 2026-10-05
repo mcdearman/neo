@@ -26,7 +26,7 @@ impl Modifiers {
     }
 }
 
-/// Keys that Neo widgets react to. Everything else arrives as `Character`
+/// Keys that widgets react to. Everything else arrives as `Character`
 /// or `Other`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Key {

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use neo_render::{Point, Rect, Size, TextLayout};
+use armature_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use super::style::lerp_paint;

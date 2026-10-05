@@ -1,5 +1,5 @@
 [package]
-name = "neo-render"
+name = "armature-render"
 description = "GPU renderer for interfaces: SDF shapes, Gaussian shadows, backdrop blur, images and text"
 version.workspace = true
 edition.workspace = true

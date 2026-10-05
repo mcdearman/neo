@@ -154,9 +154,9 @@ pub(crate) struct ImageRenderer {
 
 impl ImageRenderer {
     pub fn new(device: &wgpu::Device, globals_layout: &wgpu::BindGroupLayout, blend: wgpu::BlendState, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("neo images"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shaders/image.wgsl"))) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("armature images"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shaders/image.wgsl"))) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("neo image"),
+            label: Some("armature image"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -167,10 +167,10 @@ impl ImageRenderer {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("neo images"), bind_group_layouts: &[Some(globals_layout), Some(&layout)], immediate_size: 0 });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("armature images"), bind_group_layouts: &[Some(globals_layout), Some(&layout)], immediate_size: 0 });
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("neo images"),
+            label: Some("armature images"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -192,7 +192,7 @@ impl ImageRenderer {
         });
         // Trilinear: blends between the half-size copies when drawn small.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("neo image"),
+            label: Some("armature image"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -201,7 +201,7 @@ impl ImageRenderer {
             ..Default::default()
         });
         let capacity = 16;
-        let instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("neo image instances"), size: capacity * std::mem::size_of::<Instance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("armature image instances"), size: capacity * std::mem::size_of::<Instance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Self { pipeline, layout, sampler, instances, capacity, textures: HashMap::new(), frame: 0, max_side: device.limits().max_texture_dimension_2d, draws: vec![] }
     }
 
@@ -221,7 +221,7 @@ impl ImageRenderer {
         let reuse = self.textures.get(&p.slot).is_some_and(|t| t.size == (w, h) && t.texture.mip_level_count() == levels.len() as u32);
         if !reuse {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("neo image"),
+                label: Some("armature image"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: levels.len() as u32,
                 sample_count: 1,
@@ -233,7 +233,7 @@ impl ImageRenderer {
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("neo image"),
+                label: Some("armature image"),
                 layout: &self.layout,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
             });
@@ -275,7 +275,7 @@ impl ImageRenderer {
         }
         if instances.len() as u64 > self.capacity {
             self.capacity = (instances.len() as u64).next_power_of_two();
-            self.instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("neo image instances"), size: self.capacity * std::mem::size_of::<Instance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.instances = device.create_buffer(&wgpu::BufferDescriptor { label: Some("armature image instances"), size: self.capacity * std::mem::size_of::<Instance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         }
         if !instances.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));

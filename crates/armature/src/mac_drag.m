@@ -1,12 +1,12 @@
-// Starts a system drag of files from a Neo window, and reports where the
+// Starts a system drag of files from a window, and reports where the
 // pointer is while another app's drag is over it. Called from platform.rs.
 
 #import <AppKit/AppKit.h>
 
-@interface NeoDragSource : NSObject <NSDraggingSource>
+@interface ArmatureDragSource : NSObject <NSDraggingSource>
 @end
 
-@implementation NeoDragSource
+@implementation ArmatureDragSource
 - (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
     // The app the files land in decides whether to copy or move them.
     return NSDragOperationCopy | NSDragOperationMove | NSDragOperationLink | NSDragOperationGeneric;
@@ -16,7 +16,7 @@
 // Begins dragging the files at `paths` from `ns_view`. Must be called while
 // the mouse event that started the drag is being handled. Returns 1 if a
 // drag began.
-int neo_drag_files(void *ns_view, const char *const *paths, int count) {
+int armature_drag_files(void *ns_view, const char *const *paths, int count) {
     @autoreleasepool {
         NSView *view = (__bridge NSView *)ns_view;
         NSEvent *event = NSApp.currentEvent;
@@ -37,9 +37,9 @@ int neo_drag_files(void *ns_view, const char *const *paths, int count) {
             [item setDraggingFrame:NSMakeRect(at.x - 20 + shift, at.y - 20 - shift, 40, 40) contents:icon];
             [items addObject:item];
         }
-        static NeoDragSource *source;
+        static ArmatureDragSource *source;
         if (source == nil) {
-            source = [NeoDragSource new];
+            source = [ArmatureDragSource new];
         }
         NSDraggingSession *session = [view beginDraggingSessionWithItems:items event:event source:source];
         session.animatesToStartingPositionsOnCancelOrFail = YES;
@@ -49,7 +49,7 @@ int neo_drag_files(void *ns_view, const char *const *paths, int count) {
 
 // The pointer's position in the view, from the top-left corner in points.
 // Works during a drag from another app, when no mouse events arrive.
-int neo_pointer_in_view(void *ns_view, double *x, double *y) {
+int armature_pointer_in_view(void *ns_view, double *x, double *y) {
     NSView *view = (__bridge NSView *)ns_view;
     if (view == nil || view.window == nil) {
         return 0;

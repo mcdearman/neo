@@ -20,9 +20,9 @@ pub const ALL: &[&[u8]] = &[
     include_bytes!("../assets/lucide.ttf"),
 ];
 
-/// The bundled typefaces, for [`neo_render::Renderer::new`].
-pub fn bundled() -> neo_render::Fonts {
-    neo_render::Fonts {
+/// The bundled typefaces, for [`armature_render::Renderer::new`].
+pub fn bundled() -> armature_render::Fonts {
+    armature_render::Fonts {
         data: ALL.iter().map(|d| std::borrow::Cow::Borrowed(*d)).collect(),
         sans: SANS.into(),
         mono: MONO.into(),

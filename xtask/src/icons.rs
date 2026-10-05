@@ -1,11 +1,11 @@
-//! Draws the app icons with `neo-render` into `dist/icons`.
+//! Draws the app icons with `armature-render` into `dist/icons`.
 //!
 //! Two shapes: a full-bleed rounded square for Linux and Windows, and the
 //! macOS layout, which leaves a margin and a shadow around the tile.
 
 use std::path::Path;
 
-use neo_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
+use armature_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
 use neo_theme::{Color, Shadow};
 
 use crate::apps::{AppInfo, APPS};
