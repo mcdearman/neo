@@ -8,6 +8,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
     Show,
+    /// Bring up the area frame to take a screenshot.
+    Screenshot,
     /// Start recording, or stop the recording in progress.
     ToggleRecording,
     ToggleAutostart,
@@ -60,16 +62,19 @@ mod imp {
         /// app's event loop has started.
         pub fn new(state: TrayState, send: impl Fn(TrayAction) + Send + Sync + 'static) -> Result<Self, String> {
             let show = MenuItem::new("Show Recorder", true, None);
+            let shot = MenuItem::new("Take Screenshot…", true, None);
             let toggle = MenuItem::new(toggle_label(state.recording), true, None);
             let autostart = CheckMenuItem::new("Launch at Startup", true, state.autostart, None);
             let quit = MenuItem::new("Quit Neo Recorder", true, None);
             let menu = Menu::new();
-            menu.append_items(&[&show, &toggle, &PredefinedMenuItem::separator(), &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
-            let (show_id, toggle_id, autostart_id, quit_id) = (show.id().clone(), toggle.id().clone(), autostart.id().clone(), quit.id().clone());
+            menu.append_items(&[&show, &shot, &toggle, &PredefinedMenuItem::separator(), &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
+            let (show_id, shot_id, toggle_id, autostart_id, quit_id) = (show.id().clone(), shot.id().clone(), toggle.id().clone(), autostart.id().clone(), quit.id().clone());
             MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
                 let id = e.id();
                 let action = if *id == show_id {
                     TrayAction::Show
+                } else if *id == shot_id {
+                    TrayAction::Screenshot
                 } else if *id == toggle_id {
                     TrayAction::ToggleRecording
                 } else if *id == autostart_id {
@@ -140,6 +145,7 @@ mod imp {
             let item = |label: &str, action: TrayAction| -> ksni::MenuItem<Self> { StandardItem { label: label.into(), activate: Box::new(move |t: &mut Self| (t.send)(action)), ..Default::default() }.into() };
             vec![
                 item("Show Recorder", TrayAction::Show),
+                item("Take Screenshot…", TrayAction::Screenshot),
                 item(toggle_label(self.state.recording), TrayAction::ToggleRecording),
                 ksni::MenuItem::Separator,
                 CheckmarkItem { label: "Launch at Startup".into(), checked: self.state.autostart, activate: Box::new(|t: &mut Self| (t.send)(TrayAction::ToggleAutostart)), ..Default::default() }.into(),

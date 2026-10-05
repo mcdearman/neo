@@ -163,6 +163,105 @@ fn command(target: &Target, options: Options, path: &Path) -> Result<Child, Stri
     spawn(cmd, "ffmpeg", "Install it, for example with `winget install ffmpeg`, and make sure it is on your PATH.")
 }
 
+/// Takes one picture of `target` and saves it as a PNG at `path`. Blocks
+/// for a moment, so call it off the main thread.
+pub fn screenshot(target: &Target, options: Options, path: &Path) -> Result<Saved, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    }
+    let mut cmd = screenshot_command(target, options, path);
+    let tool = cmd.get_program().to_string_lossy().into_owned();
+    let out = cmd.stdin(Stdio::null()).output().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { format!("Taking a screenshot here needs {tool}, which is not installed.") } else { format!("Could not run {tool}: {e}") })?;
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => Ok(Saved { path: path.to_path_buf(), bytes: m.len(), length: Duration::ZERO }),
+        _ => Err(format!("No screenshot was saved ({}). {}", out.status, permission_hint())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn screenshot_command(target: &Target, _options: Options, path: &Path) -> Command {
+    let mut cmd = Command::new("screencapture");
+    // -x keeps it silent.
+    cmd.arg("-x");
+    let rect = |r: &Rect| format!("-R{},{},{},{}", r.x.round(), r.y.round(), r.w.round(), r.h.round());
+    match target {
+        Target::Screen => {}
+        Target::Window(w) => {
+            // By ID, so the window is captured even if something overlaps it; -o leaves out its shadow.
+            cmd.arg(format!("-l{}", w.id)).arg("-o");
+        }
+        Target::Area(r) => {
+            cmd.arg(rect(r));
+        }
+    }
+    cmd.arg(path);
+    cmd
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn screenshot_command(target: &Target, options: Options, path: &Path) -> Command {
+    let rect = match target {
+        Target::Screen => None,
+        Target::Window(w) => Some(physical(w.frame, options.scale)),
+        Target::Area(r) => Some(physical(*r, options.scale)),
+    };
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // grim is the usual screenshot tool on wlroots compositors.
+        let mut cmd = Command::new("grim");
+        if let Some((x, y, w, h)) = rect {
+            cmd.arg("-g").arg(format!("{x},{y} {w}x{h}"));
+        }
+        cmd.arg(path);
+        return cmd;
+    }
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-f", "x11grab"]);
+    let input = match rect {
+        Some((x, y, w, h)) => {
+            cmd.arg("-video_size").arg(format!("{w}x{h}"));
+            format!("{display}+{x},{y}")
+        }
+        None => display,
+    };
+    cmd.arg("-i").arg(input).args(["-frames:v", "1"]).arg(path);
+    cmd
+}
+
+#[cfg(windows)]
+fn screenshot_command(target: &Target, options: Options, path: &Path) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-f", "gdigrab"]);
+    let rect = match target {
+        Target::Screen => None,
+        Target::Window(w) => Some(physical(w.frame, options.scale)),
+        Target::Area(r) => Some(physical(*r, options.scale)),
+    };
+    if let Some((x, y, w, h)) = rect {
+        cmd.arg("-offset_x").arg(x.to_string()).arg("-offset_y").arg(y.to_string()).arg("-video_size").arg(format!("{w}x{h}"));
+    }
+    cmd.args(["-i", "desktop", "-frames:v", "1"]).arg(path);
+    cmd
+}
+
+/// Reads a PNG file as straight-alpha RGBA pixels.
+pub fn read_png(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?));
+    // Whatever the file holds, come out as 8-bit with an alpha channel.
+    decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut pixels = vec![0; reader.output_buffer_size().ok_or("the picture is too large")?];
+    let info = reader.next_frame(&mut pixels).map_err(|e| e.to_string())?;
+    pixels.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => pixels,
+        // Greyscale screens are rare, but a grey picture is still a picture.
+        png::ColorType::GrayscaleAlpha => pixels.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        other => return Err(format!("unexpected colour type {other:?}")),
+    };
+    Ok((info.width as usize, info.height as usize, rgba))
+}
+
 /// Whether this platform's recorder can record the microphone.
 pub const MICROPHONE: bool = cfg!(not(windows));
 
@@ -509,6 +608,29 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert_eq!({ let mut l = left.clone(); l.sort(); l }, ["clip.gif", "paused.mov"], "no parts are left behind");
         println!("paused.mov: {} bytes, {:?}; clip.gif: {} bytes", std::fs::metadata(dir.join("paused.mov")).unwrap().len(), saved.length, saved.bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reads_pngs_with_and_without_alpha() {
+        let dir = std::env::temp_dir().join(format!("neo-recorder-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, color: png::ColorType, data: &[u8]| {
+            let path = dir.join(name);
+            let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&path).unwrap()), 2, 1);
+            encoder.set_color(color);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(data).unwrap();
+            path
+        };
+        // A screenshot with no alpha channel still comes out as opaque RGBA.
+        let rgb = write("rgb.png", png::ColorType::Rgb, &[255, 0, 0, 0, 0, 255]);
+        assert_eq!(read_png(&rgb).unwrap(), (2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]));
+        let rgba = write("rgba.png", png::ColorType::Rgba, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(read_png(&rgba).unwrap(), (2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let grey = write("grey.png", png::ColorType::Grayscale, &[10, 200]);
+        assert_eq!(read_png(&grey).unwrap(), (2, 1, vec![10, 10, 10, 255, 200, 200, 200, 255]));
+        assert!(read_png(&dir.join("missing.png")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

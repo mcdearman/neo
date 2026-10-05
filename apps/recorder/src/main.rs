@@ -7,7 +7,7 @@
 //!
 //! `--mode screen|window|area` picks what to record, `--window TEXT` chooses
 //! the first window whose app or title contains TEXT, `--record` starts
-//! straight away, `--for SECONDS` stops by itself, `--mic` records the
+//! straight away, `--screenshot` takes a screenshot instead, `--for SECONDS` stops by itself, `--mic` records the
 //! microphone, `--gif` saves a GIF instead of a movie, and `--include-bar`
 //! lets the recording bar appear in the recording. `--hidden` starts in the
 //! tray without showing the window, which is how it starts at login.
@@ -17,6 +17,10 @@
 //! build run from Cargo's `target` folder does not add itself to startup
 //! unless you turn that on. `--dir FOLDER` saves
 //! somewhere other than the Movies or Videos folder.
+//!
+//! Command+Shift+S (Ctrl+Shift+S elsewhere) brings up the same frame to take
+//! a screenshot instead: a PNG of the screen, a window or the framed area,
+//! saved and also copied to the clipboard, ready to paste.
 //!
 //! While recording, the window shrinks to a small bar with the time, Pause
 //! and Stop, kept out of the recording where the system allows. Command+
@@ -56,6 +60,7 @@ const HANDLE: f32 = 10.0;
 const GRAB: f32 = 16.0;
 /// Below this width the frame's controls shrink to icons.
 const NARROW: f32 = 640.0;
+const SHOT_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧S" } else { "Ctrl+Shift+S" };
 const SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,11 +72,20 @@ enum Mode {
 
 const MODES: [Mode; 3] = [Mode::Screen, Mode::Window, Mode::Area];
 
+/// What Enter and the main button do: the last thing the user reached for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Intent {
+    Record,
+    Screenshot,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     Idle,
     /// The window has been told to hide; capture starts once it is gone.
     Starting(Target),
+    /// The window has been told to hide; the screenshot is taken once it is gone.
+    Shooting(Target),
     Recording,
     Saving,
     Done(Saved),
@@ -81,6 +95,7 @@ enum Phase {
 struct Recorder {
     desktop: Desktop,
     mode: Mode,
+    intent: Intent,
     phase: Phase,
     /// Whether the window is wanted on screen when nothing is being recorded.
     shown: bool,
@@ -115,8 +130,22 @@ struct Recorder {
     register_hotkey: bool,
     /// Start recording as soon as the window is up (`--record`).
     auto_record: bool,
+    /// Take a screenshot as soon as the window is up (`--screenshot`).
+    auto_shot: bool,
+    /// A screenshot has been asked for and has not come back yet.
+    shot_in_flight: bool,
+    /// Kept alive after a screenshot is copied: on Linux the picture stays
+    /// on the clipboard only while its owner is running.
+    clipboard: Option<arboard::Clipboard>,
+    /// Whether the last screenshot reached the clipboard, or why not.
+    copied: Option<Result<(), String>>,
+    /// Off for screenshots of the app and for tests, which must not replace
+    /// what the user has copied.
+    copy_shots: bool,
     /// Where recordings are saved (`--dir`); the Movies or Videos folder by default.
     dir: PathBuf,
+    /// Where screenshots are saved; the Pictures folder by default.
+    shots_dir: PathBuf,
     /// Leave the recording bar visible in recordings and screenshots (`--include-bar`).
     include_bar: bool,
     /// Stop by itself after this long (`--for`).
@@ -133,12 +162,16 @@ enum Msg {
     Microphone(bool),
     Gif(bool),
     Record,
+    Screenshot,
+    /// The window is out of the way: take the screenshot.
+    Shoot,
     Begin,
     Pause,
     Resume,
     Stop,
     Finished(Result<Saved, String>),
     Hotkey,
+    ScreenshotHotkey,
     Tray(TrayAction),
     Autostart(bool),
     Hide,
@@ -202,6 +235,7 @@ impl Recorder {
         Self {
             desktop: Desktop::load(),
             mode: Mode::Screen,
+            intent: Intent::Record,
             phase: Phase::Idle,
             shown: true,
             windows: capture::windows(),
@@ -226,7 +260,13 @@ impl Recorder {
             status_after_stop: None,
             register_hotkey,
             auto_record: false,
+            auto_shot: false,
+            shot_in_flight: false,
+            clipboard: None,
+            copied: None,
+            copy_shots: register_hotkey,
             dir: recordings_dir(),
+            shots_dir: user_dir("PICTURES"),
             include_bar: false,
             stop_after: None,
             quit: false,
@@ -247,6 +287,16 @@ impl Recorder {
                 if a.w < 32.0 || a.h < 32.0 { Err("Make the frame a little bigger.".into()) } else { Ok(Target::Area(a)) }
             }
         }
+    }
+
+    /// Puts the picture at `path` on the clipboard, ready to paste.
+    fn copy_picture(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let (width, height, bytes) = capture::read_png(path)?;
+        if self.clipboard.is_none() {
+            self.clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        let clipboard = self.clipboard.as_mut().expect("set above");
+        clipboard.set_image(arboard::ImageData { width, height, bytes: bytes.into() }).map_err(|e| e.to_string())
     }
 
     /// Whether a hidden window can be brought back: by the shortcut or the tray.
@@ -334,7 +384,8 @@ impl App for Recorder {
         let recording = self.busy();
         let framing = self.mode == Mode::Area && self.phase == Phase::Idle;
         WindowState {
-            visible: recording || self.shown,
+            // Out of the way for the instant a screenshot is taken.
+            visible: !matches!(self.phase, Phase::Shooting(_)) && (recording || self.shown),
             // Only the overlays float: the area frame, which has to sit over
             // what it frames, and the recording bar. The ordinary window
             // goes behind whatever the user clicks, like any other.
@@ -364,16 +415,21 @@ impl App for Recorder {
         if self.auto_record {
             proxy.send(Msg::Record);
         }
+        if self.auto_shot {
+            proxy.send(Msg::Screenshot);
+        }
         if !self.register_hotkey {
             return;
         }
         let primary = if cfg!(target_os = "macos") { HotMods::SUPER } else { HotMods::CONTROL };
         let hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyR);
-        match GlobalHotKeyManager::new().and_then(|m| m.register(hotkey).map(|_| m)) {
+        let shot_hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyS);
+        let shot_id = shot_hotkey.id();
+        match GlobalHotKeyManager::new().and_then(|m| m.register_all(&[hotkey, shot_hotkey]).map(|_| m)) {
             Ok(manager) => {
                 GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
                     if e.state() == HotKeyState::Pressed {
-                        proxy.send(Msg::Hotkey);
+                        proxy.send(if e.id() == shot_id { Msg::ScreenshotHotkey } else { Msg::Hotkey });
                     }
                 }));
                 self.hotkeys = Some(manager);
@@ -387,6 +443,7 @@ impl App for Recorder {
         match self.phase {
             // Long enough for the window to leave the screen.
             Phase::Starting(_) => subs.push(Subscription::every(Duration::from_millis(400), Msg::Begin)),
+            Phase::Shooting(_) => subs.push(Subscription::every(Duration::from_millis(350), Msg::Shoot)),
             Phase::Recording => {
                 subs.push(Subscription::every(Duration::from_millis(500), Msg::Tick));
                 if let Some(limit) = self.stop_after {
@@ -400,7 +457,7 @@ impl App for Recorder {
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
         match k.key {
-            Key::Enter if self.phase == Phase::Idle => Some(Msg::Record),
+            Key::Enter if self.phase == Phase::Idle => Some(if self.intent == Intent::Screenshot { Msg::Screenshot } else { Msg::Record }),
             Key::Enter if self.phase == Phase::Recording => Some(Msg::Stop),
             Key::Space if self.phase == Phase::Recording => Some(if self.session.as_ref().is_some_and(|s| s.paused()) { Msg::Resume } else { Msg::Pause }),
             Key::Escape if self.can_hide() && !self.busy() => Some(Msg::Hide),
@@ -429,6 +486,15 @@ impl Recorder {
     fn apply(&mut self, m: Msg) {
         match m {
             Msg::Tray(action) => match action {
+                TrayAction::Screenshot => {
+                    if !self.busy() && self.phase != Phase::Saving {
+                        self.shown = true;
+                        self.phase = Phase::Idle;
+                        self.mode = Mode::Area;
+                        self.intent = Intent::Screenshot;
+                        self.apply(Msg::Refresh);
+                    }
+                }
                 TrayAction::Show => {
                     self.shown = true;
                     self.apply(Msg::Refresh);
@@ -443,7 +509,7 @@ impl Recorder {
                             self.shown = true;
                         }
                     }
-                    Phase::Starting(_) | Phase::Saving => {}
+                    Phase::Starting(_) | Phase::Shooting(_) | Phase::Saving => {}
                 },
                 TrayAction::ToggleAutostart => self.apply(Msg::Autostart(!self.autostart)),
                 TrayAction::Quit => self.apply(Msg::Quit),
@@ -469,6 +535,7 @@ impl Recorder {
             Msg::Gif(on) => self.gif = on,
             Msg::Record => match self.target() {
                 Ok(target) => {
+                    self.intent = Intent::Record;
                     self.home = Some(Point::new(self.frame.x, self.frame.y));
                     self.subject = match &target {
                         Target::Screen => None,
@@ -479,6 +546,32 @@ impl Recorder {
                 }
                 Err(e) => self.phase = Phase::Failed(e),
             },
+            Msg::Screenshot => match self.target() {
+                Ok(target) => {
+                    self.intent = Intent::Screenshot;
+                    self.home = Some(Point::new(self.frame.x, self.frame.y));
+                    self.phase = Phase::Shooting(target);
+                }
+                Err(e) => self.phase = Phase::Failed(e),
+            },
+            Msg::Shoot => {
+                let Phase::Shooting(target) = &self.phase else { return };
+                // The window stays hidden until the picture is taken, so the
+                // phase does not change yet; this stops a second attempt.
+                if std::mem::replace(&mut self.shot_in_flight, true) {
+                    return;
+                }
+                let target = target.clone();
+                let name = format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"));
+                let path = self.shots_dir.join(name);
+                let options = Options { scale: self.scale, ..Default::default() };
+                match self.proxy.clone() {
+                    Some(proxy) => {
+                        std::thread::spawn(move || proxy.send(Msg::Finished(capture::screenshot(&target, options, &path))));
+                    }
+                    None => self.apply(Msg::Finished(capture::screenshot(&target, options, &path))),
+                }
+            }
             Msg::Begin => {
                 let Phase::Starting(target) = &self.phase else { return };
                 let name = format!("Neo Recording {}.{}", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"), capture::EXTENSION);
@@ -509,6 +602,12 @@ impl Recorder {
             }
             Msg::Stop => self.stop(),
             Msg::Finished(result) => {
+                self.shot_in_flight = false;
+                // A screenshot, which has no length, also goes on the clipboard.
+                self.copied = match &result {
+                    Ok(saved) if saved.length.is_zero() && self.copy_shots => Some(self.copy_picture(&saved.path)),
+                    _ => None,
+                };
                 self.phase = match result {
                     Ok(saved) => Phase::Done(saved),
                     Err(e) => Phase::Failed(e),
@@ -533,10 +632,24 @@ impl Recorder {
                         // modes are one click away in the frame's controls.
                         self.phase = Phase::Idle;
                         self.mode = Mode::Area;
+                        self.intent = Intent::Record;
                         self.apply(Msg::Refresh);
                     }
                 }
             },
+            Msg::ScreenshotHotkey => {
+                // Not while something is being recorded or saved.
+                if matches!(self.phase, Phase::Idle | Phase::Done(_) | Phase::Failed(_)) {
+                    let showing_it = self.shown && self.intent == Intent::Screenshot && self.phase == Phase::Idle;
+                    self.shown = !showing_it;
+                    if self.shown {
+                        self.phase = Phase::Idle;
+                        self.mode = Mode::Area;
+                        self.intent = Intent::Screenshot;
+                        self.apply(Msg::Refresh);
+                    }
+                }
+            }
             Msg::Hide => self.shown = false,
             Msg::Quit => {
                 // Finish the file rather than leave a broken one behind.
@@ -559,7 +672,8 @@ impl Recorder {
             }
             Msg::Open => {
                 if let Phase::Done(saved) = &self.phase {
-                    let _ = neo_desktop::fs::open(&saved.path);
+                    // Screenshots open in Neo Photos and recordings in Neo Videos, when installed.
+                    let _ = neo_desktop::fs::open_file(&saved.path);
                 }
             }
             Msg::Reveal => {
@@ -589,20 +703,28 @@ impl Recorder {
         let body: Element<Msg> = match &self.phase {
             Phase::Idle => self.chooser(),
             // Shown as the recording bar instead; see `recording_bar`.
-            Phase::Starting(_) | Phase::Recording => Space::fill_y().into(),
+            Phase::Starting(_) | Phase::Recording | Phase::Shooting(_) => Space::fill_y().into(),
             Phase::Saving => status(icons::VIDEO, Tone::Accent, "Saving…".into(), if self.gif { "Making the GIF. Long recordings take a while.".into() } else { String::new() }, row()),
             Phase::Done(saved) => {
                 let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let dir = saved.path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                // A screenshot has no length.
+                let picture = saved.length.is_zero();
+                let clipboard = match &self.copied {
+                    Some(Ok(())) => " · copied to the clipboard".to_string(),
+                    Some(Err(e)) => format!(" · not copied to the clipboard: {e}"),
+                    None => String::new(),
+                };
+                let detail = if picture { format!("{} · saved in {dir}{clipboard}", human_size(saved.bytes)) } else { format!("{} · {} · saved in {dir}", clock(saved.length), human_size(saved.bytes)) };
                 status(
                     icons::CIRCLE_CHECK,
                     Tone::Good,
                     name,
-                    format!("{} · {} · saved in {dir}", clock(saved.length), human_size(saved.bytes)),
-                    row().spacing(10.0).push(button("Play").on_press(Msg::Open)).push(button("Show in folder").on_press(Msg::Reveal)).push(Button::new(text("Record again").role(TextRole::Strong)).kind(ButtonKind::Accent).on_press(Msg::Reset)),
+                    detail,
+                    row().spacing(10.0).push(button(if picture { "Open" } else { "Play" }).on_press(Msg::Open)).push(button("Show in folder").on_press(Msg::Reveal)).push(Button::new(text("Done").role(TextRole::Strong)).kind(ButtonKind::Accent).on_press(Msg::Reset)),
                 )
             }
-            Phase::Failed(e) => status(icons::TRIANGLE_ALERT, Tone::Warn, "That didn't record".into(), e.clone(), row().push(button("Back").on_press(Msg::Reset))),
+            Phase::Failed(e) => status(icons::TRIANGLE_ALERT, Tone::Warn, "That didn't work".into(), e.clone(), row().push(button("Back").on_press(Msg::Reset))),
         };
         column().width(Length::Fill).height(Length::Fill).padding([0.0, 16.0, 16.0, 16.0]).push(body).into()
     }
@@ -624,7 +746,7 @@ fn mode_switch(mode: Mode) -> Element<Msg> {
 impl Recorder {
     fn shortcut_hint(&self) -> String {
         match &self.hotkey_error {
-            None if self.hotkeys.is_some() => format!("{SHORTCUT} brings up the area frame and stops a recording."),
+            None if self.hotkeys.is_some() => format!("{SHORTCUT} records an area; {SHOT_SHORTCUT} takes a screenshot."),
             Some(e) => format!("The {SHORTCUT} shortcut is unavailable: {e}"),
             None => String::new(),
         }
@@ -678,7 +800,8 @@ impl Recorder {
                 .align(Align::Center)
                 .width(Length::Fill)
                 .push(text(self.shortcut_hint()).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
-                .push(record_button(ready)),
+                .push(self.secondary_button(ready))
+                .push(self.primary_button(ready)),
         )
         .into()
     }
@@ -724,14 +847,15 @@ impl Recorder {
                 let on = self.microphone && !self.gif;
                 r = r.push(icon_button(if on { icons::MIC } else { icons::MIC_OFF }, 34.0).kind(ButtonKind::Ghost).selected(on).on_press_maybe((!self.gif).then_some(Msg::Microphone(!self.microphone))));
             }
-            r.push(Button::new(text("GIF").role(TextRole::Strong)).kind(ButtonKind::Ghost).selected(self.gif).padding([10.0, 7.0]).on_press(Msg::Gif(!self.gif))).push(record_button(ready)).push(close)
+            r.push(Button::new(text("GIF").role(TextRole::Strong)).kind(ButtonKind::Ghost).selected(self.gif).padding([10.0, 7.0]).on_press(Msg::Gif(!self.gif))).push(self.secondary_button(ready)).push(self.primary_button(ready)).push(close)
         } else {
             // Too narrow for the mode switch: a way back, record, and close.
             row()
                 .spacing(6.0)
                 .align(Align::Center)
                 .push(icon_button(icons::ARROW_LEFT, 34.0).kind(ButtonKind::Ghost).on_press(Msg::Mode(Mode::Screen)))
-                .push(icon_button(icons::VIDEO, 34.0).kind(ButtonKind::Accent).on_press_maybe(ready.then_some(Msg::Record)))
+                .push(self.secondary_button(ready))
+                .push(icon_button(if self.intent == Intent::Screenshot { icons::CAMERA } else { icons::VIDEO }, 34.0).kind(ButtonKind::Accent).on_press_maybe(ready.then_some(if self.intent == Intent::Screenshot { Msg::Screenshot } else { Msg::Record })))
                 .push(close)
         };
         let bar = container(container(controls).surface(Surface::Card).padding([10.0, 8.0])).padding([0.0, 0.0, 14.0, 0.0]);
@@ -795,8 +919,24 @@ impl<M> Widget<M> for Grip {
     }
 }
 
-fn record_button(enabled: bool) -> Element<Msg> {
-    Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::VIDEO).size(16.0)).push(text("Record").role(TextRole::Strong))).kind(ButtonKind::Accent).on_press_maybe(enabled.then_some(Msg::Record)).into()
+impl Recorder {
+    /// The main button: Record or Screenshot, whichever the user last reached for.
+    fn primary_button(&self, enabled: bool) -> Element<Msg> {
+        let (glyph, label, msg) = match self.intent {
+            Intent::Record => (icons::VIDEO, "Record", Msg::Record),
+            Intent::Screenshot => (icons::CAMERA, "Screenshot", Msg::Screenshot),
+        };
+        Button::new(row().spacing(8.0).align(Align::Center).push(icon(glyph).size(16.0)).push(text(label).role(TextRole::Strong))).kind(ButtonKind::Accent).on_press_maybe(enabled.then_some(msg)).into()
+    }
+
+    /// The other action, as a small button beside the main one.
+    fn secondary_button(&self, enabled: bool) -> Element<Msg> {
+        let (glyph, msg) = match self.intent {
+            Intent::Record => (icons::CAMERA, Msg::Screenshot),
+            Intent::Screenshot => (icons::VIDEO, Msg::Record),
+        };
+        icon_button(glyph, 34.0).on_press_maybe(enabled.then_some(msg)).into()
+    }
 }
 
 /// The frame around what will be recorded: an outline with drag handles.
@@ -926,6 +1066,7 @@ fn main() {
         }
     }
     app.auto_record = args.iter().any(|a| a == "--record");
+    app.auto_shot = args.iter().any(|a| a == "--screenshot");
     app.shown = !args.iter().any(|a| a == "--hidden");
     // On unless it has been turned off. Only an installed copy sets startup
     // up by itself; a development build changes it only when asked, so it
@@ -936,6 +1077,7 @@ fn main() {
     }
     if let Some(dir) = value("--dir") {
         app.dir = PathBuf::from(dir);
+        app.shots_dir = PathBuf::from(dir);
     }
     app.include_bar = args.iter().any(|a| a == "--include-bar");
     app.gif = args.iter().any(|a| a == "--gif");
@@ -1090,6 +1232,29 @@ mod tests {
         assert_eq!(settings::parse("launch-at-startup = true"), Some(true));
         assert_eq!(settings::parse(""), None, "never chosen: the default applies");
         assert!(!settings::installed(), "a test binary lives in Cargo's target folder");
+    }
+
+    #[test]
+    fn the_screenshot_shortcut_frames_an_area_and_hides_to_shoot() {
+        let mut r = recorder();
+        r.shown = false;
+        r.update(Msg::ScreenshotHotkey);
+        let s = r.window_state();
+        assert!(s.visible && s.bare && r.mode == Mode::Area && r.intent == Intent::Screenshot);
+        // Enter now takes a screenshot, not a recording.
+        let enter = KeyEvent { key: Key::Enter, pressed: true, repeat: false, modifiers: Default::default(), text: None };
+        assert!(matches!(r.on_key(&enter), Some(Msg::Screenshot)));
+        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
+        r.update(Msg::Screenshot);
+        assert!(matches!(r.phase, Phase::Shooting(Target::Area(_))));
+        assert!(!r.window_state().visible, "the frame gets out of the picture");
+        // The recording shortcut switches the frame back to recording.
+        let mut r = recorder();
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::ScreenshotHotkey);
+        assert!(!r.window_state().visible, "pressed again while showing: hide");
+        r.update(Msg::Hotkey);
+        assert!(r.window_state().visible && r.intent == Intent::Record);
     }
 
     #[test]
