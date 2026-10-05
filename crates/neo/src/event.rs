@@ -69,7 +69,12 @@ pub enum Event {
     PointerLeft,
     /// Scroll by `delta` logical pixels (positive y scrolls content up).
     Wheel { pos: Point, delta: Point },
+    /// A pinch on a trackpad or touch screen. `factor` is how much the
+    /// fingers spread since the last event: above 1 zooms in.
+    Pinch { pos: Point, factor: f32 },
     Key(KeyEvent),
+    /// Files dragged from another app, or from this one, and let go here.
+    FilesDropped { pos: Point, paths: Vec<std::path::PathBuf> },
     /// Text committed by an input method.
     Ime(String),
     /// The window gained or lost keyboard focus.
@@ -82,7 +87,9 @@ impl Event {
             Event::PointerMoved { pos }
             | Event::PointerPressed { pos, .. }
             | Event::PointerReleased { pos, .. }
-            | Event::Wheel { pos, .. } => Some(*pos),
+            | Event::Wheel { pos, .. }
+            | Event::Pinch { pos, .. }
+            | Event::FilesDropped { pos, .. } => Some(*pos),
             _ => None,
         }
     }

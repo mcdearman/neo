@@ -64,6 +64,53 @@ impl<A: App> Harness<A> {
         self.clipboard.borrow().clone()
     }
 
+    /// What widgets asked the window to do since the last call, such as
+    /// starting a drag.
+    pub fn take_window_requests(&mut self) -> Vec<crate::WindowRequest> {
+        self.ui.take_window_requests()
+    }
+
+    /// The pointer shape the widgets asked for at the last pointer event.
+    pub fn cursor(&self) -> crate::CursorIcon {
+        self.ui.cursor()
+    }
+
+    /// The theme the app chose for the current system scheme.
+    pub fn theme(&self) -> neo_theme::Theme {
+        *self.ui.theme()
+    }
+
+    pub fn title(&self) -> String {
+        self.ui.title()
+    }
+
+    pub fn window_state(&self) -> crate::WindowState {
+        self.ui.window_state()
+    }
+
+    /// True once the app has asked to end.
+    pub fn should_exit(&self) -> bool {
+        self.ui.should_exit()
+    }
+
+    /// Asks to close the window, as the close button does. Returns true if
+    /// the window would close, false if the app handled it instead.
+    pub fn close(&mut self) -> bool {
+        let closes = self.ui.close_requested();
+        self.ui.refresh(self.renderer.text());
+        closes
+    }
+
+    /// Tells the app the window gained or lost keyboard focus.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.event(Event::WindowFocus(focused));
+    }
+
+    /// The modifier keys held during the pointer events that follow.
+    pub fn set_modifiers(&mut self, m: Modifiers) {
+        self.ui.set_modifiers(m);
+    }
+
     pub fn set_clipboard(&mut self, text: &str) {
         *self.clipboard.borrow_mut() = Some(text.to_owned());
     }

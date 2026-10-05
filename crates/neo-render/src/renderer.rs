@@ -92,6 +92,7 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderers: Vec<TextRenderer>,
+    images: crate::image::ImageRenderer,
 }
 
 impl Renderer {
@@ -209,6 +210,8 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+
+        let images = crate::image::ImageRenderer::new(&device, &globals_bgl, premultiplied, CANVAS_FORMAT);
 
         let instance_capacity = 1024;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -329,6 +332,7 @@ impl Renderer {
             viewport,
             atlas,
             text_renderers: vec![],
+            images,
         }
     }
 
@@ -403,6 +407,8 @@ impl Renderer {
         if !all.is_empty() {
             self.queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&all));
         }
+
+        self.images.prepare(&self.device, &self.queue, scene);
 
         // Prepare one text renderer per layer that has text.
         self.viewport.update(&self.queue, Resolution { width, height });
@@ -492,6 +498,7 @@ impl Renderer {
                 pass.draw(0..4, first..first + n);
             }
             first += n;
+            self.images.render(&mut pass, &self.globals_bg, i);
             if !layer.texts.is_empty()
                 && let Err(e) = self.text_renderers[i].render(&self.atlas, &self.viewport, &mut pass) {
                     eprintln!("neo: text render failed: {e:?}");

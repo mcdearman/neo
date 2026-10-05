@@ -2,6 +2,37 @@
 
 use winit::window::Window;
 
+/// Starts a system drag of `paths` from the window, so they can be dropped
+/// on other apps. Call it while the pointer event that began the drag is
+/// being handled. Returns false where this is not supported yet: everywhere
+/// but macOS.
+pub(crate) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::drag_files(window, paths)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, paths);
+        false
+    }
+}
+
+/// Where the pointer is in the window, in logical pixels, when the platform
+/// can say without a pointer event. Needed while another app's drag is over
+/// the window, because no pointer events arrive then.
+pub(crate) fn pointer_position(window: &Window) -> Option<neo_render::Point> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::pointer_position(window)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        None
+    }
+}
+
 /// Makes the window a plain rectangle with no system frame, or gives the
 /// frame back. macOS rounds the corners of every titled window, so a bare,
 /// see-through window drops its title bar to get square corners. Other
@@ -196,6 +227,29 @@ mod macos {
             // Changing the style mask drops keyboard focus from the view.
             let _: bool = msg_send![ns_window, makeFirstResponder: view];
         }
+    }
+
+    unsafe extern "C" {
+        fn neo_drag_files(ns_view: *mut std::ffi::c_void, paths: *const *const std::ffi::c_char, count: std::ffi::c_int) -> std::ffi::c_int;
+        fn neo_pointer_in_view(ns_view: *mut std::ffi::c_void, x: *mut f64, y: *mut f64) -> std::ffi::c_int;
+    }
+
+    pub(super) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool {
+        let Ok(handle) = window.window_handle() else { return false };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else { return false };
+        let c_paths: Vec<std::ffi::CString> = paths.iter().filter_map(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).ok()).collect();
+        let pointers: Vec<*const std::ffi::c_char> = c_paths.iter().map(|p| p.as_ptr()).collect();
+        // SAFETY: winit hands out a valid NSView, this runs on the main thread,
+        // and the path strings outlive the call.
+        unsafe { neo_drag_files(h.ns_view.as_ptr(), pointers.as_ptr(), pointers.len() as std::ffi::c_int) != 0 }
+    }
+
+    pub(super) fn pointer_position(window: &Window) -> Option<neo_render::Point> {
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else { return None };
+        let (mut x, mut y) = (0.0, 0.0);
+        // SAFETY: winit hands out a valid NSView and the out-pointers are valid.
+        (unsafe { neo_pointer_in_view(h.ns_view.as_ptr(), &mut x, &mut y) } != 0).then(|| neo_render::Point::new(x as f32, y as f32))
     }
 
     pub(super) fn raise_metal_layer(window: &Window) {

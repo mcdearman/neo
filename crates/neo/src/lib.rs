@@ -55,7 +55,7 @@ pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use runtime::Ui;
 pub use shell::{run, Error};
 
-pub use neo_render::{Corners, FontFamily, Point, Rect, Scene, Size, TextLayout, TextStyle};
+pub use neo_render::{Corners, FontFamily, Image, Point, Rect, Scene, Size, TextLayout, TextStyle};
 pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, TextRole, Theme, Weight};
 
 /// Everything an application usually needs.

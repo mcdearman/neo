@@ -63,6 +63,7 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         retry_at: None,
         state: None,
         resizing: None,
+        dropped: vec![],
     };
     event_loop.run_app(&mut shell).map_err(Error::EventLoop)?;
     match shell.error {
@@ -106,6 +107,8 @@ struct Shell<A: App> {
     state: Option<crate::app::WindowState>,
     /// An edge drag Neo is carrying out itself, where the platform cannot.
     resizing: Option<ManualResize>,
+    /// Files let go over the window, gathered until the batch is complete.
+    dropped: Vec<std::path::PathBuf>,
 }
 
 /// A resize in progress: the edge held, where the pointer grabbed it on the
@@ -363,10 +366,18 @@ impl<A: App> Shell<A> {
 
     fn after_input(&mut self) {
         let Some(gpu) = &self.gpu else { return };
+        let mut drag_began = false;
         for r in self.ui.take_window_requests() {
             match r {
                 WindowRequest::Drag => {
                     let _ = gpu.window.drag_window();
+                }
+                WindowRequest::DragFiles(paths) => {
+                    // The system runs the drag and swallows the mouse-up, so
+                    // tell the widgets the pointer has gone.
+                    if crate::platform::drag_files(&gpu.window, &paths) {
+                        drag_began = true;
+                    }
                 }
                 WindowRequest::Resize(edge) => {
                     // macOS has no call to start an edge drag, so follow the pointer here.
@@ -399,6 +410,10 @@ impl<A: App> Shell<A> {
             && self.can_draw() {
                 gpu.window.request_redraw();
             }
+        if drag_began {
+            self.pointer = None;
+            self.dispatch(Event::PointerLeft);
+        }
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -621,6 +636,13 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 };
                 self.dispatch(Event::Wheel { pos, delta: d });
             }
+            // One event arrives per file; they are handed on together once
+            // the events for this drop have all come in.
+            WindowEvent::DroppedFile(path) => self.dropped.push(path),
+            WindowEvent::PinchGesture { delta, .. } => {
+                let Some(pos) = self.pointer else { return };
+                self.dispatch(Event::Pinch { pos, factor: (1.0 + delta as f32).max(0.1) });
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let modifiers = self.modifiers();
                 let key = map_key(&event.logical_key);
@@ -645,6 +667,13 @@ impl<A: App> ApplicationHandler for Shell<A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.dropped.is_empty() {
+            let paths = std::mem::take(&mut self.dropped);
+            // No pointer events arrive during another app's drag, so ask.
+            let pos = self.gpu.as_ref().and_then(|g| crate::platform::pointer_position(&g.window)).or(self.pointer).unwrap_or(Point::ZERO);
+            self.pointer = Some(pos);
+            self.dispatch(Event::FilesDropped { pos, paths });
+        }
         let now = Instant::now();
         let mut wake = self.ui.tick(now);
         if self.retry_at.is_some_and(|t| t <= now) {

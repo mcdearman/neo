@@ -195,8 +195,12 @@ impl Limits {
 }
 
 /// A requested change to the window, raised by widgets such as the title bar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowRequest {
+    /// Start a system drag of these files, so they can be dropped on other
+    /// apps. Raise it while handling the pointer movement that began the
+    /// drag. Only macOS supports it so far.
+    DragFiles(Vec<std::path::PathBuf>),
     Drag,
     Resize(ResizeEdge),
     Minimize,
@@ -606,7 +610,7 @@ impl<M> Element<M> {
     /// Offers `event` to children from topmost to bottom, stopping when one
     /// captures a press, wheel or key event.
     pub fn event_children(children: &mut [Element<M>], cx: &mut EventCx<M>, event: &Event) -> Status {
-        let stoppable = matches!(event, Event::PointerPressed { .. } | Event::Wheel { .. } | Event::Key(_) | Event::Ime(_));
+        let stoppable = matches!(event, Event::PointerPressed { .. } | Event::Wheel { .. } | Event::Pinch { .. } | Event::FilesDropped { .. } | Event::Key(_) | Event::Ime(_));
         let mut status = Status::Ignored;
         for c in children.iter_mut().rev() {
             status = status.merge(c.event(cx, event));

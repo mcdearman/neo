@@ -1,4 +1,5 @@
 use crate::geometry::{Corners, Point, Rect};
+use crate::image::{Image, ImageItem};
 use crate::text::TextLayout;
 use neo_theme::{Color, Paint, Shadow};
 
@@ -33,13 +34,14 @@ pub(crate) struct TextItem {
     pub clip: Option<Rect>,
 }
 
-/// Within a layer all shapes draw before all text. A new layer starts for
+/// Within a layer shapes draw first, then images, then text. A new layer starts for
 /// overlays and for glass surfaces, which need everything beneath them
 /// finished so it can be blurred.
 #[derive(Default)]
 pub(crate) struct Layer {
     pub shapes: Vec<Instance>,
     pub texts: Vec<TextItem>,
+    pub images: Vec<ImageItem>,
     /// Largest backdrop blur radius requested in this layer (logical px).
     pub backdrop_blur: f32,
 }
@@ -102,7 +104,7 @@ impl Scene {
     /// Starts a new layer. Everything drawn afterwards appears above
     /// everything drawn before, including text.
     pub fn push_layer(&mut self) {
-        if !self.layer().shapes.is_empty() || !self.layer().texts.is_empty() {
+        if !self.layer().shapes.is_empty() || !self.layer().texts.is_empty() || !self.layer().images.is_empty() {
             self.layers.push(Layer::default());
         }
     }
@@ -229,6 +231,30 @@ impl Scene {
     }
 
     /// Draws laid-out text with its top-left corner at `pos`.
+    /// Draws `image` stretched over `rect`. Within a layer, images sit above
+    /// shapes and below text; call [`push_layer`](Self::push_layer) afterwards
+    /// to draw shapes over an image.
+    pub fn image(&mut self, image: &Image, rect: Rect) {
+        self.image_part(image, rect, [0.0, 0.0, 1.0, 1.0], 1.0);
+    }
+
+    /// Draws part of `image` over `rect`. `uv` is the part to show, as
+    /// left, top, right and bottom fractions of the image.
+    pub fn image_part(&mut self, image: &Image, rect: Rect, uv: [f32; 4], opacity: f32) {
+        let rect = rect.translate(self.offset());
+        let clip = self.clip4();
+        self.layer().images.push(ImageItem { image: image.clone(), rect, uv, clip, opacity: opacity.clamp(0.0, 1.0), turns: 0 });
+    }
+
+    /// Draws `image` over `rect` turned clockwise by `turns` quarter turns.
+    /// For one or three turns, `rect` should have the picture's height as
+    /// its width.
+    pub fn image_turned(&mut self, image: &Image, rect: Rect, turns: u8) {
+        let rect = rect.translate(self.offset());
+        let clip = self.clip4();
+        self.layer().images.push(ImageItem { image: image.clone(), rect, uv: [0.0, 0.0, 1.0, 1.0], clip, opacity: 1.0, turns: turns % 4 });
+    }
+
     pub fn text(&mut self, layout: &TextLayout, pos: Point, color: Color) {
         let pos = pos + self.offset();
         let clip = self.clips.last().copied();

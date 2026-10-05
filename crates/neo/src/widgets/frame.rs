@@ -157,7 +157,11 @@ impl<M: 'static> Widget<M> for Frame<M> {
                     if let Some(i) = pressed {
                         cx.request_redraw();
                         if hit(*pos) == Some(i) {
-                            cx.window_request([WindowRequest::Minimize, WindowRequest::ToggleMaximize, WindowRequest::Close][i]);
+                            cx.window_request(match i {
+                                0 => WindowRequest::Minimize,
+                                1 => WindowRequest::ToggleMaximize,
+                                _ => WindowRequest::Close,
+                            });
                         }
                     }
                 }

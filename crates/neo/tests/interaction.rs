@@ -451,3 +451,212 @@ mod runtime {
         assert_eq!(h.app().width, 420.0);
     }
 }
+
+mod pictures_and_menus {
+    use super::*;
+    use neo::Image;
+
+    struct Show(Image);
+
+    impl App for Show {
+        type Message = ();
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, _: ()) {}
+        fn view(&self) -> Element<()> {
+            // The left half of the picture over the whole window, with a label on top.
+            stack().width(Length::Fill).height(Length::Fill).push(picture(&self.0).fit(Fit::Fill).width(Length::Fill).height(Length::Fill)).push(text("over")).into()
+        }
+    }
+
+    #[test]
+    fn pictures_are_drawn_with_their_own_colours() {
+        // Left half red, right half blue, half see-through at the bottom.
+        let mut px = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                let a = if y < 2 { 255 } else { 128 };
+                px.extend_from_slice(if x < 2 { &[255, 0, 0] } else { &[0, 0, 255] });
+                px.push(a);
+            }
+        }
+        let mut h = Harness::new(Show(Image::new(4, 4, px)), Size::new(200.0, 200.0)).unwrap();
+        let out = h.render(1.0);
+        let at = |x: usize, y: usize| -> [u8; 4] { out[(y * 200 + x) * 4..][..4].try_into().unwrap() };
+        let near = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(p, q)| (*p as i32 - q as i32).abs() <= 6);
+        assert!(near(at(30, 30), [255, 0, 0, 255]), "top left is red: {:?}", at(30, 30));
+        assert!(near(at(170, 30), [0, 0, 255, 255]), "top right is blue: {:?}", at(170, 30));
+        // The see-through half lets the window background show through.
+        let bottom = at(30, 180);
+        assert!(bottom[0] > 200 && bottom[1] > 60 && bottom[1] < 160, "bottom left is red over the background: {bottom:?}");
+    }
+
+    #[derive(Default)]
+    struct Chooser {
+        open: bool,
+        chosen: Option<&'static str>,
+        at: Point,
+    }
+
+    #[derive(Clone)]
+    enum Pick {
+        Menu(Point),
+        Choose(&'static str),
+        Dismiss,
+    }
+
+    impl App for Chooser {
+        type Message = Pick;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, m: Pick) {
+            match m {
+                Pick::Menu(p) => {
+                    self.open = true;
+                    self.at = p;
+                }
+                Pick::Choose(what) => {
+                    self.chosen = Some(what);
+                    self.open = false;
+                }
+                Pick::Dismiss => self.open = false,
+            }
+        }
+        fn view(&self) -> Element<Pick> {
+            let base = mouse_area(container(text("right-click me")).width(Length::Fill).height(Length::Fill)).on_secondary_press(Pick::Menu);
+            let mut s = stack().width(Length::Fill).height(Length::Fill).push(base);
+            if self.open {
+                s = s.push(popup_menu(self.at, vec![MenuItem::new("Open", Pick::Choose("open")), MenuItem::separator(), MenuItem::disabled("Paste"), MenuItem::new("Delete", Pick::Choose("delete")).danger()], Pick::Dismiss));
+            }
+            s.into()
+        }
+    }
+
+    fn right_click(h: &mut Harness<Chooser>, p: Point) {
+        h.move_to(p);
+        h.event(neo::Event::PointerPressed { pos: p, button: neo::PointerButton::Secondary });
+        h.event(neo::Event::PointerReleased { pos: p, button: neo::PointerButton::Secondary });
+    }
+
+    #[test]
+    fn a_right_click_opens_a_menu_that_chooses_or_dismisses() {
+        let mut h = Harness::new(Chooser::default(), Size::new(400.0, 300.0)).unwrap();
+        right_click(&mut h, Point::new(100.0, 80.0));
+        assert!(h.app().open);
+        // Rows are 32 high after 6 of padding: Open, a separator, Paste, Delete.
+        h.click(Point::new(140.0, 80.0 + 6.0 + 32.0 + 9.0 + 16.0));
+        assert!(h.app().open && h.app().chosen.is_none(), "a disabled row does nothing");
+        h.click(Point::new(140.0, 80.0 + 6.0 + 32.0 + 9.0 + 32.0 + 16.0));
+        assert_eq!(h.app().chosen, Some("delete"));
+        assert!(!h.app().open);
+
+        right_click(&mut h, Point::new(100.0, 80.0));
+        h.click(Point::new(350.0, 250.0));
+        assert!(!h.app().open, "a click elsewhere dismisses");
+        assert_eq!(h.app().chosen, Some("delete"), "and chooses nothing new");
+
+        // Near the corner the menu moves to stay inside the window.
+        right_click(&mut h, Point::new(395.0, 295.0));
+        h.render(1.0);
+        h.click(Point::new(300.0, 190.0));
+        assert_eq!(h.app().chosen, Some("open"));
+    }
+}
+
+mod drag_and_drop {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct Shelf {
+        clicks: u32,
+        inner: Vec<PathBuf>,
+        outer: Vec<PathBuf>,
+    }
+
+    #[derive(Clone)]
+    enum Act {
+        Click,
+        Inner(Vec<PathBuf>),
+        Outer(Vec<PathBuf>),
+    }
+
+    impl App for Shelf {
+        type Message = Act;
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, m: Act) {
+            match m {
+                Act::Click => self.clicks += 1,
+                Act::Inner(p) => self.inner = p,
+                Act::Outer(p) => self.outer = p,
+            }
+        }
+        fn view(&self) -> Element<Act> {
+            // A draggable, droppable button at the top of a droppable window.
+            let item = mouse_area(button("item").on_press(Act::Click).width(200.0).height(40.0)).drag_files(vec![PathBuf::from("/tmp/a.txt")]).on_drop(Act::Inner);
+            mouse_area(container(column().push(item)).width(Length::Fill).height(Length::Fill)).on_drop(Act::Outer).into()
+        }
+    }
+
+    #[test]
+    fn a_drag_starts_after_some_movement_and_a_click_still_clicks() {
+        let mut h = Harness::new(Shelf::default(), Size::new(400.0, 300.0)).unwrap();
+        h.click(Point::new(50.0, 20.0));
+        assert_eq!(h.app().clicks, 1);
+        assert!(h.take_window_requests().is_empty(), "a click is not a drag");
+
+        h.event(neo::Event::PointerPressed { pos: Point::new(50.0, 20.0), button: neo::PointerButton::Primary });
+        h.event(neo::Event::PointerMoved { pos: Point::new(52.0, 21.0) });
+        assert!(h.take_window_requests().is_empty(), "a wobble is not a drag");
+        h.event(neo::Event::PointerMoved { pos: Point::new(70.0, 30.0) });
+        assert_eq!(h.take_window_requests(), [neo::WindowRequest::DragFiles(vec![PathBuf::from("/tmp/a.txt")])]);
+        // The system takes over; the shell tells widgets the pointer left.
+        h.event(neo::Event::PointerLeft);
+        assert_eq!(h.app().clicks, 1, "starting a drag does not click");
+    }
+
+    #[test]
+    fn the_innermost_area_under_the_pointer_gets_the_drop() {
+        let mut h = Harness::new(Shelf::default(), Size::new(400.0, 300.0)).unwrap();
+        let files = vec![PathBuf::from("/tmp/x.png")];
+        h.event(neo::Event::FilesDropped { pos: Point::new(50.0, 20.0), paths: files.clone() });
+        assert_eq!((h.app().inner.clone(), h.app().outer.len()), (files.clone(), 0));
+        h.event(neo::Event::FilesDropped { pos: Point::new(300.0, 250.0), paths: files.clone() });
+        assert_eq!(h.app().outer, files);
+    }
+}
+
+mod long_text {
+    use super::*;
+
+    struct Columns;
+
+    impl App for Columns {
+        type Message = ();
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+        fn update(&mut self, _: ()) {}
+        fn view(&self) -> Element<()> {
+            // A long name beside a fixed column, as in a file list.
+            let long = "A very long file name that could never fit in the space it has been given here.txt";
+            container(row().spacing(0.0).width(Length::Fill).push(text(long).no_wrap().width(Length::Fill)).push(container(Space::new(0.0, 0.0)).width(150.0))).background(Background::Color(Color::WHITE)).width(Length::Fill).height(Length::Fill).into()
+        }
+    }
+
+    #[test]
+    fn one_line_text_is_cut_short_instead_of_running_over_its_neighbour() {
+        let mut h = Harness::new(Columns, Size::new(300.0, 40.0)).unwrap();
+        let px = h.render(1.0);
+        // The right-hand 150 pixels belong to the other column: nothing but background.
+        let stray = (0..40).flat_map(|y| (155..300).map(move |x| (x, y))).filter(|(x, y)| px[(y * 300 + x) * 4] < 200).count();
+        assert_eq!(stray, 0, "text ran into the next column");
+        // And the name is still there on the left.
+        let ink = (0..40).flat_map(|y| (0..150).map(move |x| (x, y))).filter(|(x, y)| px[(y * 300 + x) * 4] < 120).count();
+        assert!(ink > 50, "the shortened name is drawn");
+    }
+}

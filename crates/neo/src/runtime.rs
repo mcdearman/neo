@@ -275,6 +275,11 @@ impl<A: App> Ui<A> {
                 self.move_focus(!k.modifiers.shift);
             }
         }
+        if let Event::WindowFocus(focused) = &event
+            && let Some(m) = self.app.on_window_focus(*focused)
+        {
+            messages.push(m);
+        }
         for m in messages {
             self.app.update(m);
             self.needs_view = true;

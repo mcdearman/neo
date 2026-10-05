@@ -107,7 +107,25 @@ impl<M> Widget<M> for Text {
         let content = if spec.uppercase { self.content.to_uppercase() } else { self.content.clone() };
         let limits = limits.constrain(self.width, Length::Shrink);
         let max_w = if self.wrap { Some(limits.max.w) } else { None };
-        let layout = cx.text().layout(&content, &style, max_w);
+        let mut layout = cx.text().layout(&content, &style, max_w);
+        // One-line text that is too long for its space is cut short with an
+        // ellipsis, so it cannot run over whatever sits beside it.
+        if !self.wrap && limits.max.w.is_finite() && layout.size().w > limits.max.w {
+            let chars: Vec<char> = content.chars().collect();
+            // The longest prefix that fits with the ellipsis, by bisection.
+            let (mut fits, mut too_long) = (0, chars.len());
+            while fits + 1 < too_long {
+                let mid = (fits + too_long) / 2;
+                let candidate: String = chars[..mid].iter().collect::<String>().trim_end().to_string() + "…";
+                if cx.text().layout(&candidate, &style, None).size().w <= limits.max.w {
+                    fits = mid;
+                } else {
+                    too_long = mid;
+                }
+            }
+            let shortened = if fits == 0 { "…".to_string() } else { chars[..fits].iter().collect::<String>().trim_end().to_string() + "…" };
+            layout = cx.text().layout(&shortened, &style, None);
+        }
         let size = limits.resolve(layout.size());
         self.layout = Some(layout);
         size

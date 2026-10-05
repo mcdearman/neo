@@ -30,6 +30,8 @@ struct ButtonState {
 pub struct Button<M> {
     content: [Element<M>; 1],
     on_press: Option<M>,
+    /// Builds the message from the modifier keys held at the click.
+    on_press_with: Option<Box<dyn Fn(crate::event::Modifiers) -> M>>,
     kind: ButtonKind,
     selected: bool,
     padding: Padding,
@@ -45,6 +47,7 @@ impl<M: Clone + 'static> Button<M> {
         Self {
             content: [content.into()],
             on_press: None,
+            on_press_with: None,
             kind: ButtonKind::Raised,
             selected: false,
             padding: Padding::xy(16.0, 9.0),
@@ -66,6 +69,24 @@ impl<M: Clone + 'static> Button<M> {
     pub fn on_press_maybe(mut self, m: Option<M>) -> Self {
         self.on_press = m;
         self
+    }
+
+    /// Like [`on_press`](Self::on_press), but the message can depend on the
+    /// modifier keys held, as when Shift-clicking extends a selection.
+    pub fn on_press_with(mut self, f: impl Fn(crate::event::Modifiers) -> M + 'static) -> Self {
+        self.on_press_with = Some(Box::new(f));
+        self
+    }
+
+    fn enabled(&self) -> bool {
+        self.on_press.is_some() || self.on_press_with.is_some()
+    }
+
+    fn message(&self, modifiers: crate::event::Modifiers) -> Option<M> {
+        match &self.on_press_with {
+            Some(f) => Some(f(modifiers)),
+            None => self.on_press.clone(),
+        }
     }
 
     pub fn kind(mut self, k: ButtonKind) -> Self {
@@ -137,7 +158,7 @@ impl<M: Clone + 'static> Widget<M> for Button<M> {
     }
 
     fn focusable(&self) -> bool {
-        self.on_press.is_some()
+        self.enabled()
     }
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
@@ -159,7 +180,7 @@ impl<M: Clone + 'static> Widget<M> for Button<M> {
         let p = theme.palette();
         let now = cx.now();
         let motion = theme.motion();
-        let enabled = self.on_press.is_some();
+        let enabled = self.enabled();
         let (hover_t, press_t, animating) = {
             let st = cx.state::<ButtonState>();
             let h = st.hover.step(if st.hovered && enabled { 1.0 } else { 0.0 }, now, motion);
@@ -209,7 +230,7 @@ impl<M: Clone + 'static> Widget<M> for Button<M> {
 
     fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
         let b = cx.bounds();
-        let enabled = self.on_press.is_some();
+        let enabled = self.enabled();
         match event {
             Event::PointerMoved { pos } => {
                 let inside = b.contains(*pos);
@@ -241,14 +262,14 @@ impl<M: Clone + 'static> Widget<M> for Button<M> {
                     st.pressed = false;
                     cx.request_redraw();
                     if b.contains(*pos)
-                        && let Some(m) = self.on_press.clone() {
+                        && let Some(m) = self.message(cx.modifiers()) {
                             cx.emit(m);
                         }
                 }
                 Status::Ignored
             }
             Event::Key(k) if k.pressed && cx.is_focused() && matches!(k.key, Key::Enter | Key::Space) => {
-                if let Some(m) = self.on_press.clone() {
+                if let Some(m) = self.message(k.modifiers) {
                     cx.emit(m);
                 }
                 Status::Captured

@@ -20,7 +20,12 @@ pub fn user_dir(xdg_name: &str) -> PathBuf {
         if let Some(first) = name.get_mut(0..1) {
             first.make_ascii_uppercase();
         }
-        home.join(if xdg_name == "DOWNLOAD" { "Downloads".into() } else { name })
+        home.join(match xdg_name {
+            "DOWNLOAD" => "Downloads".into(),
+            // macOS calls its video folder Movies.
+            "VIDEOS" if cfg!(target_os = "macos") => "Movies".into(),
+            _ => name,
+        })
     };
     let config = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
     let dirs = config.join("user-dirs.dirs");
@@ -30,6 +35,117 @@ pub fn user_dir(xdg_name: &str) -> PathBuf {
         .find_map(|l| l.trim().strip_prefix(&key))
         .map(|v| PathBuf::from(v.trim_matches('"').replace("$HOME", &home.to_string_lossy())))
         .unwrap_or_else(fallback)
+}
+
+/// Compares names so that "file2" sorts before "file10".
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let num = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut s = String::new();
+                    while let Some(c) = it.peek().filter(|c| c.is_ascii_digit()) {
+                        s.push(*c);
+                        it.next();
+                    }
+                    s
+                };
+                let (na, nb) = (num(&mut a), num(&mut b));
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let o = x.to_lowercase().cmp(y.to_lowercase());
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+/// A name for `name` in `dir` that nothing has yet: the name itself, then
+/// "name copy", "name copy 2" and so on, keeping the extension.
+pub fn free_name(dir: &Path, name: &str) -> PathBuf {
+    let direct = dir.join(name);
+    if direct.symlink_metadata().is_err() {
+        return direct;
+    }
+    let as_path = Path::new(name);
+    let stem = as_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string());
+    let ext = as_path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..)
+        .map(|n| dir.join(if n == 1 { format!("{stem} copy{ext}") } else { format!("{stem} copy {n}{ext}") }))
+        .find(|p| p.symlink_metadata().is_err())
+        .expect("some number is free")
+}
+
+/// Copies a file, or a folder and everything in it, to `to`.
+pub fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = from.symlink_metadata()?;
+    if meta.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_all(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+/// How files dropped on a folder got there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Transferred {
+    pub moved: usize,
+    pub copied: usize,
+}
+
+/// Puts `sources` into the folder `target`. Entries that already live in
+/// `move_from` are moved, as when dragging within one folder; anything else
+/// is copied, so a drop from another app never takes the original away.
+/// Sources already in `target`, and a folder dropped into itself, are skipped.
+pub fn transfer(sources: &[PathBuf], target: &Path, move_from: Option<&Path>) -> std::io::Result<Transferred> {
+    let mut done = Transferred::default();
+    for src in sources {
+        let Some(name) = src.file_name() else { continue };
+        if src.parent() == Some(target) || target.starts_with(src) {
+            continue;
+        }
+        if move_from.is_some() && src.parent() == move_from {
+            let dest = target.join(name);
+            if dest.symlink_metadata().is_ok() {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already exists in {}", name.to_string_lossy(), target.display())));
+            }
+            std::fs::rename(src, &dest)?;
+            done.moved += 1;
+        } else {
+            copy_all(src, &free_name(target, &name.to_string_lossy()))?;
+            done.copied += 1;
+        }
+    }
+    Ok(done)
+}
+
+/// Picture formats Neo Photos opens, by lower-case extension.
+pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico", "heic", "heif", "avif"];
+
+/// Video formats Neo Videos opens, by lower-case extension.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "wmv", "flv", "3gp", "ts"];
+
+/// Whether `path` has one of `extensions`, ignoring case.
+pub fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// The tops of the file system: `/` on Unix, each drive on Windows.
@@ -122,10 +238,12 @@ pub fn open(path: &Path) -> std::io::Result<()> {
     cmd.arg(path).spawn().map(|_| ())
 }
 
-/// Where the Neo Files program might be: beside this program, in a macOS
-/// app bundle next to this one or in `~/Applications`, then on the `PATH`.
-fn neo_files_candidates() -> Vec<PathBuf> {
-    let name = format!("neo-files{}", std::env::consts::EXE_SUFFIX);
+/// Where another Neo app's program might be: beside this program, in a
+/// macOS app bundle next to this one or in `~/Applications`, then on the
+/// `PATH`. `program` is the binary's name, such as `neo-files`, and
+/// `bundle` its macOS app name, such as `Neo Files`.
+fn neo_app_candidates(program: &str, bundle: &str) -> Vec<PathBuf> {
+    let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
@@ -133,11 +251,11 @@ fn neo_files_candidates() -> Vec<PathBuf> {
         out.push(dir.join(&name));
         // Inside `Some.app/Contents/MacOS`, look for a sibling bundle.
         if let Some(apps) = dir.ancestors().nth(3).filter(|_| dir.ends_with("Contents/MacOS")) {
-            out.push(apps.join("Neo Files.app/Contents/MacOS").join(&name));
+            out.push(apps.join(format!("{bundle}.app/Contents/MacOS")).join(&name));
         }
     }
     if cfg!(target_os = "macos") {
-        out.push(home_dir().join("Applications/Neo Files.app/Contents/MacOS").join(&name));
+        out.push(home_dir().join(format!("Applications/{bundle}.app/Contents/MacOS")).join(&name));
     }
     out.retain(|p| p.is_file());
     out.push(PathBuf::from(name));
@@ -147,12 +265,32 @@ fn neo_files_candidates() -> Vec<PathBuf> {
 /// Shows a file in Neo Files, selected in its folder. Falls back to the
 /// system's file manager, opened on the folder, when Neo Files is not installed.
 pub fn reveal(path: &Path) -> std::io::Result<()> {
-    for files in neo_files_candidates() {
-        if std::process::Command::new(files).arg(path).spawn().is_ok() {
-            return Ok(());
-        }
+    if open_in("neo-files", "Neo Files", path) {
+        return Ok(());
     }
     open(path.parent().unwrap_or(path))
+}
+
+/// Opens `path` in another Neo app. Returns false if that app is not installed.
+pub fn open_in(program: &str, bundle: &str, path: &Path) -> bool {
+    neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).arg(path).spawn().is_ok())
+}
+
+/// Opens a file the way Neo Files does: pictures in Neo Photos, videos in
+/// Neo Videos, and everything else with the system's default app. Falls
+/// back to the system's choice when the Neo app is not installed.
+pub fn open_file(path: &Path) -> std::io::Result<()> {
+    let viewer = if has_extension(path, IMAGE_EXTENSIONS) {
+        Some(("neo-photos", "Neo Photos"))
+    } else if has_extension(path, VIDEO_EXTENSIONS) {
+        Some(("neo-videos", "Neo Videos"))
+    } else {
+        None
+    };
+    match viewer {
+        Some((program, bundle)) if open_in(program, bundle, path) => Ok(()),
+        _ => open(path),
+    }
 }
 
 /// Moves a file or folder to the Trash, so it can be restored later.
@@ -226,6 +364,54 @@ mod tests {
         assert_eq!(human_size(1_400_000), "1.4 MB");
         assert_eq!(human_size(52_000_000_000), "52 GB");
         assert_eq!(human_bytes_binary(8 * 1024 * 1024 * 1024), "8.0 GiB");
+    }
+
+    #[test]
+    fn natural_order() {
+        let mut v = vec!["file10", "File2", "file1", "a"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["a", "file1", "File2", "file10"]);
+    }
+
+    #[test]
+    fn knows_pictures_and_videos_by_extension() {
+        assert!(has_extension(Path::new("/a/Holiday.JPG"), IMAGE_EXTENSIONS));
+        assert!(has_extension(Path::new("clip.mov"), VIDEO_EXTENSIONS));
+        assert!(!has_extension(Path::new("notes.txt"), IMAGE_EXTENSIONS));
+        assert!(!has_extension(Path::new("png"), IMAGE_EXTENSIONS), "a name is not an extension");
+    }
+
+    #[test]
+    fn drops_move_within_a_folder_and_copy_from_outside() {
+        let root = std::env::temp_dir().join(format!("neo-transfer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("here/sub")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/album")).unwrap();
+        std::fs::write(root.join("here/a.txt"), "a").unwrap();
+        std::fs::write(root.join("elsewhere/b.txt"), "b").unwrap();
+        std::fs::write(root.join("elsewhere/album/c.txt"), "c").unwrap();
+        let here = root.join("here");
+
+        // Dragged from this folder onto its subfolder: moved.
+        let done = transfer(&[here.join("a.txt")], &here.join("sub"), Some(&here)).unwrap();
+        assert_eq!(done, Transferred { moved: 1, copied: 0 });
+        assert!(here.join("sub/a.txt").exists() && !here.join("a.txt").exists());
+
+        // From somewhere else, a file and a folder: copied, originals kept.
+        let from = root.join("elsewhere");
+        let done = transfer(&[from.join("b.txt"), from.join("album")], &here, Some(&here)).unwrap();
+        assert_eq!(done, Transferred { moved: 0, copied: 2 });
+        assert!(here.join("b.txt").exists() && from.join("b.txt").exists() && here.join("album/c.txt").exists());
+
+        // Again: the copies get new names instead of replacing anything.
+        transfer(&[from.join("b.txt")], &here, Some(&here)).unwrap();
+        assert!(here.join("b copy.txt").exists());
+        assert_eq!(free_name(&here, "b.txt"), here.join("b copy 2.txt"));
+
+        // Dropping where it already is, or a folder into itself, does nothing.
+        assert_eq!(transfer(&[here.join("b.txt")], &here, Some(&here)).unwrap(), Transferred::default());
+        assert_eq!(transfer(&[here.join("sub")], &here.join("sub"), Some(&here)).unwrap(), Transferred::default());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -7,12 +7,14 @@
 //! Glass surfaces use a dual Kawase blur of everything beneath them.
 
 mod geometry;
+mod image;
 mod renderer;
 mod scene;
 mod text;
 
 pub use geometry::{Corners, Point, Rect, Size};
 pub use renderer::{Renderer, SurfaceTarget, CANVAS_FORMAT};
+pub use image::Image;
 pub use scene::Scene;
 pub use text::{FontFamily, TextLayout, TextStyle, TextSystem};
 

@@ -62,6 +62,12 @@ pub trait App: 'static {
         None
     }
 
+    /// Called when the window gains or loses keyboard focus, as when the
+    /// user clicks another app. A pop-up can use this to dismiss itself.
+    fn on_window_focus(&self, _focused: bool) -> Option<Self::Message> {
+        None
+    }
+
     /// Return true to end the app. Checked after every update.
     fn should_exit(&self) -> bool {
         false
