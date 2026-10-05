@@ -286,7 +286,7 @@ impl App for Launcher {
 
     fn view(&self) -> Element<Msg> {
         // A new key each showing gives the field focus again, with its text selected away.
-        let field = text_input("Search apps", self.query.clone()).on_input(Msg::Query).on_submit(Msg::Launch).on_cancel(Msg::Hide).autofocus(true);
+        let field = text_input("Search apps", self.query.clone()).on_input(Msg::Query).on_submit(Msg::Launch).on_cancel(Msg::Hide).on_arrow(|by| Msg::Move(by as isize)).autofocus(true);
         let search = row().spacing(12.0).align(Align::Center).width(Length::Fill).padding([18.0, 12.0]).push(icon(icons::SEARCH).size(20.0).tone(Tone::Muted)).push(Element::from(field).key(self.showings));
 
         let loose = !self.query.trim().is_empty() && self.results.first().is_some_and(|i| fuzzy::score(&self.query, &self.apps[*i].name).0 <= fuzzy::LOOSE + 10_000);
@@ -409,6 +409,25 @@ mod tests {
         l.update(Msg::Query("qqfirefoxx".into()));
         assert_eq!(names(&l)[0], "Firefox", "no exact match, so the closest");
         assert_eq!(l.selected, 0);
+    }
+
+    #[test]
+    fn arrow_keys_move_the_selection_while_the_search_field_has_focus() {
+        use neo::testing::Harness;
+        let mut h = Harness::new(launcher(), neo::Size::new(640.0, 420.0)).unwrap();
+        h.render(1.0);
+        let none = neo::Modifiers::default();
+        h.type_text("c");
+        assert_eq!(h.app().query, "c", "the field has focus, so typing searches");
+        h.key(neo::Key::Down, none);
+        assert_eq!(h.app().selected, 1);
+        h.key(neo::Key::Down, none);
+        assert_eq!(h.app().selected, 2);
+        h.key(neo::Key::Up, none);
+        assert_eq!(h.app().selected, 1);
+        h.key(neo::Key::Tab, none);
+        assert_eq!(h.app().selected, 2, "Tab moves down too");
+        assert_eq!(h.app().query, "c", "and none of them edit the text");
     }
 
     #[test]

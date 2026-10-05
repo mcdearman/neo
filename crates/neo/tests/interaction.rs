@@ -660,3 +660,45 @@ mod long_text {
         assert!(ink > 50, "the shortened name is drawn");
     }
 }
+
+mod search_field {
+    use super::*;
+
+    #[derive(Default)]
+    struct Search {
+        query: String,
+        moves: Vec<i32>,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Msg {
+        Query(String),
+        Move(i32),
+    }
+
+    impl App for Search {
+        type Message = Msg;
+        fn update(&mut self, m: Msg) {
+            match m {
+                Msg::Query(q) => self.query = q,
+                Msg::Move(by) => self.moves.push(by),
+            }
+        }
+        fn view(&self) -> Element<Msg> {
+            text_input("Search", self.query.clone()).on_input(Msg::Query).on_arrow(Msg::Move).autofocus(true).into()
+        }
+    }
+
+    #[test]
+    fn up_and_down_drive_a_list_instead_of_the_caret() {
+        let mut h = Harness::new(Search::default(), Size::new(300.0, 120.0)).unwrap();
+        h.render(1.0);
+        h.type_text("ab");
+        h.key(Key::Down, Modifiers::default());
+        h.key(Key::Up, Modifiers::default());
+        assert_eq!(h.app().moves, [1, -1]);
+        // The caret did not jump to the start on Up: typing still appends.
+        h.type_text("c");
+        assert_eq!(h.app().query, "abc");
+    }
+}

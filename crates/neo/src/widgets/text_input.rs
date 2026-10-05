@@ -37,6 +37,7 @@ pub struct TextInput<M> {
     on_input: Option<Box<dyn Fn(String) -> M>>,
     on_submit: Option<M>,
     on_cancel: Option<M>,
+    on_arrow: Option<Box<dyn Fn(i32) -> M>>,
     autofocus: bool,
     width: Length,
     padding: Padding,
@@ -53,6 +54,7 @@ impl<M: Clone> TextInput<M> {
             on_input: None,
             on_submit: None,
             on_cancel: None,
+            on_arrow: None,
             autofocus: false,
             width: Length::Fill,
             padding: Padding::xy(14.0, 10.0),
@@ -75,6 +77,13 @@ impl<M: Clone> TextInput<M> {
     /// Sent when the user presses Escape.
     pub fn on_cancel(mut self, m: M) -> Self {
         self.on_cancel = Some(m);
+        self
+    }
+
+    /// Up and Down send this, with -1 or 1, instead of moving the caret to
+    /// the start or end. For a field that drives a list, such as a search box.
+    pub fn on_arrow(mut self, f: impl Fn(i32) -> M + 'static) -> Self {
+        self.on_arrow = Some(Box::new(f));
         self
     }
 
@@ -361,6 +370,11 @@ impl<M: Clone + 'static> Widget<M> for TextInput<M> {
                     Key::Right => {
                         let c = if cmd { n } else if word { word_right(&self.value, cursor) } else if cursor != anchor && !shift { cursor.max(anchor) } else { (cursor + 1).min(n) };
                         move_to(cx, c);
+                    }
+                    Key::Up | Key::Down if self.on_arrow.is_some() => {
+                        if let Some(f) = &self.on_arrow {
+                            cx.emit(f(if k.key == Key::Up { -1 } else { 1 }));
+                        }
                     }
                     Key::Home | Key::Up => move_to(cx, 0),
                     Key::End | Key::Down => move_to(cx, n),
