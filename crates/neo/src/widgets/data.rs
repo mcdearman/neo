@@ -105,7 +105,7 @@ pub fn gauge(value: f32, label: impl Into<String>) -> Gauge {
 impl<M> Widget<M> for Gauge {
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
         let spec = cx.theme().text(TextRole::Title);
-        let style = TextStyle { family: FontFamily::Mono, weight: 500, letter_spacing: 0.0, size: spec.size * self.diameter / 112.0 * 1.05, ..TextStyle::from_spec(spec) };
+        let style = TextStyle { family: FontFamily::Mono, weight: 500, letter_spacing: 0.0, size: spec.size * self.diameter / 112.0 * 1.05, ..spec.style() };
         self.layout = Some(cx.text().layout(&self.label, &style, None));
         let d = self.diameter.min(limits.max.w).min(limits.max.h);
         limits.resolve(Size::new(d, d))

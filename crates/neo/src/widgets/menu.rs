@@ -110,7 +110,7 @@ impl<M: Clone + 'static> Widget<M> for PopupMenu<M> {
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
         let size = limits.max;
-        let style = TextStyle::from_spec(cx.theme().text(TextRole::Body));
+        let style = cx.theme().text(TextRole::Body).style();
         let icon_style = TextStyle { size: ICON, weight: 400, family: FontFamily::Icons, line_height: 1.0, letter_spacing: 0.0 };
         let any_icon = self.items.iter().any(|i| i.icon.is_some());
         let mut width: f32 = 160.0;

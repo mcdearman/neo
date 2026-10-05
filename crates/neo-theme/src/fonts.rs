@@ -19,3 +19,13 @@ pub const ALL: &[&[u8]] = &[
     include_bytes!("../assets/jetbrains-mono-500.ttf"),
     include_bytes!("../assets/lucide.ttf"),
 ];
+
+/// The bundled typefaces, for [`neo_render::Renderer::new`].
+pub fn bundled() -> neo_render::Fonts {
+    neo_render::Fonts {
+        data: ALL.iter().map(|d| std::borrow::Cow::Borrowed(*d)).collect(),
+        sans: SANS.into(),
+        mono: MONO.into(),
+        icons: ICONS.into(),
+    }
+}

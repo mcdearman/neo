@@ -1,6 +1,6 @@
 /// A colour in the sRGB colour space with straight (non-premultiplied) alpha.
 ///
-/// Neo blends in sRGB space, the same way browsers do, so these values are
+/// The renderer blends in sRGB space, the same way browsers do, so these values are
 /// what you see on screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {

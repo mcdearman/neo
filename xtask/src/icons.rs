@@ -57,7 +57,7 @@ fn tray(r: &mut Renderer, out: &Path) -> std::io::Result<()> {
 
 /// Writes `hicolor/NxN/apps/<id>.png` and `macos/<id>.iconset/*.png` under `out`.
 pub fn render_all(out: &Path) -> Result<(), String> {
-    let mut r = Renderer::headless()?;
+    let mut r = Renderer::headless(neo_theme::fonts::bundled())?;
     tray(&mut r, out).map_err(|e| e.to_string())?;
     for app in APPS {
         let flat = scene(&mut r, app, false);

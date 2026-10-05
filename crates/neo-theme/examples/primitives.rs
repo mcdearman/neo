@@ -4,7 +4,7 @@ use neo_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
 use neo_theme::{Color, Scheme, Surface, Theme};
 
 fn main() {
-    let mut r = Renderer::headless().expect("GPU");
+    let mut r = Renderer::headless(neo_theme::fonts::bundled()).expect("GPU");
     let (w, h, scale) = (900.0, 520.0, 2.0);
     let mut scene = Scene::new(Color::TRANSPARENT);
 

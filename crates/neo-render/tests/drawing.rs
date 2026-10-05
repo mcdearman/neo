@@ -2,8 +2,7 @@
 //! pixels. Needs a GPU adapter (any Metal, Vulkan, DX12 or GL device,
 //! including software rasterisers).
 
-use neo_render::{Point, Rect, Renderer, Scene};
-use neo_theme::{Color, Paint, Shadow};
+use neo_render::{Color, Fonts, Paint, Point, Rect, Renderer, Scene, Shadow};
 
 const W: usize = 100;
 const WHITE: [u8; 3] = [255, 255, 255];
@@ -20,7 +19,7 @@ fn blue() -> Color {
 
 /// A 100 by 100 white scene, drawn by `f` and rendered at `scale`.
 fn draw_at(scale: f32, f: impl FnOnce(&mut Scene)) -> Vec<u8> {
-    let mut renderer = Renderer::headless().expect("a GPU adapter is required for these tests");
+    let mut renderer = Renderer::headless(Fonts::system()).expect("a GPU adapter is required for these tests");
     let mut scene = Scene::new(Color::WHITE);
     f(&mut scene);
     let side = (W as f32 * scale) as u32;

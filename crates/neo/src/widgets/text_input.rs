@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use neo_render::{Point, Rect, Size, TextLayout, TextStyle};
+use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use super::style::lerp_paint;
@@ -201,7 +201,7 @@ impl<M: Clone + 'static> Widget<M> for TextInput<M> {
     }
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
-        let style = TextStyle::from_spec(cx.theme().text(TextRole::Body));
+        let style = cx.theme().text(TextRole::Body).style();
         let shown = self.shown();
         self.layout = Some(cx.text().layout(&shown, &style, None));
         self.placeholder_layout = Some(cx.text().layout(&self.placeholder, &style, None));

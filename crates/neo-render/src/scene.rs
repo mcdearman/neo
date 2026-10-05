@@ -1,7 +1,8 @@
 use crate::geometry::{Corners, Point, Rect};
 use crate::image::{Image, ImageItem};
 use crate::text::TextLayout;
-use neo_theme::{Color, Paint, Shadow};
+use crate::color::Color;
+use crate::paint::{Paint, Shadow};
 
 /// GPU instance for one shape. Matches `Inst` in `shape.wgsl`.
 #[repr(C)]
@@ -157,7 +158,7 @@ impl Scene {
         self.push(rect, radii.into(), s.color, Color::TRANSPARENT, [k, sigma, s.spread, 0.0], [s.offset.0, s.offset.1, 0.0, 0.0]);
     }
 
-    /// Paints a themed surface: outer shadows, fill and border, then inner shadows.
+    /// Paints a box: outer shadows, fill and border, then inner shadows.
     pub fn paint(&mut self, rect: Rect, radii: impl Into<Corners>, paint: &Paint) {
         let radii = radii.into();
         for s in paint.shadows.iter().filter(|s| !s.inset) {

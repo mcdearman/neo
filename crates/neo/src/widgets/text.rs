@@ -1,4 +1,4 @@
-use neo_render::{FontFamily, Point, Size, TextLayout, TextStyle};
+use neo_render::{FontFamily, Point, Size, TextLayout};
 use neo_theme::{TextRole, Weight};
 
 use super::style::Tone;
@@ -92,7 +92,7 @@ impl<M> Widget<M> for Text {
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
         let theme = *cx.theme();
         let spec = theme.text(self.role);
-        let mut style = TextStyle::from_spec(spec);
+        let mut style = spec.style();
         style.family = self.family;
         if let Some(w) = self.weight {
             style.weight = w.0;

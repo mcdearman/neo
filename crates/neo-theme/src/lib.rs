@@ -4,11 +4,10 @@
 //! they ask the theme to [`paint`](Theme::paint) a [`Surface`] and get back
 //! a [`Paint`] that already accounts for the scheme, accent and the user's accessibility settings.
 
-mod color;
 pub mod fonts;
 pub mod icons;
 
-pub use color::Color;
+pub use neo_render::{Color, Paint, Shadow};
 
 /// A single glyph from the bundled Lucide icon font. See [`icons`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -229,28 +228,6 @@ pub enum Surface {
     Accent,
 }
 
-/// A drop shadow or inner shadow, in CSS `box-shadow` terms.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Shadow {
-    pub offset: (f32, f32),
-    /// Blur radius (CSS semantics: the Gaussian sigma is half of this).
-    pub blur: f32,
-    pub spread: f32,
-    pub color: Color,
-    pub inset: bool,
-}
-
-/// How to paint one [`Surface`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct Paint {
-    pub fill: Color,
-    /// Border width and colour.
-    pub border: Option<(f32, Color)>,
-    pub shadows: Vec<Shadow>,
-    /// Colour for content (text, icons) drawn on this surface.
-    pub content: Color,
-}
-
 /// Text roles in the type scale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextRole {
@@ -285,6 +262,19 @@ pub struct TextSpec {
     pub line_height: f32,
     pub uppercase: bool,
     pub letter_spacing: f32,
+}
+
+impl TextSpec {
+    /// The renderer's text style for this role, in the interface typeface.
+    pub fn style(self) -> neo_render::TextStyle {
+        neo_render::TextStyle {
+            size: self.size,
+            weight: self.weight.0,
+            family: neo_render::FontFamily::Sans,
+            line_height: self.line_height,
+            letter_spacing: self.letter_spacing,
+        }
+    }
 }
 
 impl Theme {

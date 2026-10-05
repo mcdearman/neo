@@ -1,4 +1,4 @@
-use neo_render::{Point, Rect, Size, TextLayout, TextStyle};
+use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
@@ -59,7 +59,7 @@ impl<M: 'static> Widget<M> for Segmented<M> {
     }
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
-        let mut style = TextStyle::from_spec(cx.theme().text(TextRole::Strong));
+        let mut style = cx.theme().text(TextRole::Strong).style();
         style.size *= 0.93;
         self.layouts = self.options.iter().map(|o| cx.text().layout(o, &style, None)).collect();
         let n = self.layouts.len().max(1) as f32;

@@ -96,7 +96,8 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+    /// `fonts` are the typefaces text is drawn with.
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, fonts: crate::Fonts) -> Self {
         let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("neo shapes"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/shape.wgsl"))),
@@ -327,7 +328,7 @@ impl Renderer {
             blit_shader,
             blit_pipelines: vec![],
             canvas: None,
-            text: TextSystem::new(),
+            text: TextSystem::new(fonts),
             swash: SwashCache::new(),
             viewport,
             atlas,
@@ -337,7 +338,7 @@ impl Renderer {
     }
 
     /// Creates a renderer without a window, for tests and screenshots.
-    pub fn headless() -> Result<Self, String> {
+    pub fn headless(fonts: crate::Fonts) -> Result<Self, String> {
         pollster::block_on(async {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = instance
@@ -348,7 +349,7 @@ impl Renderer {
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .map_err(|e| format!("no GPU device: {e}"))?;
-            Ok(Self::new(device, queue))
+            Ok(Self::new(device, queue, fonts))
         })
     }
 

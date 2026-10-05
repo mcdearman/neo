@@ -24,7 +24,7 @@ pub struct Harness<A: App> {
 impl<A: App> Harness<A> {
     /// Creates a harness with a window of `size` logical pixels.
     pub fn new(app: A, size: Size) -> Result<Self, String> {
-        let renderer = Renderer::headless()?;
+        let renderer = Renderer::headless(neo_theme::fonts::bundled())?;
         let clipboard = Rc::new(RefCell::new(None));
         let mut ui = Ui::new(app, size, Scheme::Light);
         let reader = clipboard.clone();

@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use neo_render::{Point, Rect, Size, TextLayout, TextStyle};
+use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use super::style::lerp_paint;
@@ -55,7 +55,7 @@ impl<M: 'static> Widget<M> for Frame<M> {
         let top = if self.chrome { TITLE_H } else { 0.0 };
         if self.chrome {
             let spec = cx.theme().text(TextRole::Strong);
-            self.title_layout = Some(cx.text().layout(&self.title, &TextStyle::from_spec(spec), None));
+            self.title_layout = Some(cx.text().layout(&self.title, &spec.style(), None));
         }
         self.content[0].layout(cx, Limits::tight(Size::new(size.w, (size.h - top).max(0.0))));
         self.content[0].set_position(Point::new(0.0, top));

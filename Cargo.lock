@@ -1681,7 +1681,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glyphon",
- "neo-theme",
  "png",
  "pollster",
  "wgpu",
@@ -1708,6 +1707,9 @@ dependencies = [
 [[package]]
 name = "neo-theme"
 version = "0.1.0"
+dependencies = [
+ "neo-render",
+]
 
 [[package]]
 name = "neo-videos"

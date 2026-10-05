@@ -1,4 +1,4 @@
-use neo_render::{Point, Rect, Size, TextLayout, TextStyle};
+use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Color, Surface, TextRole};
 
 use crate::anim::Anim;
@@ -156,7 +156,7 @@ impl<M: 'static> Widget<M> for Checkbox<M> {
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
         let spec = cx.theme().text(TextRole::Body);
-        self.layout = self.label.as_ref().map(|l| cx.text().layout(l, &TextStyle::from_spec(spec), None));
+        self.layout = self.label.as_ref().map(|l| cx.text().layout(l, &spec.style(), None));
         let tw = self.layout.as_ref().map_or(0.0, |l| l.size().w + 10.0);
         let th = self.layout.as_ref().map_or(0.0, |l| l.size().h);
         limits.resolve(Size::new(BOX + tw, BOX.max(th)))

@@ -199,7 +199,7 @@ impl<A: App> Shell<A> {
         let scale = window.scale_factor() as f32;
         self.ui.resize(Size::new(size.width as f32 / scale, size.height as f32 / scale));
         self.gpu = Some(Gpu {
-            renderer: Renderer::new(device, queue),
+            renderer: Renderer::new(device, queue, neo_theme::fonts::bundled()),
             surface,
             config,
             target: SurfaceTarget { format, unpremultiply },

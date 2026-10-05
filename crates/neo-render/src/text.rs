@@ -34,15 +34,24 @@ impl Default for TextStyle {
     }
 }
 
-impl TextStyle {
-    pub fn from_spec(spec: neo_theme::TextSpec) -> Self {
-        Self {
-            size: spec.size,
-            weight: spec.weight.0,
-            family: FontFamily::Sans,
-            line_height: spec.line_height,
-            letter_spacing: spec.letter_spacing,
-        }
+/// The typefaces a renderer draws text with. The system's own fonts are
+/// always available as a fallback, for emoji, CJK and so on.
+#[derive(Clone, Debug, Default)]
+pub struct Fonts {
+    /// Font files to load.
+    pub data: Vec<std::borrow::Cow<'static, [u8]>>,
+    /// Family name for [`FontFamily::Sans`]. Empty uses the system's.
+    pub sans: String,
+    /// Family name for [`FontFamily::Mono`]. Empty uses the system's.
+    pub mono: String,
+    /// Family name for [`FontFamily::Icons`]. Empty uses the sans family.
+    pub icons: String,
+}
+
+impl Fonts {
+    /// No fonts of its own: text is drawn with whatever the system has.
+    pub fn system() -> Self {
+        Self::default()
     }
 }
 
@@ -128,21 +137,26 @@ struct Entry {
 /// Owns the font database and caches shaped text between frames.
 pub struct TextSystem {
     pub(crate) fonts: FontSystem,
+    names: Fonts,
     cache: HashMap<u64, Vec<(Key, Entry)>>,
     frame: u64,
 }
 
 impl TextSystem {
-    /// Loads the bundled fonts plus system fonts for fallback (emoji, CJK, ...).
-    pub fn new() -> Self {
+    /// Loads `names.data` plus system fonts for fallback (emoji, CJK, ...).
+    pub fn new(mut names: Fonts) -> Self {
         let mut fonts = FontSystem::new();
         let db = fonts.db_mut();
-        for data in neo_theme::fonts::ALL {
-            db.load_font_data(data.to_vec());
+        for data in std::mem::take(&mut names.data) {
+            db.load_font_data(data.into_owned());
         }
-        db.set_sans_serif_family(neo_theme::fonts::SANS);
-        db.set_monospace_family(neo_theme::fonts::MONO);
-        Self { fonts, cache: HashMap::new(), frame: 0 }
+        if !names.sans.is_empty() {
+            db.set_sans_serif_family(names.sans.clone());
+        }
+        if !names.mono.is_empty() {
+            db.set_monospace_family(names.mono.clone());
+        }
+        Self { fonts, names, cache: HashMap::new(), frame: 0 }
     }
 
     /// Shapes `text`, wrapping at `max_width` when given.
@@ -152,7 +166,7 @@ impl TextSystem {
 
     /// Shapes coloured spans as one run of text, for syntax highlighting.
     /// Spans with no colour of their own use the colour passed when drawing.
-    pub fn layout_spans(&mut self, spans: &[(&str, Option<neo_theme::Color>)], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+    pub fn layout_spans(&mut self, spans: &[(&str, Option<crate::Color>)], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
         let text: String = spans.iter().map(|(t, _)| *t).collect();
         let colors: Vec<(usize, [u8; 4])> = spans.iter().map(|(t, c)| (t.len(), c.map_or([0; 4], |c| c.to_rgba8()))).collect();
         self.layout_inner(&text, &colors, style, max_width)
@@ -182,9 +196,10 @@ impl TextSystem {
         let line_height = (style.size * style.line_height).round();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(style.size, line_height));
         let family = match style.family {
-            FontFamily::Sans => Family::Name(neo_theme::fonts::SANS),
-            FontFamily::Mono => Family::Name(neo_theme::fonts::MONO),
-            FontFamily::Icons => Family::Name(neo_theme::fonts::ICONS),
+            FontFamily::Sans => Family::SansSerif,
+            FontFamily::Mono => Family::Monospace,
+            FontFamily::Icons if self.names.icons.is_empty() => Family::SansSerif,
+            FontFamily::Icons => Family::Name(&self.names.icons),
         };
         let attrs = Attrs::new()
             .family(family)
@@ -232,11 +247,5 @@ impl TextSystem {
             bucket.retain(|(_, e)| frame - e.last_used < 120);
             !bucket.is_empty()
         });
-    }
-}
-
-impl Default for TextSystem {
-    fn default() -> Self {
-        Self::new()
     }
 }
