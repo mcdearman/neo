@@ -78,3 +78,49 @@ impl Default for Color {
         Color::TRANSPARENT
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_reads_red_green_blue_in_order() {
+        let c = Color::hex(0x336699);
+        assert_eq!(c.to_rgba8(), [0x33, 0x66, 0x99, 255]);
+        assert_eq!(Color::hex(0xff0000), Color::rgb(1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn mix_moves_every_channel_including_alpha() {
+        let a = Color::rgba(0.0, 0.2, 1.0, 0.0);
+        let b = Color::rgba(1.0, 0.6, 0.0, 1.0);
+        assert_eq!(a.mix(b, 0.0), a);
+        assert_eq!(a.mix(b, 1.0), b);
+        let half = a.mix(b, 0.5);
+        for (got, want) in [(half.r, 0.5), (half.g, 0.4), (half.b, 0.5), (half.a, 0.5)] {
+            assert!((got - want).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn contrast_follows_wcag() {
+        assert!((Color::BLACK.contrast(Color::WHITE) - 21.0).abs() < 1e-3);
+        assert_eq!(Color::WHITE.contrast(Color::BLACK), Color::BLACK.contrast(Color::WHITE), "order does not matter");
+        assert!((Color::hex(0x808080).contrast(Color::hex(0x808080)) - 1.0).abs() < 1e-6);
+        // A reference pair: #767676 on white is the lightest grey that passes AA.
+        let c = Color::hex(0x767676).contrast(Color::WHITE);
+        assert!((c - 4.54).abs() < 0.01, "{c}");
+    }
+
+    #[test]
+    fn bytes_round_and_clamp() {
+        assert_eq!(Color::rgba(2.0, -1.0, 0.5, 0.25).to_rgba8(), [255, 0, 128, 64]);
+    }
+
+    #[test]
+    fn premultiplying_scales_colour_by_alpha() {
+        assert_eq!(Color::rgba(1.0, 0.5, 0.0, 0.5).premultiplied(), [0.5, 0.25, 0.0, 0.5]);
+        assert_eq!(Color::default(), Color::TRANSPARENT);
+        assert_eq!(Color::WHITE.with_alpha(0.3).a, 0.3);
+    }
+}
