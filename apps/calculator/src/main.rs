@@ -134,7 +134,7 @@ impl App for Calculator {
     }
 
     fn view(&self) -> Element<Msg> {
-        row().spacing(12.0).width(Length::Fill).height(Length::Fill).padding([12.0, 0.0, 12.0, 12.0]).push(self.main()).push(self.history_panel()).into()
+        row().spacing(12.0).width(Length::Fill).height(Length::Fill).padding([0.0, 12.0, 12.0, 12.0]).push(self.main()).push(self.history_panel()).into()
     }
 }
 
@@ -214,7 +214,7 @@ impl Calculator {
             .push(text("History").role(TextRole::Label).tone(Tone::Muted))
             .push(Space::fill_x())
             .push(icon_button(icons::TRASH_2, 30.0).kind(ButtonKind::Ghost).on_press_maybe((!self.history.is_empty()).then_some(Msg::ClearHistory)));
-        column().spacing(4.0).width(220.0).height(Length::Fill).padding([0.0, 12.0, 0.0, 0.0]).push(header).push(scrollable(list).height(Length::Fill)).into()
+        column().spacing(4.0).width(220.0).height(Length::Fill).push(header).push(scrollable(list).height(Length::Fill)).into()
     }
 }
 

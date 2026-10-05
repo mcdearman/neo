@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 neo.workspace = true
 neo-desktop.workspace = true
+# For thumbnails in the grid view.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
