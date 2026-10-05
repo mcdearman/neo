@@ -77,9 +77,18 @@ fn info_plist(app: &AppInfo) -> String {
         bin = app.bin,
         id = app.id,
         version = env!("CARGO_PKG_VERSION"),
-        // macOS refuses microphone access to apps that do not say why they want it.
-        // The Recorder lives in the menu bar, so it has no Dock icon.
-        usage = if app.bin == "neo-recorder" { "\n    <key>LSUIElement</key><true/>\n    <key>NSMicrophoneUsageDescription</key><string>Neo Recorder records sound from the microphone when you turn that option on.</string>" } else { "" },
+        usage = {
+            let mut extra = String::new();
+            if app.background {
+                // No Dock icon for an app that waits behind a shortcut.
+                extra.push_str("\n    <key>LSUIElement</key><true/>");
+            }
+            if app.bin == "neo-recorder" {
+                // macOS refuses microphone access to apps that do not say why they want it.
+                extra.push_str("\n    <key>NSMicrophoneUsageDescription</key><string>Neo Recorder records sound from the microphone when you turn that option on.</string>");
+            }
+            extra
+        },
     )
 }
 

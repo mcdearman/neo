@@ -1,0 +1,13 @@
+[package]
+name = "neo-videos"
+description = "Neo Videos: play video files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+
+[build-dependencies]
+cc = "1"

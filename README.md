@@ -8,12 +8,15 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 
 | App | Package | What it does |
 |---|---|---|
-| Files | `neo-files` | Browse folders with places, breadcrumbs, back and forward, search, sortable columns and hidden files. Double-click or Enter opens with the default app. New folder, rename and Move to Trash (freedesktop.org Trash on Linux). |
+| Files | `neo-files` | Browse folders with places, breadcrumbs, back and forward, search, sortable columns and hidden files. Three views: list, compact list, and a grid with picture thumbnails. Double-click or Enter opens with the default app. New folder, rename and Move to Trash (freedesktop.org Trash on Linux), also from a right-click menu. Shift and Command/Ctrl clicks select several entries. Drag entries onto a folder to move them, drop files from other apps to copy them in, and on macOS drag entries out to other apps. Pictures open in Photos and videos in Videos. |
 | Terminal | `neo-terminal` | A GPU-drawn terminal using `alacritty_terminal` for emulation and the pty: 256 and true colour, bold, underline, inverse, wide characters, scrollback, mouse selection, copy and paste, bracketed paste and window titles. |
 | Settings | `neo-settings` | Colour scheme, accent, corner radius, glass, text size and reduced motion, applied to every open Neo app at once; plus About this computer. |
-| System Monitor | `neo-monitor` | Processes with filter, sort, thread counts and End process (with confirmation). Open a process to see its memory, its swap and a live table of its threads with each one's CPU use. Per-core CPU, memory, swap and network history; disk usage. |
+| System Monitor | `neo-monitor` | Processes with filter, sort, thread counts and End process (with confirmation). Open a process to see its memory, its swap and a live table of its threads with each one's CPU use. Per-core CPU, memory, swap and network history; disk usage. A Sensors page shows temperatures for the CPU, GPU, memory and storage where the hardware reports them, with fan speeds. |
 | Calculator | `neo-calculator` | Type expressions with precedence, brackets, powers, `%`, `!`, functions, `π`, `e` and `ans`; the result previews as you type, and a history panel recalls past results. Basic and scientific keypads. |
-| Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. While recording, a small bar shows the time with Pause and Stop, and is left out of the recording where the system allows. Options for the microphone and for saving a GIF. It keeps an icon in the menu bar or system tray, and the installed app starts at login (a setting, on by default) so the shortcut is always ready. ⌘⇧R (Ctrl+Shift+R elsewhere) brings up the area frame from anywhere and stops a recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
+| Photos | `neo-photos` | Views pictures: scroll or pinch to zoom, drag to pan, rotate, and step through the folder. PNG, JPEG, GIF, WebP, BMP, TIFF and ICO everywhere, playing animated GIFs and WebPs; on macOS also HEIC and anything else the system reads. |
+| Videos | `neo-videos` | Plays video with play/pause, seeking and volume. Uses AVFoundation on macOS; `ffmpeg` and `ffplay` on Linux and Windows. |
+| Launcher | `neo-launcher` | A search box that opens apps. ⌘' (Ctrl+' on Windows) brings it up from anywhere. The search is fuzzy and always shows the closest matches, and apps opened often rank higher. On Linux, bind `neo-launcher` to a key in the window manager. |
+| Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. While recording, a small bar shows the time with Pause and Stop, and is left out of the recording where the system allows. Options for the microphone and for saving a GIF. ⌘⇧S (Ctrl+Shift+S) takes a screenshot of the same three kinds. It keeps an icon in the menu bar or system tray, and the installed app starts at login (a setting, on by default) so the shortcut is always ready. ⌘⇧R (Ctrl+Shift+R elsewhere) brings up the area frame from anywhere and stops a recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
 | Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
 
 ```sh
@@ -22,6 +25,8 @@ cargo run -p neo-terminal [folder]
 cargo run -p neo-settings
 cargo run -p neo-monitor
 cargo run -p neo-calculator
+cargo run -p neo-photos [picture or folder]
+cargo run -p neo-videos [video]
 cargo run -p neo-recorder [--mode area --record --for 10 --gif]
 cargo run -p neo-code [folder]              # Cmd/Ctrl+S saves
 cargo run -p neo-files -- --snapshot target/snapshots   # every app renders PNGs this way
@@ -88,7 +93,7 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 ### Widgets
 
-Text, Icon, Container, Row, Column, Stack, Space, Divider, Scrollable, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, TextEditor, ProgressBar, Gauge and Sparkline.
+Text, Icon, Picture, Container, Row, Column, Stack, Space, Divider, Scrollable, MouseArea, PopupMenu, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, TextEditor, ProgressBar, Gauge and Sparkline.
 
 TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
 

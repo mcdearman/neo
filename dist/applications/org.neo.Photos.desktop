@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Photos
+GenericName=Image Viewer
+Comment=View pictures, with zoom, rotate and a walk through the folder
+Exec=neo-photos %f
+Icon=org.neo.Photos
+Terminal=false
+Categories=Graphics;Viewer;2DGraphics;RasterGraphics;
+Keywords=picture;photo;image;viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/x-icon;image/vnd.microsoft.icon;image/heic;image/heif;image/avif;
+StartupNotify=true
+StartupWMClass=org.neo.Photos

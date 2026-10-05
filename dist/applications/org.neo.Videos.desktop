@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Videos
+GenericName=Video Player
+Comment=Play video files
+Exec=neo-videos %f
+Icon=org.neo.Videos
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=video;movie;film;player;
+MimeType=video/mp4;video/x-m4v;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/x-ms-wmv;video/x-flv;video/3gpp;video/mp2t;
+StartupNotify=true
+StartupWMClass=org.neo.Videos

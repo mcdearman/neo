@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Launcher
+GenericName=App Launcher
+Comment=Find and open apps with a fuzzy search
+Exec=neo-launcher
+Icon=org.neo.Launcher
+Terminal=false
+Categories=Utility;
+Keywords=launcher;search;run;apps;open;
+StartupNotify=false
+StartupWMClass=org.neo.Launcher
