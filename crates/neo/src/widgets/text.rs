@@ -2,6 +2,7 @@ use neo_render::{FontFamily, Point, Size, TextLayout};
 use neo_theme::{TextRole, Weight};
 
 use super::style::Tone;
+use crate::ThemeCx;
 use crate::core::{Align, Cx, DrawCx, Length, Limits, Widget};
 
 /// A run of text in one style.

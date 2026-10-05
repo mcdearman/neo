@@ -133,6 +133,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "armature"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "cc",
+ "neo-render",
+ "objc2 0.6.4",
+ "pollster",
+ "raw-window-handle",
+ "regex",
+ "window-vibrancy",
+ "winit",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1578,17 +1593,10 @@ dependencies = [
 name = "neo"
 version = "0.1.0"
 dependencies = [
- "arboard",
- "cc",
+ "armature",
  "neo-render",
  "neo-theme",
- "objc2 0.6.4",
  "png",
- "pollster",
- "raw-window-handle",
- "regex",
- "window-vibrancy",
- "winit",
 ]
 
 [[package]]

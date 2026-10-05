@@ -1,6 +1,7 @@
 use neo_render::{FontFamily, Point, Size, TextLayout, TextStyle};
 
 use super::style::Tone;
+use crate::ThemeCx;
 use crate::core::{Cx, DrawCx, Limits, Widget};
 
 /// A glyph from the Lucide icon set. See [`neo_theme::icons`].

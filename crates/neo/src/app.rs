@@ -1,12 +1,8 @@
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use std::time::Duration;
-
-use neo_render::{Point, Rect, Size};
-use neo_theme::{Scheme, Theme};
+use armature::{Chrome, KeyEvent, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
+use neo_theme::{Scheme, TextRole, Theme};
 
 use crate::core::Element;
-use crate::event::KeyEvent;
+use crate::widgets::frame::Frame;
 
 /// A Neo application, in the Elm style: state, messages that change it,
 /// and a view that describes the interface for the current state.
@@ -79,108 +75,87 @@ pub trait App: 'static {
     }
 }
 
-/// Sends messages to a running app from any thread and wakes its event loop.
-pub struct Proxy<M> {
-    pub(crate) tx: Sender<M>,
-    pub(crate) wake: Arc<dyn Fn() + Send + Sync>,
-}
+/// Runs a Neo [`App`] on the framework underneath: supplies the theme as
+/// the window's style, Neo's typefaces, and the Neo title bar.
+pub struct Themed<A>(pub A);
 
-impl<M> Clone for Proxy<M> {
-    fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), wake: self.wake.clone() }
+fn scheme(s: armature::Scheme) -> Scheme {
+    match s {
+        armature::Scheme::Light => Scheme::Light,
+        armature::Scheme::Dark => Scheme::Dark,
     }
 }
 
-impl<M> Proxy<M> {
-    /// Queues `message` for `App::update`. Returns false once the app has exited.
-    pub fn send(&self, message: M) -> bool {
-        let ok = self.tx.send(message).is_ok();
-        if ok {
-            (self.wake)();
-        }
-        ok
+impl<A: App> armature::App for Themed<A> {
+    type Message = A::Message;
+
+    fn title(&self) -> String {
+        self.0.title()
+    }
+
+    fn update(&mut self, message: Self::Message) {
+        self.0.update(message)
+    }
+
+    fn view(&self) -> Element<Self::Message> {
+        self.0.view()
+    }
+
+    fn style(&self, system: armature::Scheme) -> Style {
+        let theme = self.0.theme(scheme(system));
+        Style::new(theme)
+            .content(theme.palette().text)
+            .text(theme.text(TextRole::Body).style())
+            .window_radius(theme.window_radius())
+            .backdrop_blur(theme.glass.enabled.then_some(theme.glass.blur))
+    }
+
+    fn fonts(&self) -> armature::Fonts {
+        neo_theme::fonts::bundled()
+    }
+
+    fn frame(&self, view: Element<Self::Message>, chrome: Chrome) -> Element<Self::Message> {
+        Element::new(Frame::new(view, chrome.title, chrome.title_bar, chrome.rounded, chrome.background))
+    }
+
+    fn on_key(&self, key: &KeyEvent) -> Option<Self::Message> {
+        self.0.on_key(key)
+    }
+
+    fn start(&mut self, proxy: Proxy<Self::Message>) {
+        self.0.start(proxy)
+    }
+
+    fn subscriptions(&self) -> Vec<Subscription<Self::Message>> {
+        self.0.subscriptions()
+    }
+
+    fn window_state(&self) -> WindowState {
+        self.0.window_state()
+    }
+
+    fn on_close(&self) -> Option<Self::Message> {
+        self.0.on_close()
+    }
+
+    fn on_window_geometry(&self, geometry: WindowGeometry) -> Option<Self::Message> {
+        self.0.on_window_geometry(geometry)
+    }
+
+    fn on_window_focus(&self, focused: bool) -> Option<Self::Message> {
+        self.0.on_window_focus(focused)
+    }
+
+    fn should_exit(&self) -> bool {
+        self.0.should_exit()
+    }
+
+    fn window(&self) -> WindowSettings {
+        self.0.window()
     }
 }
 
-/// Sends `message` every `period`.
-#[derive(Clone, Debug)]
-pub struct Subscription<M> {
-    pub period: Duration,
-    pub message: M,
-}
-
-impl<M> Subscription<M> {
-    pub fn every(period: Duration, message: M) -> Self {
-        Self { period, message }
-    }
-}
-
-/// How a window presents itself. See [`App::window_state`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WindowState {
-    /// Hidden windows keep running, for example to wait for a global shortcut.
-    pub visible: bool,
-    /// Stay above other apps' windows.
-    pub always_on_top: bool,
-    /// Draw no window background or title bar. Only what the view paints
-    /// shows; the rest of the window is see-through.
-    pub bare: bool,
-    /// Resize the window's content area to this whenever the value changes.
-    pub size: Option<Size>,
-    /// Move the window's top-left corner here, in logical screen pixels,
-    /// whenever the value changes. Ignored where the compositor places
-    /// windows itself, as on Wayland.
-    pub position: Option<Point>,
-    /// Leave the window out of screenshots and screen recordings, where the
-    /// platform can.
-    pub hidden_from_capture: bool,
-}
-
-impl Default for WindowState {
-    fn default() -> Self {
-        Self { visible: true, always_on_top: false, bare: false, size: None, position: None, hidden_from_capture: false }
-    }
-}
-
-/// Where a window is. See [`App::on_window_geometry`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WindowGeometry {
-    /// The window's content area on the screen, in logical pixels.
-    /// Compositors that hide window positions, such as Wayland ones, report
-    /// the origin as zero.
-    pub frame: Rect,
-    /// The screen the window is on, in the same coordinates.
-    pub screen: Rect,
-    /// Physical pixels per logical pixel.
-    pub scale: f32,
-}
-
-/// Who draws the title bar and window border.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Decorations {
-    /// Neo draws the title bar, window controls and rounded corners, so
-    /// windows look the same on every platform. The default.
-    #[default]
-    Neo,
-    /// The platform's native title bar.
-    System,
-}
-
-#[derive(Clone, Debug)]
-pub struct WindowSettings {
-    /// Initial content size in logical pixels.
-    pub size: Size,
-    pub min_size: Option<Size>,
-    pub decorations: Decorations,
-    pub resizable: bool,
-    /// Identifies the app to the desktop, such as `org.neo.Files`. On Linux
-    /// this is the Wayland app ID and X11 class, which must match the name
-    /// of the app's `.desktop` file for docks and menus to show its icon.
-    pub app_id: Option<String>,
-}
-
-impl Default for WindowSettings {
-    fn default() -> Self {
-        Self { size: Size::new(960.0, 640.0), min_size: Some(Size::new(360.0, 240.0)), decorations: Decorations::Neo, resizable: true, app_id: None }
-    }
+/// Opens a window and runs `app` until it closes.
+pub fn run<A: App>(app: A) -> Result<(), armature::Error> {
+    armature::run(Themed(app))
 }

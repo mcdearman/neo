@@ -38,22 +38,27 @@
 //! }
 //! ```
 
-mod anim;
 mod app;
-mod core;
-mod event;
-mod platform;
-mod runtime;
-mod shell;
+mod cx;
 pub mod testing;
 pub mod widgets;
 
-pub use anim::Anim;
-pub use app::{App, Decorations, Proxy, Subscription, WindowGeometry, WindowSettings, WindowState};
-pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
-pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
-pub use runtime::Ui;
-pub use shell::{run, Error};
+// Where widgets expect to find the framework's types.
+mod core {
+    pub use armature::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, Widget, WindowRequest};
+}
+mod event {
+    pub use armature::{Event, Key, Modifiers, PointerButton, Status};
+}
+mod anim {
+    pub use armature::Anim;
+}
+
+pub use app::{run, App, Themed};
+pub use cx::{FocusRing, ThemeCx};
+
+pub use armature::{Align, Anim, Cx, CursorIcon, Decorations, DrawCx, Element, Error, EventCx, Length, Limits, Padding, Proxy, ResizeEdge, Subscription, Ui, Widget, WidgetId, WindowGeometry, WindowRequest, WindowSettings, WindowState};
+pub use armature::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 
 pub use neo_render::{Corners, FontFamily, Image, Point, Rect, Scene, Size, TextLayout, TextStyle};
 pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, TextRole, Theme, Weight};
@@ -61,5 +66,5 @@ pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface,
 /// Everything an application usually needs.
 pub mod prelude {
     pub use crate::widgets::*;
-    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, Weight, WindowSettings, WindowState};
+    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, FocusRing, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, ThemeCx, Weight, WindowSettings, WindowState};
 }

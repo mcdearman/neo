@@ -85,9 +85,10 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 | Crate | Role |
 |---|---|
-| `neo-theme` | Design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. No dependencies. |
-| `neo-render` | wgpu renderer. Every shape is one instanced SDF quad: rounded rects, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Includes dual-Kawase backdrop blur, glyphon text and PNG readback. |
-| `neo` | Widgets, layout, events, focus, animation, the winit shell and a headless test harness. |
+| `neo-render` | wgpu renderer, with no look of its own: the caller supplies colours, shadows and typefaces. Every shape is one instanced SDF quad: rounded rects, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Includes dual-Kawase backdrop blur, images, glyphon text and PNG readback. |
+| `armature` | The framework (working name): windows, input, layout, the Elm-style app loop, widget state, a headless test harness, and the widgets that only arrange or capture. Carries a toolkit's theme to its widgets without reading it. |
+| `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |
+| `neo` | The Neo toolkit: themed controls (buttons, inputs, toggles, sliders, menus, the code editor), the Neo title bar, and the `App` trait the apps implement, built on `armature`. |
 | `neo-desktop` | What the apps share: the appearance file and live reload, file helpers (standard folders, sizes, dates, Trash, open with the default app) and common layout pieces such as the sidebar and settings rows. |
 | `apps/*` | The desktop apps above, one binary each. |
 

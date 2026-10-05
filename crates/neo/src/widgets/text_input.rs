@@ -4,6 +4,7 @@ use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use super::style::lerp_paint;
+use crate::ThemeCx;
 use crate::anim::Anim;
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Padding, Widget};
 use crate::event::{Event, Key, PointerButton, Status};

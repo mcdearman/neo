@@ -569,7 +569,8 @@ impl Document {
     }
 }
 
-pub(crate) fn text_between(lines: &[String], a: Pos, b: Pos) -> String {
+/// The text from `a` up to `b`, with lines joined by newlines.
+pub fn text_between(lines: &[String], a: Pos, b: Pos) -> String {
     if a.line == b.line {
         return lines[a.line][a.col..b.col].to_owned();
     }

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use neo_render::{wgpu, Point, Renderer, Size, SurfaceTarget};
-use neo_theme::Scheme;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -12,7 +11,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 use winit::window::{ResizeDirection, Window, WindowId, WindowLevel};
 
-use crate::app::{App, Decorations};
+use crate::app::{App, Decorations, Scheme};
 use crate::core::{CursorIcon, ResizeEdge, WindowRequest};
 use crate::event::{Event, Key, KeyEvent, Modifiers, PointerButton};
 use crate::runtime::Ui;
@@ -151,8 +150,8 @@ impl<A: App> Shell<A> {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            if s.decorations == Decorations::Neo {
-                // Keep the native shadow and resize edges while Neo draws the chrome.
+            if s.decorations == Decorations::Custom {
+                // Keep the native shadow and resize edges while the app draws the chrome.
                 attrs = attrs.with_decorations(true).with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true).with_titlebar_buttons_hidden(true);
             }
         }
@@ -199,7 +198,7 @@ impl<A: App> Shell<A> {
         let scale = window.scale_factor() as f32;
         self.ui.resize(Size::new(size.width as f32 / scale, size.height as f32 / scale));
         self.gpu = Some(Gpu {
-            renderer: Renderer::new(device, queue, neo_theme::fonts::bundled()),
+            renderer: Renderer::new(device, queue, self.ui.app().fonts()),
             surface,
             config,
             target: SurfaceTarget { format, unpremultiply },
@@ -214,7 +213,7 @@ impl<A: App> Shell<A> {
         Ok(())
     }
 
-    /// Applies theme-driven window state such as glass blur.
+    /// Applies style-driven window state such as backdrop blur.
     fn sync_window(&mut self) {
         let Some(gpu) = &self.gpu else { return };
         let state = self.ui.window_state();
@@ -255,7 +254,7 @@ impl<A: App> Shell<A> {
             }
         }
         // Platform blur would fill a see-through window.
-        let glass = (self.ui.theme().glass.enabled && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
+        let glass = (self.ui.backdrop_blur().is_some() && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
         if self.glass != Some(glass) {
             crate::platform::set_blur(&gpu.window, glass.0, glass.1);
             self.glass = Some(glass);
@@ -268,14 +267,12 @@ impl<A: App> Shell<A> {
         }
     }
 
-    /// Applies the theme's blur strength once the platform blur exists.
+    /// Applies the style's blur strength once the platform blur exists.
     fn sync_blur_strength(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let theme = self.ui.theme();
-        if !theme.glass.enabled {
+        let Some(want) = self.ui.backdrop_blur() else {
             return;
-        }
-        let want = theme.glass.blur;
+        };
         if self.blur_strength == Some(want) {
             return;
         }
@@ -423,7 +420,7 @@ impl<A: App> Shell<A> {
 
     /// With Neo decorations on Linux and Windows, the window edges resize.
     fn resize_edge(&self, p: Point) -> Option<ResizeEdge> {
-        if cfg!(target_os = "macos") || self.settings.decorations != Decorations::Neo || !self.settings.resizable {
+        if cfg!(target_os = "macos") || self.settings.decorations != Decorations::Custom || !self.settings.resizable {
             return None;
         }
         let gpu = self.gpu.as_ref()?;

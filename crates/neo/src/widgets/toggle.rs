@@ -1,6 +1,7 @@
 use neo_render::{Point, Rect, Size, TextLayout};
 use neo_theme::{Color, Surface, TextRole};
 
+use crate::{FocusRing, ThemeCx};
 use crate::anim::Anim;
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
 use crate::event::{Event, Key, PointerButton, Status};

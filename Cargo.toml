@@ -11,5 +11,6 @@ repository = "https://github.com/mcdearman/neo"
 [workspace.dependencies]
 neo-theme = { path = "crates/neo-theme" }
 neo-render = { path = "crates/neo-render" }
+armature = { path = "crates/armature" }
 neo = { path = "crates/neo" }
 neo-desktop = { path = "crates/neo-desktop" }

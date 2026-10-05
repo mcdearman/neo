@@ -3,20 +3,14 @@
 mod button;
 mod container;
 mod data;
-mod document;
-mod flex;
 pub(crate) mod frame;
 mod highlight;
 mod icon;
-pub(crate) mod map;
 mod menu;
-mod mouse_area;
-mod picture;
 mod scrollable;
 mod segmented;
 mod slider;
-mod space;
-mod stack;
+mod divider;
 pub mod style;
 mod text;
 mod text_editor;
@@ -25,20 +19,16 @@ mod toggle;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
-pub use document::{Action, BlockSelection, ClipboardNeed, Document, Mode as VimMode, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
+pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, Mode as VimMode, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::Language;
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
-pub use flex::{column, row, Column, Flex, Justify, Row};
+pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack};
 pub use icon::{icon, Icon};
-pub use map::Map;
 pub use menu::{popup_menu, MenuItem, PopupMenu};
-pub use mouse_area::{mouse_area, MouseArea};
-pub use picture::{fit_rect, picture, Fit, Picture};
 pub use scrollable::{scrollable, Scrollable};
 pub use segmented::{segmented, Segmented};
 pub use slider::{slider, Slider};
-pub use space::{Divider, Space};
-pub use stack::{stack, Stack};
+pub use divider::Divider;
 pub use style::Tone;
 pub use text::{text, Text};
 pub use text_editor::{text_editor, TextEditor};
@@ -67,5 +57,5 @@ macro_rules! into_element_generic {
     )*};
 }
 
-into_element!(Text, Icon, Space, Divider, ProgressBar, Gauge, Sparkline, Picture);
-into_element_generic!(MouseArea, PopupMenu, Button, Container, Flex, Scrollable, Segmented, Slider, Stack, TextEditor, TextInput, Toggle, Checkbox);
+into_element!(Text, Icon, Divider, ProgressBar, Gauge, Sparkline);
+into_element_generic!(PopupMenu, Button, Container, Scrollable, Segmented, Slider, TextEditor, TextInput, Toggle, Checkbox);

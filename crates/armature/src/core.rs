@@ -3,8 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use neo_render::{Rect, Scene, Size, TextSystem, Point};
-use neo_theme::{Color, Theme};
+use neo_render::{Color, Rect, Scene, Size, TextSystem, Point};
 
 use crate::event::{Event, Status};
 
@@ -75,7 +74,8 @@ pub enum Align {
 }
 
 impl Align {
-    pub(crate) fn offset(self, free: f32) -> f32 {
+    /// How far from the start to place content that leaves `free` space.
+    pub fn offset(self, free: f32) -> f32 {
         match self {
             Align::Start | Align::Stretch => 0.0,
             Align::Center => (free * 0.5).max(0.0).round(),
@@ -259,7 +259,8 @@ impl StateStore {
 /// Everything shared by the layout, draw and event passes.
 pub(crate) struct Shared<'a> {
     pub text: &'a mut TextSystem,
-    pub theme: Theme,
+    pub style: crate::app::Style,
+    pub scheme: crate::app::Scheme,
     pub states: &'a mut StateStore,
     pub runtime: &'a mut RuntimeState,
 }
@@ -306,8 +307,20 @@ impl<'a, 'b> Cx<'a, 'b> {
         self.bounds
     }
 
-    pub fn theme(&self) -> &Theme {
-        &self.shared.theme
+    /// The theme the app attached with [`Style::new`](crate::Style::new),
+    /// if it is a `T`. Toolkits wrap this in a typed accessor.
+    pub fn style<T: 'static>(&self) -> Option<&T> {
+        self.shared.style.get()
+    }
+
+    /// The style's default text style, which [`Label`](crate::widgets::Label) uses.
+    pub fn text_style(&self) -> neo_render::TextStyle {
+        self.shared.style.text_style()
+    }
+
+    /// The desktop's light or dark preference.
+    pub fn scheme(&self) -> crate::app::Scheme {
+        self.shared.scheme
     }
 
     pub fn text(&mut self) -> &mut TextSystem {
@@ -419,7 +432,7 @@ impl<'a, 'b> Cx<'a, 'b> {
     /// Colour for text and icons that do not set their own, which follows
     /// the surface they sit on (for example accent text on a pressed button).
     pub fn content_color(&self) -> Color {
-        self.shared.runtime.content_color.unwrap_or_else(|| self.shared.theme.palette().text)
+        self.shared.runtime.content_color.unwrap_or_else(|| self.shared.style.content_color())
     }
 
     pub(crate) fn reborrow<'c>(&'c mut self, id: WidgetId, bounds: Rect) -> Cx<'c, 'b> {
@@ -452,15 +465,6 @@ impl<'a, 'b> DrawCx<'a, 'b> {
         let prev = self.cx.shared.runtime.content_color.replace(color);
         f(self);
         self.cx.shared.runtime.content_color = prev;
-    }
-
-    /// Draws a focus ring around `rect` when keyboard focus is on this widget.
-    pub fn focus_ring(&mut self, rect: Rect, radius: f32) {
-        if self.focus_visible() {
-            let accent = self.theme().palette().accent_text;
-            let ring = rect.inset(-3.0);
-            self.scene.fill(ring, radius + 3.0, Color::TRANSPARENT, Some((2.0, accent)));
-        }
     }
 }
 
@@ -665,12 +669,12 @@ impl<M> Node for Element<M> {
 /// Lets `&str`, `String` and widgets be used wherever an element is expected.
 impl<M: 'static> From<&str> for Element<M> {
     fn from(s: &str) -> Self {
-        Element::new(crate::widgets::Text::new(s))
+        Element::new(crate::widgets::Label::new(s))
     }
 }
 
 impl<M: 'static> From<String> for Element<M> {
     fn from(s: String) -> Self {
-        Element::new(crate::widgets::Text::new(s))
+        Element::new(crate::widgets::Label::new(s))
     }
 }

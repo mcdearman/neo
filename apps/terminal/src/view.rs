@@ -12,6 +12,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::CursorShape;
+use neo::ThemeCx;
 use neo::widgets::style::Tone;
 use neo::{Color, Cx, CursorIcon, DrawCx, Event, EventCx, FontFamily, Key, Length, Limits, Point, PointerButton, Rect, Size, Status, TextStyle, Widget};
 

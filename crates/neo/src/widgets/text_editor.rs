@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 use neo_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::Color;
 
-use super::document::{text_between, Action, ClipboardNeed, Document, Motion, Pos, Scroll, VimView};
+use armature::document::{text_between, Action, ClipboardNeed, Document, Motion, Pos, Scroll, VimView};
 use super::highlight::{highlight, Language, SyntaxColors};
+use crate::{FocusRing, ThemeCx};
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
 use crate::event::{Event, Key, PointerButton, Status};
 

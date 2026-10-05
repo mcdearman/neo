@@ -2,13 +2,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use neo_render::{Point, Rect, Scene, Size, TextSystem};
-use neo_theme::{Color, Scheme, Theme};
+use neo_render::{Color, Point, Rect, Scene, Size, TextSystem};
 
-use crate::app::{App, Decorations, Proxy};
+use crate::app::{App, Chrome, Decorations, Proxy, Scheme, Style};
 use crate::core::{CursorIcon, Cx, DrawCx, Element, EventCx, IdPass, Limits, Node, RuntimeState, Shared, StateStore, WidgetId, WindowRequest};
 use crate::event::{Event, Key, Status};
-use crate::widgets::frame::Frame;
 
 /// Runs an [`App`] without a window: builds the view, lays it out, routes
 /// events and draws scenes. The windowing shell and the test harness both
@@ -20,7 +18,7 @@ pub struct Ui<A: App> {
     rt: RuntimeState,
     size: Size,
     system_scheme: Scheme,
-    theme: Theme,
+    style: Style,
     decorations: Decorations,
     maximized: bool,
     needs_view: bool,
@@ -32,7 +30,7 @@ pub struct Ui<A: App> {
 impl<A: App> Ui<A> {
     pub fn new(app: A, size: Size, system_scheme: Scheme) -> Self {
         let decorations = app.window().decorations;
-        let theme = app.theme(system_scheme);
+        let style = app.style(system_scheme);
         Self {
             app,
             root: None,
@@ -40,7 +38,7 @@ impl<A: App> Ui<A> {
             rt: RuntimeState { window_focused: true, ..Default::default() },
             size,
             system_scheme,
-            theme,
+            style,
             decorations,
             maximized: false,
             needs_view: true,
@@ -68,14 +66,19 @@ impl<A: App> Ui<A> {
         &mut self.app
     }
 
-    pub fn theme(&self) -> &Theme {
-        &self.theme
+    pub fn style(&self) -> &Style {
+        &self.style
     }
 
-    /// Corner radius of the window as Neo draws it: zero with system
+    /// Blur strength for the window's backdrop, if the style asks for one.
+    pub fn backdrop_blur(&self) -> Option<f32> {
+        self.style.blur()
+    }
+
+    /// Corner radius of the window as the app draws it: zero with system
     /// decorations or when maximized.
     pub fn window_radius(&self) -> f32 {
-        if self.decorations == Decorations::Neo && !self.maximized { self.theme.window_radius() } else { 0.0 }
+        if self.decorations == Decorations::Custom && !self.maximized { self.style.radius() } else { 0.0 }
     }
 
     pub fn title(&self) -> String {
@@ -119,7 +122,7 @@ impl<A: App> Ui<A> {
 
     pub fn set_system_scheme(&mut self, s: Scheme) {
         self.system_scheme = s;
-        self.refresh_theme();
+        self.refresh_style();
     }
 
     pub fn set_maximized(&mut self, m: bool) {
@@ -166,22 +169,22 @@ impl<A: App> Ui<A> {
         self.rt.redraw || self.rt.animating || self.needs_view || self.needs_layout
     }
 
-    fn refresh_theme(&mut self) {
-        let theme = self.app.theme(self.system_scheme);
-        if theme != self.theme {
-            self.theme = theme;
+    fn refresh_style(&mut self) {
+        let style = self.app.style(self.system_scheme);
+        if style != self.style {
+            self.style = style;
             self.needs_layout = true;
             self.rt.redraw = true;
         }
     }
 
     fn ensure(&mut self, text: &mut TextSystem) {
-        self.refresh_theme();
+        self.refresh_style();
         if self.needs_view {
             let bare = self.app.window_state().bare;
-            let chrome = self.decorations == Decorations::Neo && !bare;
-            let rounded = chrome && !self.maximized;
-            let mut root = Element::new(Frame::new(self.app.view(), self.app.title(), chrome, rounded, !bare));
+            let title_bar = self.decorations == Decorations::Custom && !bare;
+            let chrome = Chrome { title: self.app.title(), title_bar, rounded: title_bar && !self.maximized, background: !bare };
+            let mut root = self.app.frame(self.app.view(), chrome);
             let mut pass = IdPass::default();
             root.assign_ids(WidgetId(1), 0, &mut pass);
             self.states.sweep(&pass.live);
@@ -196,7 +199,7 @@ impl<A: App> Ui<A> {
         if self.needs_layout || self.rt.relayout {
             self.rt.relayout = false;
             let root = self.root.as_mut().expect("view built above");
-            let mut shared = Shared { text, theme: self.theme, states: &mut self.states, runtime: &mut self.rt };
+            let mut shared = Shared { text, style: self.style.clone(), scheme: self.system_scheme, states: &mut self.states, runtime: &mut self.rt };
             let mut cx = Cx { shared: &mut shared, id: WidgetId(0), bounds: Rect::ZERO };
             root.layout(&mut cx, Limits::tight(self.size));
             root.set_position(Point::ZERO);
@@ -233,7 +236,7 @@ impl<A: App> Ui<A> {
         self.rt.wake_at = None;
         let mut scene = Scene::new(Color::TRANSPARENT);
         let root = self.root.as_ref().expect("view built in ensure");
-        let mut shared = Shared { text, theme: self.theme, states: &mut self.states, runtime: &mut self.rt };
+        let mut shared = Shared { text, style: self.style.clone(), scheme: self.system_scheme, states: &mut self.states, runtime: &mut self.rt };
         let mut cx = DrawCx { cx: Cx { shared: &mut shared, id: WidgetId(0), bounds: root.bounds() }, scene: &mut scene };
         root.draw(&mut cx);
         scene
@@ -261,7 +264,7 @@ impl<A: App> Ui<A> {
         let mut messages = Vec::new();
         let status = {
             let root = self.root.as_mut().expect("view built in ensure");
-            let mut shared = Shared { text, theme: self.theme, states: &mut self.states, runtime: &mut self.rt };
+            let mut shared = Shared { text, style: self.style.clone(), scheme: self.system_scheme, states: &mut self.states, runtime: &mut self.rt };
             let mut cx = EventCx { cx: Cx { shared: &mut shared, id: WidgetId(0), bounds: root.bounds() }, messages: &mut messages };
             root.event(&mut cx, &event)
         };
