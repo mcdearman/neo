@@ -397,7 +397,8 @@ impl Recorder {
 
     /// How bright the flash is now: it starts strong and fades away.
     fn flash_strength(&self) -> f32 {
-        let t = self.flash_from.map_or(1.0, |from| from.elapsed().as_secs_f32() / FLASH.as_secs_f32()).clamp(0.0, 1.0);
+        // Full strength until the fade has started.
+        let t = self.flash_from.map_or(0.0, |from| from.elapsed().as_secs_f32() / FLASH.as_secs_f32()).clamp(0.0, 1.0);
         0.55 * (1.0 - t) * (1.0 - t)
     }
 
@@ -725,7 +726,8 @@ impl Recorder {
                     // A screenshot flashes, then says where it went.
                     Ok(saved) if saved.length.is_zero() => {
                         if self.flashes() {
-                            self.flash_from = Some(Instant::now());
+                            // The fade is timed from the first frame, below.
+                            self.flash_from = None;
                             self.shown = false;
                             self.phase = Phase::Flash(saved);
                         } else {
@@ -803,11 +805,17 @@ impl Recorder {
                 }
             }
             Msg::FlashTick => {
-                if self.flash_from.is_none_or(|t| t.elapsed() >= FLASH)
-                    && let Phase::Flash(saved) = std::mem::replace(&mut self.phase, Phase::Idle)
-                {
-                    self.flash_from = None;
-                    self.announce(saved);
+                match self.flash_from {
+                    // The window is up and drawing: the fade starts now, so
+                    // the time it took to appear is not taken out of it.
+                    None => self.flash_from = Some(Instant::now()),
+                    Some(from) if from.elapsed() >= FLASH => {
+                        if let Phase::Flash(saved) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                            self.flash_from = None;
+                            self.announce(saved);
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
             Msg::Hide => self.shown = false,
@@ -861,6 +869,11 @@ impl Recorder {
         if self.busy() {
             return self.recording_bar();
         }
+        // Before the frame below: the flash's window is bare too, and must
+        // not be mistaken for the area frame.
+        if matches!(self.phase, Phase::Flash(_)) {
+            return self.flash();
+        }
         if self.window_state().bare {
             return self.frame_view();
         }
@@ -868,7 +881,7 @@ impl Recorder {
             Phase::Idle => self.chooser(),
             // Shown as the recording bar instead; see `recording_bar`.
             Phase::Starting(_) | Phase::Recording | Phase::Shooting(_) | Phase::Picking => Space::fill_y().into(),
-            Phase::Flash(_) => return self.flash(),
+            Phase::Flash(_) => self.flash(),
             Phase::Saving => status(icons::VIDEO, Tone::Accent, "Saving…".into(), if self.gif { "Making the GIF. Long recordings take a while.".into() } else { String::new() }, row()),
             Phase::Done(saved) => {
                 let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1483,6 +1496,10 @@ mod tests {
         assert!(w.hidden_from_capture, "and it must not show up in the next picture");
         let bright = r.flash_strength();
         assert!(bright > 0.3, "starts strong: {bright}");
+        // The fade is timed from the first tick after the window is up.
+        assert_eq!(r.flash_from, None);
+        r.update(Msg::FlashTick);
+        assert!(r.flash_from.is_some() && matches!(r.phase, Phase::Flash(_)));
         // Part-way through it has faded, and it is still a flash.
         r.flash_from = Some(Instant::now() - FLASH / 2);
         r.update(Msg::FlashTick);
@@ -1493,6 +1510,34 @@ mod tests {
         r.update(Msg::FlashTick);
         assert_eq!(r.phase, Phase::Done(saved));
         assert!(r.window_state().visible && !r.window_state().passive);
+    }
+
+    #[test]
+    fn the_flash_draws_plain_white_and_nothing_else() {
+        use neo::testing::Harness;
+        let mut r = recorder();
+        r.desktop.appearance.reduce_motion = false;
+        // Coming from an area screenshot, which is when the frame could be drawn by mistake.
+        r.mode = Mode::Area;
+        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
+        r.update(Msg::Finished(Ok(Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO })));
+        assert!(matches!(r.phase, Phase::Flash(_)));
+        // Hold the flash at its start, however long the first frame takes to draw.
+        r.flash_from = Some(Instant::now() + Duration::from_secs(60));
+        let size = Size::new(400.0, 300.0);
+        let mut h = Harness::new(r, size).unwrap();
+        let px = h.render(1.0);
+        let at = |x: usize, y: usize| {
+            let i = (y * 400 + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let middle = at(200, 150);
+        assert_eq!(&middle[..3], [255, 255, 255], "white");
+        assert!(middle[3] > 20 && middle[3] < 160, "see-through, so the screen shows under it: alpha {}", middle[3]);
+        // The same everywhere: no frame around the edge, no handles, no controls.
+        for (x, y) in [(0, 0), (399, 0), (0, 299), (399, 299), (200, 2), (2, 150), (200, 280)] {
+            assert_eq!(at(x, y), middle, "at {x},{y}");
+        }
     }
 
     #[test]
