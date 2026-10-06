@@ -287,13 +287,24 @@ mod tests {
         let mut inspect = Inspect::new(Pid::from_u32(std::process::id()));
         inspect.refresh(None);
         assert!(inspect.threads.as_ref().unwrap().iter().all(|r| r.cpu.is_none()), "nothing to compare against on the first sample");
-        std::thread::sleep(Duration::from_millis(400));
-        inspect.refresh(None);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        worker.join().unwrap();
+        // A listing of a process's threads can miss one while others are
+        // exiting, as the tests running beside this one do. A measurement
+        // needs the thread in two listings in a row, so try again if not.
+        let spinning = |i: &Inspect| i.threads.as_ref().unwrap().iter().find(|r| r.info.name == "neo-spin").and_then(|r| r.cpu);
+        let mut cpu = None;
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(400));
+            inspect.refresh(None);
+            cpu = spinning(&inspect);
+            if cpu.is_some() {
+                break;
+            }
+        }
         let top = inspect.sorted()[0];
         assert_eq!(top.info.name, "neo-spin", "the busiest thread sorts first");
-        let cpu = top.cpu.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        worker.join().unwrap();
+        let cpu = cpu.expect("the thread was in two listings in a row");
         assert!((60.0..=110.0).contains(&cpu), "a spinning thread uses about one core, measured {cpu:.0}%");
     }
 }

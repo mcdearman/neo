@@ -17,7 +17,7 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 | Videos | `neo-videos` | Plays video with play/pause, seeking and volume. Uses AVFoundation on macOS; `ffmpeg` and `ffplay` on Linux and Windows. |
 | Launcher | `neo-launcher` | A search box that opens apps. ⌘' (Ctrl+' on Windows) brings it up from anywhere. The search is fuzzy and always shows the closest matches, and apps opened often rank higher. On Linux, bind `neo-launcher` to a key in the window manager. |
 | Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. While recording, a small bar shows the time with Pause and Stop, and is left out of the recording where the system allows. Options for the microphone and for saving a GIF. ⌘⇧S (Ctrl+Shift+S) takes a screenshot of the same three kinds. It keeps an icon in the menu bar or system tray, and the installed app starts at login (a setting, on by default) so the shortcut is always ready. ⌘⇧R (Ctrl+Shift+R elsewhere) brings up the area frame from anywhere and stops a recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
-| Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim or Helix keys. |
+| Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim or Helix keys. Opens a folder from the Explorer, with Cmd/Ctrl+O, by dropping it on the window, or as a command-line argument. |
 
 ```sh
 cargo run -p neo-files [folder]
@@ -117,7 +117,8 @@ A document can be driven by standard, Vim or Helix keys: `Document::set_keymap(K
 - **Registers and clipboard:** `"a` and other named registers; `Space y`, `Space p`, `Space P` and `Space R` for the system clipboard.
 - **Search and commands:** `/ ? n N *` with Rust regex syntax; `:w :q :q! :wq :x` and `:{line}`.
 - **Scrolling:** `Ctrl-d u f b`, `zz zt zb zj zk`.
-- **Not included:** multiple selections (`C`, `s`, `S`, `,`), since a document has one selection; macros; the jump list; `.` repeat.
+- **Several selections:** every motion and change applies to each one, and they merge when they come to overlap. `C` and `Alt-C` copy a selection to the next or previous line; `s` selects matches of a pattern inside the selections and `S` splits on them; `Alt-s` splits into lines; `_` trims blank space; `,` keeps only the main selection and `Alt-,` drops it; `(` and `)` choose which is the main one. Yanking takes one piece per selection and pasting gives each its own. In Select mode `n` adds the next match.
+- **Not included:** macros; the jump list; `.` repeat; aligning selections (`&`).
 
 The application carries out `:w` and `:q` from either keymap through `Document::take_vim_requests`.
 

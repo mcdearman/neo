@@ -192,6 +192,8 @@ struct NeoCode {
     dark: Option<bool>,
     toast: Option<String>,
     keymap: Keymap,
+    /// The folder that is open, when the project is on disk.
+    root: Option<PathBuf>,
     desktop: Desktop,
 }
 
@@ -208,6 +210,11 @@ enum Msg {
     Poll,
     /// The keys to edit with: an index into [`KEYMAPS`].
     Keys(usize),
+    /// Ask which folder to open.
+    OpenFolder,
+    Folder(PathBuf),
+    /// Files or folders dropped on the window.
+    Dropped(Vec<PathBuf>),
 }
 
 impl NeoCode {
@@ -227,7 +234,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, desktop: Desktop::load() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -237,7 +244,8 @@ impl NeoCode {
         app
     }
 
-    fn folder(root: &Path) -> Self {
+    /// The name and file tree of the folder at `root`.
+    fn load(root: &Path) -> (String, Vec<Node>) {
         fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Node>) {
             if depth > 6 || out.len() > 4000 {
                 return;
@@ -261,7 +269,52 @@ impl NeoCode {
         let mut nodes = vec![];
         walk(root, "", 0, &mut nodes);
         let project = root.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| root.display().to_string());
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, desktop: Desktop::load() }
+        (project, nodes)
+    }
+
+    fn folder(root: &Path) -> Self {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let (project, nodes) = Self::load(&root);
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load() }
+    }
+
+    /// Replaces the project with the folder at `dir`. Refused while files
+    /// have unsaved changes, which would otherwise be lost.
+    fn open_folder(&mut self, dir: &Path) {
+        if self.tabs.iter().any(|t| t.dirty()) {
+            self.toast = Some("Save or close your changed files before opening another folder.".into());
+            return;
+        }
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !dir.is_dir() {
+            self.toast = Some(format!("{} is not a folder.", dir.display()));
+            return;
+        }
+        let (project, nodes) = Self::load(&dir);
+        self.toast = Some(format!("Opened {project}"));
+        self.project = project;
+        self.nodes = nodes;
+        self.tabs.clear();
+        self.active = None;
+        self.root = Some(dir);
+    }
+
+    /// Opens what was dropped on the window: a folder as the project, or a
+    /// file in a tab, switching to the file's folder if it is not in this one.
+    fn open_dropped(&mut self, path: &Path) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if path.is_dir() {
+            return self.open_folder(&path);
+        }
+        let node = |app: &Self| app.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if *p == path));
+        if node(self).is_none()
+            && let Some(parent) = path.parent()
+        {
+            self.open_folder(parent);
+        }
+        if let Some(i) = node(self) {
+            self.update(Msg::Open(i));
+        }
     }
 
     fn visible_nodes(&self) -> Vec<usize> {
@@ -342,6 +395,7 @@ impl App for NeoCode {
         }
         match &k.key {
             Key::Character(c) if c == "s" => Some(Msg::Save),
+            Key::Character(c) if c == "o" => Some(Msg::OpenFolder),
             Key::Character(c) if c == "w" => self.active.map(Msg::Close),
             Key::Character(c) => c.parse::<usize>().ok().filter(|n| (1..=self.tabs.len()).contains(n)).map(|n| Msg::Select(n - 1)),
             _ => None,
@@ -419,6 +473,17 @@ impl App for NeoCode {
                     }
                 }
             }
+            Msg::OpenFolder => {
+                if let Some(dir) = rfd::FileDialog::new().set_title("Open Folder").pick_folder() {
+                    self.update(Msg::Folder(dir));
+                }
+            }
+            Msg::Folder(dir) => self.open_folder(&dir),
+            Msg::Dropped(paths) => {
+                if let Some(first) = paths.first() {
+                    self.open_dropped(first);
+                }
+            }
             Msg::Keys(i) => {
                 self.keymap = KEYMAPS.get(i).map_or(Keymap::Plain, |(k, _)| *k);
                 for t in &mut self.tabs {
@@ -450,15 +515,18 @@ impl App for NeoCode {
     }
 
     fn view(&self) -> Element<Msg> {
-        let body = row().spacing(14.0).width(Length::Fill).height(Length::Fill).push(self.sidebar()).push(self.main());
-        column().width(Length::Fill).height(Length::Fill).padding([4.0, 14.0, 12.0, 14.0]).spacing(10.0).push(body).push(self.status_bar()).into()
+        // Edge to edge, as in most code editors: the explorer, the editor
+        // under a thin strip of tabs, and a thin status bar.
+        let body = row().width(Length::Fill).height(Length::Fill).push(self.sidebar()).push(Divider::vertical()).push(self.main());
+        let all = column().width(Length::Fill).height(Length::Fill).push(body).push(Divider::horizontal()).push(self.status_bar());
+        mouse_area(all).on_drop(Msg::Dropped).into()
     }
 }
 
 impl NeoCode {
     fn sidebar(&self) -> Element<Msg> {
         let active_path = self.active_tab().map(|t| t.path.clone());
-        let mut list = column().spacing(2.0).width(Length::Fill);
+        let mut list = column().spacing(1.0).width(Length::Fill);
         for i in self.visible_nodes() {
             let n = &self.nodes[i];
             let glyph = if n.dir {
@@ -471,7 +539,7 @@ impl NeoCode {
                 .spacing(8.0)
                 .align(Align::Center)
                 .push(Space::new(n.depth as f32 * 14.0, 0.0))
-                .push(icon(glyph).size(15.0).tone(tone))
+                .push(icon(glyph).size(14.0).tone(tone))
                 .push(text(n.name.clone()).role(if n.dir { TextRole::Strong } else { TextRole::Body }).no_wrap());
             let msg = if n.dir { Msg::ToggleDir(i) } else { Msg::Open(i) };
             list = list.push(
@@ -480,48 +548,49 @@ impl NeoCode {
                     .selected(!n.dir && active_path.as_deref() == Some(n.path.as_str()))
                     .align_x(Align::Start)
                     .width(Length::Fill)
-                    .padding([6.0, 8.0])
-                    .radius(8.0)
+                    .padding([8.0, 4.0])
+                    .radius(6.0)
                     .on_press(msg)
                     .into_element_keyed(&n.path),
             );
         }
         let header = column()
-            .spacing(10.0)
+            .spacing(6.0)
             .width(Length::Fill)
-            .push(text("Explorer").role(TextRole::Label).tone(Tone::Muted))
-            .push(row().spacing(8.0).align(Align::Center).push(icon(icons::FOLDER_OPEN).size(17.0).tone(Tone::Accent)).push(text(self.project.clone()).role(TextRole::Title).no_wrap()));
-        container(column().spacing(12.0).width(Length::Fill).height(Length::Fill).push(header).push(scrollable(list)))
-            .surface(Surface::Card)
-            .padding([16.0, 10.0])
-            .width(250.0)
-            .height(Length::Fill)
-            .into()
+            .push(
+                row()
+                    .align(Align::Center)
+                    .push(text("Explorer").role(TextRole::Label).tone(Tone::Muted))
+                    .push(Space::fill_x())
+                    .push(icon_button(icons::FOLDER_OPEN, 26.0).kind(ButtonKind::Ghost).on_press(Msg::OpenFolder)),
+            )
+            .push(text(self.project.clone()).role(TextRole::Strong).no_wrap());
+        container(column().spacing(8.0).width(Length::Fill).height(Length::Fill).push(header).push(scrollable(list))).padding([8.0, 8.0, 0.0, 8.0]).width(240.0).height(Length::Fill).into()
     }
 
     fn main(&self) -> Element<Msg> {
-        let mut tabs = row().spacing(6.0).align(Align::Center);
+        let surface = self.theme(if self.is_dark() { Scheme::Dark } else { Scheme::Light }).palette().surface;
+        let mut tabs = row().spacing(2.0).align(Align::Center);
         for (i, t) in self.tabs.iter().enumerate() {
             let active = self.active == Some(i);
             let label = row()
-                .spacing(8.0)
+                .spacing(6.0)
                 .align(Align::Center)
-                .push(icon(file_icon(&t.name)).size(14.0).tone(Tone::Accent))
-                .push(text(t.name.clone()).role(TextRole::Strong).no_wrap())
+                .push(icon(file_icon(&t.name)).size(13.0).tone(Tone::Accent))
+                .push(text(t.name.clone()).role(TextRole::Body).no_wrap())
                 .push_if(t.dirty(), || text("●").role(TextRole::Caption).tone(Tone::Accent).into());
             tabs = tabs.push(
                 row()
-                    .spacing(2.0)
                     .align(Align::Center)
-                    .push(Button::new(label).kind(ButtonKind::Ghost).selected(active).padding([7.0, 12.0]).radius(9.0).on_press(Msg::Select(i)))
-                    .push(icon_button(icons::X, 24.0).kind(ButtonKind::Ghost).on_press(Msg::Close(i))),
+                    .push(Button::new(label).kind(ButtonKind::Ghost).selected(active).padding([8.0, 4.0]).radius(6.0).on_press(Msg::Select(i)))
+                    .push(icon_button(icons::X, 20.0).kind(ButtonKind::Ghost).on_press(Msg::Close(i))),
             );
         }
+        let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
             Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).into_element_keyed(&t.path))
-                .surface(Surface::Card)
-                .padding(4.0)
+                .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
@@ -531,15 +600,16 @@ impl NeoCode {
                     .align(Align::Center)
                     .push(icon(icons::FILE_CODE).size(40.0).tone(Tone::Faint))
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
+                    .push(text("Cmd/Ctrl+O opens a folder, or drop one on the window").role(TextRole::Caption).tone(Tone::Faint))
                     .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work with Vim and Helix keys").role(TextRole::Caption).tone(Tone::Faint)),
             )
-            .surface(Surface::Card)
+            .background(Background::Color(surface))
             .center()
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
         };
-        column().spacing(10.0).width(Length::Fill).height(Length::Fill).push(tabs).push(editor).into()
+        column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor).into()
     }
 
     fn status_bar(&self) -> Element<Msg> {
@@ -547,8 +617,8 @@ impl NeoCode {
         if let Some(v) = self.active_tab().and_then(|t| t.doc.mode_status()) {
             let insert = v.insert;
             let badge = container(text(v.label).role(TextRole::Label))
-                .padding([4.0, 10.0])
-                .radius(6.0)
+                .padding([8.0, 2.0])
+                .radius(5.0)
                 .background(if insert { Background::Surface(Surface::Accent) } else { Background::Surface(Surface::Pressed) });
             left = left.push(badge);
             if let Some(cmd) = v.command_line {
@@ -558,6 +628,9 @@ impl NeoCode {
             }
             if let Some(r) = v.recording {
                 left = left.push(row().spacing(6.0).align(Align::Center).push(icon(icons::CIRCLE).size(10.0).tone(Tone::Bad)).push(text(format!("recording @{r}")).role(TextRole::Caption).tone(Tone::Bad)));
+            }
+            if v.selections > 1 {
+                left = left.push(text(format!("{} selections", v.selections)).mono().role(TextRole::Caption).tone(Tone::Accent));
             }
             if let Some(m) = v.message.filter(|m| !m.starts_with("recording @")) {
                 let tone = if m.starts_with("search hit") || m.ends_with("yanked") || m.ends_with("fewer lines") { Tone::Muted } else { Tone::Warn };
@@ -583,16 +656,17 @@ impl NeoCode {
             left = left.push(row().spacing(6.0).align(Align::Center).push(icon(icons::CIRCLE_CHECK).size(14.0).tone(Tone::Good)).push(text(msg.clone()).role(TextRole::Caption).tone(Tone::Good)));
         }
         let dark = self.is_dark();
-        row()
+        let keys = KEYMAPS.iter().position(|(k, _)| *k == self.keymap).unwrap_or(0);
+        let bar = row()
             .width(Length::Fill)
             .align(Align::Center)
             .spacing(12.0)
-            .padding([0.0, 6.0])
             .push(left)
             .push(Space::fill_x())
-            .push(row().spacing(8.0).align(Align::Center).push(text("Keys").role(TextRole::Caption).tone(Tone::Muted)).push(segmented(KEYMAPS.map(|(_, name)| name), KEYMAPS.iter().position(|(k, _)| *k == self.keymap), Msg::Keys)))
-            .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 34.0).on_press(Msg::ToggleScheme))
-            .into()
+            // Click to go on to the next set of keys.
+            .push(Button::new(text(format!("{} keys", KEYMAPS[keys].1)).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([8.0, 3.0]).radius(5.0).on_press(Msg::Keys((keys + 1) % KEYMAPS.len())))
+            .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 24.0).kind(ButtonKind::Ghost).on_press(Msg::ToggleScheme));
+        container(bar).padding([10.0, 0.0]).height(30.0).width(Length::Fill).align_y(Align::Center).into()
     }
 }
 
@@ -652,7 +726,8 @@ fn snapshots(dir: PathBuf) {
             "editor-dark" => h.type_text("jVj"),
             "editor-insert" => h.type_text("jA // edited"),
             // Helix: three lines selected, with a pending text-object command.
-            "editor-helix" => h.type_text("ggjxxxmi"),
+            // Helix: a cursor on each of four lines, mid-way through typing.
+            "editor-helix" => h.type_text("12GwCCCi"),
             _ => h.type_text("qad2"),
         }
         let path = dir.join(format!("{name}.png"));
@@ -724,6 +799,89 @@ mod tests {
         assert_eq!(label(&plain), None);
         plain.type_text("x");
         assert!(lines(&plain).iter().any(|l| l.contains('x')) && lines(&plain) != lines(&editing(0)));
+    }
+
+    #[test]
+    fn helix_cursors_on_several_lines_type_together() {
+        let mut h = editing(2);
+        let before = lines(&h);
+        h.type_text("ggCCi// ");
+        h.key(Key::Escape, Modifiers::default());
+        let now = lines(&h);
+        for i in 0..3 {
+            assert_eq!(now[i], format!("// {}", before[i]), "line {i}");
+        }
+        assert_eq!(now[3], before[3]);
+        assert_eq!(h.app().active_tab().unwrap().doc.mode_status().unwrap().selections, 3);
+        // And it draws: three carets is a different picture from one.
+        let three = h.render(1.0);
+        h.type_text(",");
+        assert_ne!(three, h.render(1.0));
+    }
+
+    /// A folder in the scratch space of the test run, with two files.
+    fn project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("neo-code-test-{}-{name}", std::process::id())).join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn one() {}\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "# Notes\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn opening_a_folder_replaces_the_project() {
+        let dir = project("open-folder");
+        let mut app = NeoCode::sample();
+        assert!(!app.tabs.is_empty());
+        app.update(Msg::Folder(dir.clone()));
+        assert_eq!(app.project, "open-folder");
+        assert!(app.tabs.is_empty(), "the old project's tabs are closed");
+        let names: Vec<&str> = app.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["src", "lib.rs", "notes.md"], "folders first, then files");
+        let lib = app.nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+        app.update(Msg::Open(lib));
+        assert_eq!(app.active_tab().unwrap().doc.text(), "pub fn one() {}\n");
+        // Something that is not a folder is refused with a message.
+        app.update(Msg::Folder(dir.join("notes.md")));
+        assert_eq!(app.project, "open-folder");
+        assert!(app.toast.as_deref().unwrap().ends_with("is not a folder."));
+    }
+
+    #[test]
+    fn unsaved_changes_block_opening_another_folder() {
+        let dir = project("unsaved-guard");
+        let mut app = NeoCode::sample();
+        app.update(Msg::Keys(0));
+        app.update(Msg::Edit(Action::Insert("x".into())));
+        assert!(app.active_tab().unwrap().dirty());
+        app.update(Msg::Folder(dir));
+        assert_eq!(app.project, "aurora", "still the sample project");
+        assert!(app.toast.as_deref().unwrap().starts_with("Save or close"));
+    }
+
+    #[test]
+    fn dropping_a_folder_or_a_file_opens_it() {
+        let dir = project("dropped");
+        let mut app = NeoCode::sample();
+        app.update(Msg::Dropped(vec![dir.clone()]));
+        assert_eq!(app.project, "dropped");
+        assert!(app.tabs.is_empty());
+        // A file inside the open folder just opens.
+        app.update(Msg::Dropped(vec![dir.join("notes.md")]));
+        assert_eq!((app.project.as_str(), app.active_tab().unwrap().name.as_str()), ("dropped", "notes.md"));
+        // A file from elsewhere brings its folder with it.
+        let other = project("dropped-elsewhere");
+        app.update(Msg::Dropped(vec![other.join("src/lib.rs")]));
+        assert_eq!((app.project.as_str(), app.active_tab().unwrap().name.as_str()), ("src", "lib.rs"));
+    }
+
+    #[test]
+    fn the_shortcut_and_the_status_bar_reach_the_new_commands() {
+        let app = NeoCode::sample();
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        let key = KeyEvent { key: Key::Character("o".into()), pressed: true, repeat: false, modifiers: cmd, text: None };
+        assert!(matches!(app.on_key(&key), Some(Msg::OpenFolder)));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use armature_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::Color;
 
-use armature::document::{text_between, Action, ClipboardNeed, Document, Motion, Pos, Scroll, VimView};
+use armature::document::{text_between, Action, ClipboardNeed, Document, ExtraSelection, Motion, Pos, Scroll, VimView};
 use super::highlight::{highlight, Language, SyntaxColors};
 use crate::{FocusRing, ThemeCx};
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
@@ -30,6 +30,8 @@ pub struct TextEditor<M> {
     lines: Vec<String>,
     cursor: Pos,
     selection: Option<(Pos, Pos, bool)>,
+    /// Selections besides the main one, which Helix keys can make.
+    extras: Vec<ExtraSelection>,
     block_caret: bool,
     vim: Option<VimView>,
     revision: u64,
@@ -56,6 +58,7 @@ impl<M> TextEditor<M> {
             lines: doc.lines().to_vec(),
             cursor: doc.cursor(),
             selection: doc.display_selection(),
+            extras: doc.extra_selections(),
             block_caret: doc.block_caret(),
             vim: doc.vim_view(),
             revision: doc.revision(),
@@ -332,6 +335,18 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 }
             }
         }
+        // The other selections, drawn the same way.
+        for (s, e) in self.extras.iter().filter_map(|x| x.range) {
+            let sel_color = p.accent.with_alpha(if focused { 0.28 } else { 0.16 });
+            for line in s.line.max(self.first)..=e.line.min(self.first + self.rows.len().saturating_sub(1)) {
+                let from = if line == s.line { self.caret_x(line, s.col) } else { 0.0 };
+                let to = if line == e.line { self.caret_x(line, e.col) } else { self.caret_x(line, self.lines[line].len()) + self.char_w * 0.6 };
+                if to > from {
+                    let y = self.line_y(b, scroll, line);
+                    cx.scene.fill(Rect::new(tx + from, y, to - from, self.line_h), 3.0, sel_color, None);
+                }
+            }
+        }
         if let Some(bl) = block {
             let sel_color = p.accent.with_alpha(if focused { 0.28 } else { 0.16 });
             for line in bl.first_line.max(self.first)..=bl.last_line.min(self.first + self.rows.len().saturating_sub(1)) {
@@ -353,8 +368,22 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let y = self.line_y(b, scroll, self.first + i);
             cx.scene.text(layout, Point::new(tx.round(), (y + (self.line_h - layout.size().h) * 0.5).round()), default);
         }
+        // The other selections' carets, a little fainter than the main one.
+        let shown = self.first..self.first + self.rows.len();
+        for c in self.extras.iter().map(|x| x.cursor).filter(|c| shown.contains(&c.line)) {
+            let x0 = self.caret_x(c.line, c.col);
+            let y = self.line_y(b, scroll, c.line);
+            if self.block_caret {
+                let line = &self.lines[c.line];
+                let x1 = line[c.col.min(line.len())..].chars().next().map_or(x0 + self.char_w, |ch| self.caret_x(c.line, c.col + ch.len_utf8()));
+                let rect = Rect::new((tx + x0).round(), y + 1.0, (x1 - x0).max(self.char_w * 0.5).round(), self.line_h - 2.0);
+                cx.scene.fill(rect, 2.0, p.accent_text.with_alpha(if focused { 0.3 } else { 0.15 }), None);
+            } else if focused {
+                cx.scene.fill(Rect::new((tx + x0).round() - 1.0, y + 2.0, 2.0, self.line_h - 4.0), 1.0, p.accent_text.with_alpha(0.7), None);
+            }
+        }
         if self.block_caret {
-            // Vim Normal and Visual modes: a steady block over the character.
+            // Modal keymaps outside Insert mode: a steady block over the character.
             let line = &self.lines[self.cursor.line];
             let x0 = self.caret_x(self.cursor.line, self.cursor.col);
             let x1 = if self.cursor.col < line.len() {
