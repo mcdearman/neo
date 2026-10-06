@@ -477,9 +477,9 @@ pub(crate) struct SyntaxColors {
 }
 
 impl SyntaxColors {
-    pub fn new(p: &Palette, scheme: Scheme, accent: Accent, syntax: Syntax, types: neo_theme::TypeColour) -> Self {
+    pub fn new(p: &Palette, scheme: Scheme, accent: Accent, syntax: Syntax) -> Self {
         if syntax == Syntax::Meadow {
-            return Self::meadow(p, scheme, types);
+            return Self::meadow(p, scheme);
         }
         match scheme {
             // Monokai Pro. Comments are brightened from #727072 to reach 4.5:1.
@@ -520,30 +520,24 @@ impl SyntaxColors {
         }
     }
 
-    /// The Meadow REPL's colouring. The REPL names terminal colours, not
-    /// shades: keywords magenta, types cyan, constructors blue, modules a
-    /// dim cyan (here types and modules have colours of their own choosing), functions bright yellow, other names bright blue, numbers
-    /// yellow, strings green, comments dim, and operators and punctuation
-    /// left as the text is. These are the shades Neo's own
-    /// terminal gives those names, so code in the editor and the same code
-    /// typed at the REPL beside it look alike.
-    fn meadow(p: &Palette, scheme: Scheme, types: neo_theme::TypeColour) -> Self {
+    /// Colouring after the Meadow REPL's, which gives each kind of name a
+    /// colour of its own: keywords, types, constructors, modules,
+    /// functions, other names, numbers and strings, with comments dim and
+    /// operators and punctuation left as the text is.
+    ///
+    /// The REPL names terminal colours, not shades, and most of these are
+    /// the shades Neo's own terminal gives those names, so code here and
+    /// at the REPL beside it look much alike. Three were chosen by eye
+    /// instead: types are peach where the REPL has cyan, module paths
+    /// orchid where it has a dim cyan, and the keywords' magenta is taken
+    /// a little further from blue to stand apart from the names beside it.
+    fn meadow(p: &Palette, scheme: Scheme) -> Self {
         let hex = Color::hex;
-        // magenta, cyan, blue, bright yellow, bright blue, yellow, green
-        let [keyword, ty_cyan, constructor, function, variable, number, string] = match scheme {
-            // The keyword's magenta is taken a little further from blue than
-            // the terminal's, to stand apart from the names beside it.
-            Scheme::Dark => [hex(0xB88EF5), hex(0x78DCE8), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
-            Scheme::Light => [hex(0x8A3FB5), hex(0x16706A), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
+        // keyword, type, module, constructor, function, variable, number, string
+        let [keyword, ty, module, constructor, function, variable, number, string] = match scheme {
+            Scheme::Dark => [hex(0xB393F4), hex(0xFFB07A), hex(0xE0A3F5), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
+            Scheme::Light => [hex(0x8A3FB5), hex(0xB4541A), hex(0x9A3FB8), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
         };
-        // Types are whichever candidate is being tried, in place of the
-        // REPL's cyan; module paths are orchid, at full strength, not
-        // a dimmed copy of the types' colour.
-        let ty = types.tone(scheme);
-        let module = hex(if scheme == Scheme::Dark { 0xE0A3F5 } else { 0x9A3FB8 });
-        let _ = ty_cyan;
-        // Dim, as the REPL has comments: the text's colour, most of the
-        // way to the ground, and for modules the type's.
         let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };
         Self { keyword, ty, function, string, number, comment, macro_: function, attribute: ty.mix(p.text, 0.25), punct: p.text, heading: keyword, variable: Some(variable), constructor, module }
     }

@@ -112,40 +112,6 @@ impl Default for Glass {
 }
 
 /// Every user-adjustable appearance setting.
-/// Candidates for the colour of types in the Meadow scheme. Here only
-/// until one is chosen: then it becomes the scheme's colour and this goes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TypeColour {
-    #[default]
-    Peach,
-    Rose,
-}
-
-impl TypeColour {
-    pub const ALL: [TypeColour; 2] = [TypeColour::Peach, TypeColour::Rose];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            TypeColour::Peach => "Peach",
-            TypeColour::Rose => "Rose",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
-    }
-
-    /// The colour itself: light on a dark ground, and a darker tone of the
-    /// same hue that reads on a light one.
-    pub fn tone(self, scheme: Scheme) -> Color {
-        let (dark, light) = match self {
-            TypeColour::Peach => (0xFFB07A, 0xB4541A),
-            TypeColour::Rose => (0xFF8FA8, 0xB8355A),
-        };
-        Color::hex(if scheme == Scheme::Dark { dark } else { light })
-    }
-}
-
 /// A set of colours for code.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Syntax {
@@ -186,8 +152,6 @@ pub struct Theme {
     pub glass: Glass,
     /// How code is coloured.
     pub syntax: Syntax,
-    /// The colour of types in the Meadow scheme, while one is being chosen.
-    pub types: TypeColour,
 }
 
 impl Default for Theme {
@@ -200,7 +164,6 @@ impl Default for Theme {
             reduce_motion: false,
             glass: Glass::default(),
             syntax: Syntax::default(),
-            types: TypeColour::default(),
         }
     }
 }

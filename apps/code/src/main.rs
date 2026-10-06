@@ -290,9 +290,6 @@ enum Msg {
     OpenSettings,
     /// Colour code by this scheme, counted in `Syntax::ALL`.
     Colours(usize),
-    /// Try this colour for types, counted in `TypeColour::ALL`. Here
-    /// while one is being chosen.
-    Types(usize),
     OpenRecent(PathBuf),
     /// Show the terminal under the editor, or put it away.
     ToggleTerminal,
@@ -696,12 +693,6 @@ impl NeoCode {
                 self.keep(settings::KEYMAP, settings::keymap_name(self.keymap).into());
             }
             Msg::Back => self.jump_back(),
-            Msg::Types(i) => {
-                if let Some(types) = neo::TypeColour::ALL.get(i) {
-                    self.settings.types = *types;
-                    self.keep(settings::TYPES, types.name().to_ascii_lowercase().into());
-                }
-            }
             Msg::OpenSettings => self.open_settings(),
             Msg::Colours(i) => {
                 if let Some(syntax) = neo::Syntax::ALL.get(i) {
@@ -769,7 +760,6 @@ impl App for NeoCode {
     fn theme(&self, system: Scheme) -> Theme {
         let mut theme = self.desktop.theme(system);
         theme.syntax = self.settings.syntax;
-        theme.types = self.settings.types;
         // The sun and moon button overrides the desktop's scheme for this window.
         match self.dark {
             Some(true) => theme.scheme = Scheme::Dark,
@@ -839,10 +829,7 @@ impl App for NeoCode {
                     .separator()
                     .push(MenuEntry::new("Toggle Breakpoint  (F9)", Msg::Margin(self.active_tab().map_or(0, |t| t.doc.cursor().line))).enabled(file_open))
             },
-            {
-                let types = neo::TypeColour::ALL.iter().enumerate().map(|(i, t)| MenuEntry::new(format!("{}Types: {}", if *t == self.settings.types { "✓ " } else { "" }, t.name()), Msg::Types(i)));
-                types.fold(keys.fold(Menu::new("View").push(MenuEntry::new(if self.terminal_shown { "Hide Terminal  (Ctrl+Tab)" } else { "Terminal  (Ctrl+Tab)" }, Msg::ToggleTerminal)).push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push).separator(), Menu::push)
-            },
+            keys.fold(Menu::new("View").push(MenuEntry::new(if self.terminal_shown { "Hide Terminal  (Ctrl+Tab)" } else { "Terminal  (Ctrl+Tab)" }, Msg::ToggleTerminal)).push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
         ]
     }
 
@@ -1254,16 +1241,6 @@ impl NeoCode {
             .push_if(server.is_some(), || {
                 let (label, tone) = server.clone().unwrap_or_default();
                 text(label).role(TextRole::Caption).tone(tone).no_wrap().into()
-            })
-            // Click to try the next colour for types, while one is being chosen.
-            .push({
-                let at = neo::TypeColour::ALL.iter().position(|t| *t == self.settings.types).unwrap_or(0);
-                let swatch = container(Space::new(10.0, 10.0)).background(Background::Color(self.settings.types.tone(if dark { Scheme::Dark } else { Scheme::Light })));
-                Button::new(row().spacing(6.0).align(Align::Center).push(swatch).push(text(format!("Types: {}", self.settings.types.name())).role(TextRole::Caption)))
-                    .kind(ButtonKind::Ghost)
-                    .padding([8.0, 3.0])
-                    .radius(5.0)
-                    .on_press(Msg::Types((at + 1) % neo::TypeColour::ALL.len()))
             })
             // Click to go on to the next set of keys.
             .push(Button::new(text(format!("{} keys", KEYMAPS[keys].1)).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([8.0, 3.0]).radius(5.0).on_press(Msg::Keys((keys + 1) % KEYMAPS.len())))
@@ -2195,45 +2172,6 @@ mod tests {
     }
 
     #[test]
-    fn the_colour_of_types_can_be_tried_and_is_kept() {
-        let dir = project("type-colours");
-        let config = dir.parent().unwrap().join(format!("{}-config", dir.file_name().unwrap().to_string_lossy()));
-        let _ = std::fs::remove_dir_all(&config);
-        std::fs::write(dir.join("src/lib.rs"), "struct Point { x: u32 }\n").unwrap();
-        let mut app = NeoCode::folder(&dir);
-        app.config = Some(config.clone());
-        app.dark = Some(true);
-        let lib = app.nodes.iter().position(|n| n.name == "lib.rs").unwrap();
-        app.update(Msg::Open(lib));
-        let mut h = Harness::new(app, Size::new(1280.0, 820.0)).unwrap();
-        // Each candidate draws the types differently from every other.
-        let mut seen: Vec<Vec<u8>> = vec![];
-        for i in 0..neo::TypeColour::ALL.len() {
-            h.app_mut().update(Msg::Types(i));
-            assert_eq!(h.app().theme(Scheme::Dark).types, neo::TypeColour::ALL[i]);
-            let picture = h.render(1.0);
-            assert!(!seen.contains(&picture), "{} looks like one before it", neo::TypeColour::ALL[i].name());
-            seen.push(picture);
-        }
-        // The last tried is the one the next start comes up with.
-        let mut again = NeoCode::folder(&dir);
-        again.config = Some(config.clone());
-        again.load_settings();
-        assert_eq!(again.settings.types, neo::TypeColour::Rose);
-        assert!(std::fs::read_to_string(settings::user_file(&config)).unwrap().contains("\"editor.typeColor\": \"rose\""));
-        // One tried before and since dropped falls back without complaint.
-        std::fs::write(settings::user_file(&config), "{ \"editor.typeColor\": \"teal\" }").unwrap();
-        again.toast = None;
-        again.load_settings();
-        assert_eq!((again.settings.types, again.toast.clone()), (neo::TypeColour::Peach, None));
-        again.update(Msg::Types(1));
-        // The menu lists them all, with a tick by the one in use.
-        let labels: Vec<String> = again.menus()[4].entries.iter().map(|e| e.label.clone()).collect();
-        assert!(labels.contains(&"✓ Types: Rose".to_owned()) && labels.contains(&"Types: Peach".to_owned()), "{labels:?}");
-        std::fs::remove_dir_all(config).unwrap();
-    }
-
-    #[test]
     fn a_function_with_arguments_asks_for_them_before_debugging() {
         let mut s = Served::new("debug-ask", "pub fn one() {}\n");
         let file = s.file.clone();
@@ -2661,10 +2599,6 @@ mod tests {
                 h.advance(Duration::from_millis(200));
             }
             println!("hover: {:?}", h.app().active_tab().and_then(|t| h.app().editor_popup(t)));
-        }
-        // `NEO_TYPES=name` tries that colour for types.
-        if let Some(i) = std::env::var("NEO_TYPES").ok().and_then(|n| neo::TypeColour::ALL.iter().position(|t| t.name().eq_ignore_ascii_case(&n))) {
-            h.app_mut().update(Msg::Types(i));
         }
         // `NEO_LSP_LINE=n` (from one) puts the caret there first, to see that part.
         if let Some(line) = std::env::var("NEO_LSP_LINE").ok().and_then(|l| l.parse::<usize>().ok()) {

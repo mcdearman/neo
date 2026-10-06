@@ -146,7 +146,6 @@ impl App for Gallery {
             reduce_motion: self.reduce_motion,
             glass: Glass { enabled: self.glass, opacity: self.glass_opacity, blur: self.glass_blur },
             syntax: Default::default(),
-            types: Default::default(),
         }
     }
 
