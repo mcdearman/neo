@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use neo::Syntax;
 use neo::prelude::Keymap;
 use serde_json::{Map, Value, json};
 
@@ -28,16 +29,19 @@ pub struct Settings {
     pub dark: Option<bool>,
     /// Come back to the files that were open in a folder.
     pub restore: bool,
+    /// How code is coloured.
+    pub syntax: Syntax,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { keymap: Keymap::Vim, font_size: 14.0, tab_size: 4, hover: true, hover_delay: 350, code_lens: true, dark: None, restore: true }
+        Self { keymap: Keymap::Vim, font_size: 14.0, tab_size: 4, hover: true, hover_delay: 350, code_lens: true, dark: None, restore: true, syntax: Syntax::default() }
     }
 }
 
 pub const KEYMAP: &str = "editor.keymap";
 pub const THEME: &str = "workbench.colorTheme";
+pub const SYNTAX: &str = "editor.colorScheme";
 
 /// How a keymap is written in the file.
 pub fn keymap_name(k: Keymap) -> &'static str {
@@ -60,6 +64,7 @@ impl Settings {
             "editor.hover.delay": d.hover_delay,
             "editor.codeLens": d.code_lens,
             THEME: "system",
+            SYNTAX: d.syntax.name().to_ascii_lowercase(),
             "window.restoreWorkspace": d.restore,
         }) else {
             unreachable!("an object was written")
@@ -99,6 +104,7 @@ impl Settings {
                     })
                     .map(|dark| s.dark = dark),
                 "window.restoreWorkspace" => value.as_bool().map(|b| s.restore = b),
+                SYNTAX => value.as_str().and_then(Syntax::from_name).map(|x| s.syntax = x),
                 _ => Some(()),
             };
             if ok.is_none() {
@@ -285,18 +291,20 @@ mod tests {
 
     #[test]
     fn settings_are_read_by_name_and_bad_values_keep_the_usual_one() {
-        let Value::Object(values) = json!({ "editor.keymap": "Helix", "editor.fontSize": 16.5, "editor.tabSize": 2, "editor.hover.enabled": false, "editor.hover.delay": 100, "editor.codeLens": false, "workbench.colorTheme": "dark", "window.restoreWorkspace": false, "someone.elses": [1, 2] }) else { panic!() };
+        let Value::Object(values) = json!({ "editor.keymap": "Helix", "editor.fontSize": 16.5, "editor.tabSize": 2, "editor.hover.enabled": false, "editor.hover.delay": 100, "editor.codeLens": false, "workbench.colorTheme": "dark", "window.restoreWorkspace": false, "editor.colorScheme": "meadow", "someone.elses": [1, 2] }) else { panic!() };
         let (s, wrong) = Settings::from(&values);
-        assert_eq!(s, Settings { keymap: Keymap::Helix, font_size: 16.5, tab_size: 2, hover: false, hover_delay: 100, code_lens: false, dark: Some(true), restore: false });
+        assert_eq!(s, Settings { keymap: Keymap::Helix, font_size: 16.5, tab_size: 2, hover: false, hover_delay: 100, code_lens: false, dark: Some(true), restore: false, syntax: Syntax::Meadow });
         assert!(wrong.is_empty(), "a key that is not NeoCode's is nobody's mistake: {wrong:?}");
-        let Value::Object(values) = json!({ "editor.keymap": "emacs", "editor.fontSize": 400, "editor.tabSize": "two", "workbench.colorTheme": 3 }) else { panic!() };
+        let Value::Object(values) = json!({ "editor.colorScheme": "Monokai" }) else { panic!() };
+        assert_eq!(Settings::from(&values).0.syntax, Syntax::Monokai);
+        let Value::Object(values) = json!({ "editor.keymap": "emacs", "editor.fontSize": 400, "editor.tabSize": "two", "workbench.colorTheme": 3, "editor.colorScheme": "plaid" }) else { panic!() };
         let (s, mut wrong) = Settings::from(&values);
         wrong.sort();
         assert_eq!(s, Settings::default());
-        assert_eq!(wrong, ["editor.fontSize", "editor.keymap", "editor.tabSize", "workbench.colorTheme"]);
+        assert_eq!(wrong, ["editor.colorScheme", "editor.fontSize", "editor.keymap", "editor.tabSize", "workbench.colorTheme"]);
         // The file to start from says what the usual values are.
         assert_eq!(Settings::from(&Settings::defaults()), (Settings::default(), vec![]));
-        assert_eq!(Settings::defaults().len(), 8);
+        assert_eq!(Settings::defaults().len(), 9);
     }
 
     #[test]

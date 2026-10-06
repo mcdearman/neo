@@ -59,17 +59,21 @@ fn spec_named(name: &str) -> Option<&'static lsp::ServerSpec> {
 /// text to the built-in highlighter.
 pub fn kind_of(name: &str) -> Option<SyntaxKind> {
     Some(match name {
-        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" | "namespace" | "builtinType" | "typeAlias" | "union" | "trait" | "selfTypeKeyword" => SyntaxKind::Type,
+        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" | "builtinType" | "typeAlias" | "union" | "trait" | "selfTypeKeyword" => SyntaxKind::Type,
         "function" | "method" => SyntaxKind::Function,
         "macro" => SyntaxKind::Macro,
         "keyword" | "modifier" | "selfKeyword" => SyntaxKind::Keyword,
         "string" | "regexp" | "character" | "escapeSequence" => SyntaxKind::String,
-        "number" | "enumMember" | "constant" | "boolean" => SyntaxKind::Number,
+        "number" | "constant" | "boolean" => SyntaxKind::Number,
+        // What builds a value, and what holds names: kinds of their own,
+        // which a scheme may colour apart from types and numbers.
+        "enumMember" | "enum_member" => SyntaxKind::Constructor,
+        "namespace" | "module" => SyntaxKind::Module,
         "comment" => SyntaxKind::Comment,
         "decorator" | "attribute" | "lifetime" | "label" => SyntaxKind::Attribute,
         "operator" | "punctuation" => SyntaxKind::Punct,
-        // Plain names read best in the text's own colour.
-        "variable" | "parameter" | "property" => SyntaxKind::Plain,
+        // Plain names: the text's own colour in most schemes.
+        "variable" | "parameter" | "property" => SyntaxKind::Variable,
         _ => return None,
     })
 }

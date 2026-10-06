@@ -283,6 +283,8 @@ enum Msg {
     Jump,
     /// Open `settings.json` to edit.
     OpenSettings,
+    /// Colour code by this scheme, counted in `Syntax::ALL`.
+    Colours(usize),
     OpenRecent(PathBuf),
     /// Show the terminal under the editor, or put it away.
     ToggleTerminal,
@@ -686,6 +688,12 @@ impl NeoCode {
                 self.keep(settings::KEYMAP, settings::keymap_name(self.keymap).into());
             }
             Msg::OpenSettings => self.open_settings(),
+            Msg::Colours(i) => {
+                if let Some(syntax) = neo::Syntax::ALL.get(i) {
+                    self.settings.syntax = *syntax;
+                    self.keep(settings::SYNTAX, syntax.name().to_ascii_lowercase().into());
+                }
+            }
             Msg::OpenRecent(dir) => self.open_folder(&dir),
             Msg::Save => {
                 let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) else { return };
@@ -745,6 +753,7 @@ impl App for NeoCode {
 
     fn theme(&self, system: Scheme) -> Theme {
         let mut theme = self.desktop.theme(system);
+        theme.syntax = self.settings.syntax;
         // The sun and moon button overrides the desktop's scheme for this window.
         match self.dark {
             Some(true) => theme.scheme = Scheme::Dark,
@@ -1154,6 +1163,7 @@ impl NeoCode {
         let keys = segmented(KEYMAPS.map(|(_, name)| name), KEYMAPS.iter().position(|(k, _)| *k == self.keymap), Msg::Keys);
         vec![
             neo_desktop::ui::setting("Keys", "Standard editing, or Vim or Helix modal keys.", keys),
+            neo_desktop::ui::setting("Colours", "How code is coloured. Meadow gives each kind of name a colour of its own, as the Meadow REPL does.", segmented(neo::Syntax::ALL.map(|s| s.name()), neo::Syntax::ALL.iter().position(|s| *s == self.settings.syntax), Msg::Colours)),
             neo_desktop::ui::setting("Language servers", &self.servers_summary(), Space::new(0.0, 0.0)),
         ]
     }
@@ -2523,6 +2533,10 @@ mod tests {
                 h.advance(Duration::from_millis(200));
             }
             println!("hover: {:?}", h.app().active_tab().and_then(|t| h.app().editor_popup(t)));
+        }
+        // `NEO_LSP_LINE=n` (from one) puts the caret there first, to see that part.
+        if let Some(line) = std::env::var("NEO_LSP_LINE").ok().and_then(|l| l.parse::<usize>().ok()) {
+            h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(line.saturating_sub(1), 0), select: false }));
         }
         if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
             h.app_mut().toast = None;

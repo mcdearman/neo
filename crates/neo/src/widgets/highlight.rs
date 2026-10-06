@@ -1,7 +1,7 @@
 //! A small, fast syntax highlighter for the code editor. It works one line
 //! at a time and carries only block-comment state between lines.
 
-use neo_theme::{Accent, Color, Palette, Scheme};
+use neo_theme::{Accent, Color, Palette, Scheme, Syntax};
 
 /// Languages the editor can colour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -448,6 +448,13 @@ pub enum Kind {
     Attribute,
     Punct,
     Heading,
+    /// A name that is neither a function nor a type: a variable, a
+    /// parameter. Only a language server can tell.
+    Variable,
+    /// What builds a value of a type: a data constructor, an enum's case.
+    Constructor,
+    /// A module or a namespace.
+    Module,
 }
 
 /// Colours for each token kind, derived from the theme.
@@ -463,10 +470,17 @@ pub(crate) struct SyntaxColors {
     attribute: Color,
     punct: Color,
     heading: Color,
+    /// Plain names are left the colour of the text where this is `None`.
+    variable: Option<Color>,
+    constructor: Color,
+    module: Color,
 }
 
 impl SyntaxColors {
-    pub fn new(p: &Palette, scheme: Scheme, accent: Accent) -> Self {
+    pub fn new(p: &Palette, scheme: Scheme, accent: Accent, syntax: Syntax) -> Self {
+        if syntax == Syntax::Meadow {
+            return Self::meadow(p, scheme);
+        }
         match scheme {
             // Monokai Pro. Comments are brightened from #727072 to reach 4.5:1.
             Scheme::Dark => Self {
@@ -480,6 +494,9 @@ impl SyntaxColors {
                 attribute: Color::hex(0xFC9867),
                 punct: Color::hex(0x939293),
                 heading: Color::hex(0xFF6188),
+                variable: None,
+                constructor: Color::hex(0xAB9DF2),
+                module: Color::hex(0x78DCE8),
             },
             Scheme::Light => {
                 // Types use teal, unless teal is the accent, in which case royal blue.
@@ -495,9 +512,31 @@ impl SyntaxColors {
                     attribute: Accent::Coral.text_tone(scheme),
                     punct: p.muted,
                     heading: p.accent_text,
+                    variable: None,
+                    constructor: Accent::Coral.text_tone(scheme),
+                    module: ty.text_tone(scheme),
                 }
             }
         }
+    }
+
+    /// The Meadow REPL's colouring. The REPL names terminal colours, not
+    /// shades: keywords magenta, types cyan, constructors blue, modules a
+    /// dim cyan, functions bright yellow, other names bright blue, numbers
+    /// yellow, strings green, comments dim. These are the shades Neo's own
+    /// terminal gives those names, so code in the editor and the same code
+    /// typed at the REPL beside it look alike.
+    fn meadow(p: &Palette, scheme: Scheme) -> Self {
+        let hex = Color::hex;
+        // magenta, cyan, blue, bright yellow, bright blue, yellow, green
+        let [keyword, ty, constructor, function, variable, number, string] = match scheme {
+            Scheme::Dark => [hex(0xAB9DF2), hex(0x78DCE8), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
+            Scheme::Light => [hex(0x8A3FB5), hex(0x16706A), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
+        };
+        // Dim, as the REPL has comments: the text's colour, most of the
+        // way to the ground, and for modules the type's.
+        let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };
+        Self { keyword, ty, function, string, number, comment, macro_: function, attribute: ty.mix(p.text, 0.25), punct: p.muted, heading: keyword, variable: Some(variable), constructor, module: ty.mix(p.bg, 0.4) }
     }
 
     pub fn color(&self, k: Kind) -> Option<Color> {
@@ -513,6 +552,9 @@ impl SyntaxColors {
             Kind::Macro => Some(self.macro_),
             Kind::Attribute => Some(self.attribute),
             Kind::Punct => Some(self.punct),
+            Kind::Variable => self.variable,
+            Kind::Constructor => Some(self.constructor),
+            Kind::Module => Some(self.module),
         }
     }
 }

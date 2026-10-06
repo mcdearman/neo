@@ -176,6 +176,7 @@ impl Appearance {
             text_scale: self.text_scale,
             reduce_motion: self.reduce_motion,
             glass: self.glass,
+            syntax: Default::default(),
         }
     }
 }

@@ -112,6 +112,33 @@ impl Default for Glass {
 }
 
 /// Every user-adjustable appearance setting.
+/// A set of colours for code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Syntax {
+    /// The Meadow REPL's: each kind of name has a colour of its own, the
+    /// same one the REPL gives it in a Neo terminal. The default.
+    #[default]
+    Meadow,
+    /// Monokai Pro's on a dark ground, and the accent's tones on a light one.
+    Monokai,
+}
+
+impl Syntax {
+    pub const ALL: [Syntax; 2] = [Syntax::Meadow, Syntax::Monokai];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Syntax::Meadow => "Meadow",
+            Syntax::Monokai => "Monokai",
+        }
+    }
+
+    /// The scheme a name stands for, in any case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub scheme: Scheme,
@@ -123,6 +150,8 @@ pub struct Theme {
     /// Turn off animation and transitions.
     pub reduce_motion: bool,
     pub glass: Glass,
+    /// How code is coloured.
+    pub syntax: Syntax,
 }
 
 impl Default for Theme {
@@ -134,6 +163,7 @@ impl Default for Theme {
             text_scale: 1.0,
             reduce_motion: false,
             glass: Glass::default(),
+            syntax: Syntax::default(),
         }
     }
 }

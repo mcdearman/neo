@@ -145,6 +145,7 @@ impl App for Gallery {
             text_scale: if self.large_text { 1.18 } else { 1.0 },
             reduce_motion: self.reduce_motion,
             glass: Glass { enabled: self.glass, opacity: self.glass_opacity, blur: self.glass_blur },
+            syntax: Default::default(),
         }
     }
 
