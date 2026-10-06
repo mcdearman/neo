@@ -111,6 +111,8 @@ enum Msg {
     ConfirmEnd,
     CancelEnd,
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 fn filled(n: usize) -> VecDeque<f32> {
@@ -226,6 +228,10 @@ impl App for Monitor {
 
     fn window(&self) -> WindowSettings {
         WindowSettings { size: Size::new(1060.0, 700.0), min_size: Some(Size::new(760.0, 480.0)), app_id: Some("org.neo.Monitor".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -357,6 +363,9 @@ impl App for Monitor {
                     None => (Tone::Warn, format!("{name} has already exited.")),
                 });
             }
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -364,6 +373,13 @@ impl App for Monitor {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "System Monitor Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Monitor {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let cpu = *self.cpu.back().unwrap_or(&0.0);
         let mem = *self.memory.back().unwrap_or(&0.0);
         let mut side = column().spacing(2.0).width(Length::Fill).push(section("Monitor"));

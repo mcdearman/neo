@@ -208,6 +208,8 @@ enum Msg {
     ToggleScheme,
     ClearToast,
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
     /// The keys to edit with: an index into [`KEYMAPS`].
     Keys(usize),
     /// Ask which folder to open.
@@ -370,6 +372,10 @@ impl App for NeoCode {
         WindowSettings { size: Size::new(1280.0, 820.0), app_id: Some("org.neo.Code".into()), ..Default::default() }
     }
 
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
+    }
+
     fn theme(&self, system: Scheme) -> Theme {
         let mut theme = self.desktop.theme(system);
         // The sun and moon button overrides the desktop's scheme for this window.
@@ -524,6 +530,9 @@ impl App for NeoCode {
                 self.dark = Some(!self.is_dark());
             }
             Msg::ClearToast => self.toast = None,
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -531,6 +540,13 @@ impl App for NeoCode {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Code Settings", Msg::Desktop, self.settings_rows())
+    }
+}
+
+impl NeoCode {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         // Edge to edge, as in most code editors: the explorer, the editor
         // under a thin strip of tabs, and a thin status bar.
         let body = row().width(Length::Fill).height(Length::Fill).push(self.sidebar()).push(Divider::vertical()).push(self.main());
@@ -579,7 +595,9 @@ impl NeoCode {
     }
 
     fn main(&self) -> Element<Msg> {
-        let surface = self.theme(if self.is_dark() { Scheme::Dark } else { Scheme::Light }).palette().surface;
+        // The card fill, which is translucent on a glass window, so what is
+        // behind the window still shows through the editor, blurred.
+        let surface = self.theme(if self.is_dark() { Scheme::Dark } else { Scheme::Light }).paint(Surface::Card).fill;
         let mut tabs = row().spacing(2.0).align(Align::Center);
         for (i, t) in self.tabs.iter().enumerate() {
             let active = self.active == Some(i);
@@ -620,6 +638,12 @@ impl NeoCode {
             .into(),
         };
         column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor).into()
+    }
+
+    /// Code's own rows for the settings panel.
+    fn settings_rows(&self) -> Vec<Element<Msg>> {
+        let keys = segmented(KEYMAPS.map(|(_, name)| name), KEYMAPS.iter().position(|(k, _)| *k == self.keymap), Msg::Keys);
+        vec![neo_desktop::ui::setting("Keys", "Standard editing, or Vim or Helix modal keys.", keys)]
     }
 
     fn status_bar(&self) -> Element<Msg> {
@@ -717,7 +741,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     use neo::{Modifiers, Point};
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true), ("editor-helix", true), ("editor-menu", false)] {
+    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true), ("editor-helix", true), ("editor-menu", false), ("editor-settings", false)] {
         let mut app = NeoCode::sample();
         app.dark = Some(dark);
         if name == "editor-helix" {
@@ -742,6 +766,7 @@ fn snapshots(dir: PathBuf) {
                 h.click(Point::new(24.0, 23.0));
                 h.move_to(Point::new(60.0, 110.0));
             }
+            "editor-settings" => h.app_mut().update(Msg::Desktop(neo_desktop::DesktopMsg::OpenSettings)),
             // Helix: a cursor on each of four lines, mid-way through typing.
             "editor-helix" => h.type_text("12GwCCCi"),
             _ => h.type_text("qad2"),
@@ -930,6 +955,52 @@ mod tests {
         h.click(Point::new(24.0, 23.0));
         h.click(Point::new(60.0, 44.0 + 32.0 + 9.0 + 32.0 + 16.0));
         assert_eq!(h.app().tabs.len(), tabs - 2);
+    }
+
+    /// The sample project with its own settings kept in a scratch file, so
+    /// tests never touch the real ones.
+    fn with_scratch_settings(name: &str) -> NeoCode {
+        let mut app = NeoCode::sample();
+        let path = std::env::temp_dir().join(format!("neo-code-test-{}-{name}", std::process::id())).join("app.conf");
+        let _ = std::fs::remove_file(&path);
+        app.desktop = Desktop::with_prefs_file(path);
+        app
+    }
+
+    #[test]
+    fn settings_open_from_the_menu_shortcut_and_block_the_editor() {
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        let mut app = with_scratch_settings("panel");
+        app.update(Msg::Keys(0));
+        let mut h = Harness::new(app, Size::new(1280.0, 820.0)).unwrap();
+        h.click(Point::new(700.0, 300.0));
+        let before = lines(&h);
+        h.key(Key::Character(",".into()), cmd);
+        assert!(h.app().desktop.settings_open);
+        h.type_text("zzz");
+        assert_eq!(lines(&h), before, "typing does not reach the file behind the panel");
+        h.click(Point::new(700.0, 700.0));
+        assert!(!h.app().desktop.settings_open, "a click outside the panel closes it");
+        h.key(Key::Character(",".into()), cmd);
+        h.key(Key::Escape, Modifiers::default());
+        assert!(!h.app().desktop.settings_open, "and so does Escape");
+    }
+
+    #[test]
+    fn this_app_can_turn_glass_off_and_the_editor_follows() {
+        let mut app = with_scratch_settings("glass");
+        app.desktop.appearance.glass.enabled = true;
+        app.desktop.appearance.glass.opacity = 0.6;
+        let mut h = Harness::new(app, Size::new(1280.0, 820.0)).unwrap();
+        // The editor area, right of the text: its opacity in the rendered frame.
+        let alpha = |h: &mut Harness<NeoCode>| h.render(1.0)[(600 * 1280 + 1100) * 4 + 3];
+        assert!(h.theme().glass.enabled);
+        let glass = alpha(&mut h);
+        assert!(glass < 250, "the editor area is see-through on a glass window, got {glass}");
+        h.app_mut().update(Msg::Desktop(neo_desktop::DesktopMsg::Glass(false)));
+        assert_eq!(alpha(&mut h), 255, "solid once this app opts out");
+        assert!(!h.theme().glass.enabled);
+        assert!(h.app().desktop.appearance.glass.enabled, "and only this app changed");
     }
 
     #[test]

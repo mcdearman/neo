@@ -135,6 +135,8 @@ enum Msg {
     Advance,
     PlayPause,
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 /// The pictures beside `path`, and where `path` is among them. A folder
@@ -203,6 +205,10 @@ impl App for Photos {
 
     fn window(&self) -> WindowSettings {
         WindowSettings { size: Size::new(1040.0, 720.0), min_size: Some(Size::new(480.0, 360.0)), app_id: Some("org.neo.Photos".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -306,6 +312,9 @@ impl App for Photos {
                     Err(e) => self.status = Some((Tone::Bad, format!("Could not move {name} to the Trash: {e}"))),
                 }
             }
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -313,6 +322,13 @@ impl App for Photos {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Photos Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Photos {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let has = self.current.is_some();
         let animated = self.current.as_ref().is_some_and(|d| !d.frames.is_empty());
         let many = self.files.len() > 1;

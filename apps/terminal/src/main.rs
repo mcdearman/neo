@@ -130,6 +130,8 @@ enum Msg {
     Exited(Option<i32>),
     Restart,
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 impl Terminal {
@@ -179,6 +181,10 @@ impl App for Terminal {
         WindowSettings { size: Size::new(900.0, 580.0), min_size: Some(Size::new(360.0, 200.0)), app_id: Some("org.neo.Terminal".into()), ..Default::default() }
     }
 
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
+    }
+
     fn theme(&self, system: Scheme) -> Theme {
         self.desktop.theme(system)
     }
@@ -207,6 +213,9 @@ impl App for Terminal {
             }
             Msg::Exited(code) => self.exited = Some(code),
             Msg::Restart => self.spawn(),
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -214,6 +223,13 @@ impl App for Terminal {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Terminal Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Terminal {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let mut col = column().width(Length::Fill).height(Length::Fill);
         if let Some(s) = &self.session {
             col = col.push(Element::new(TermView::new(s.term.clone(), s.pty.clone(), FONT, Msg::Resize)));

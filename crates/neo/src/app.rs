@@ -1,4 +1,4 @@
-use armature::{Chrome, KeyEvent, Menu, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
+use armature::{Chrome, KeyEvent, Menu, MenuEntry, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
 use neo_theme::{Scheme, TextRole, Theme};
 
 use crate::core::Element;
@@ -30,6 +30,13 @@ pub trait App: 'static {
     /// top of the window. Asked after every update, so entries can follow
     /// app state. An entry's shortcut works whether or not its menu is open.
     fn menus(&self) -> Vec<Menu<Self::Message>> {
+        vec![]
+    }
+
+    /// Entries about the app as a whole, such as Settings. On macOS they go
+    /// in the application menu, under the app's name; elsewhere they follow
+    /// the entries of the first menu.
+    fn app_menu(&self) -> Vec<MenuEntry<Self::Message>> {
         vec![]
     }
 
@@ -123,12 +130,16 @@ impl<A: App> armature::App for Themed<A> {
     }
 
     fn frame(&self, view: Element<Self::Message>, chrome: Chrome) -> Element<Self::Message> {
-        let menus = if chrome.menu_bar { self.0.menus() } else { vec![] };
+        let menus = if chrome.menu_bar { armature::with_app_entries(self.0.menus(), self.0.app_menu()) } else { vec![] };
         Element::new(Frame::new(view, chrome.title, chrome.title_bar, chrome.rounded, chrome.background).menus(menus))
     }
 
     fn menus(&self) -> Vec<Menu<Self::Message>> {
         self.0.menus()
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Self::Message>> {
+        self.0.app_menu()
     }
 
     fn on_key(&self, key: &KeyEvent) -> Option<Self::Message> {

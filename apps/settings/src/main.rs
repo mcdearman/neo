@@ -89,6 +89,8 @@ enum Msg {
     TextScale(f32),
     ReduceMotion(bool),
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
     /// The preview controls do nothing.
     Preview,
 }
@@ -118,6 +120,10 @@ impl App for Settings {
         WindowSettings { size: Size::new(920.0, 640.0), min_size: Some(Size::new(720.0, 480.0)), app_id: Some("org.neo.Settings".into()), ..Default::default() }
     }
 
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
+    }
+
     fn theme(&self, system: Scheme) -> Theme {
         self.desktop.theme(system)
     }
@@ -138,6 +144,9 @@ impl App for Settings {
             Msg::TextScale(s) => self.change(|a| a.text_scale = s),
             Msg::ReduceMotion(r) => self.change(|a| a.reduce_motion = r),
             Msg::Preview => {}
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -145,6 +154,13 @@ impl App for Settings {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "This Window", Msg::Desktop, vec![])
+    }
+}
+
+impl Settings {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let mut side = column().spacing(2.0).width(Length::Fill).push(section("Settings"));
         for p in Page::ALL {
             side = side.push(nav_item(p.icon(), p.name(), p == self.page, Msg::Page(p)));

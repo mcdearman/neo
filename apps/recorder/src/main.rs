@@ -49,7 +49,7 @@ use neo_desktop::Desktop;
 use capture::{Options, Saved, Session, Target, WindowInfo};
 use tray::{Tray, TrayAction, TrayState};
 
-const POPUP: Size = Size { w: 460.0, h: 650.0 };
+const POPUP: Size = Size { w: 460.0, h: 700.0 };
 /// The bar shown while recording.
 const BAR: Size = Size { w: 300.0, h: 60.0 };
 const FRAME: Size = Size { w: 760.0, h: 520.0 };
@@ -174,6 +174,8 @@ enum Msg {
     ScreenshotHotkey,
     Tray(TrayAction),
     Autostart(bool),
+    /// Whether this app's window is glass when the desktop's windows are.
+    Glass(bool),
     Hide,
     Quit,
     Geometry(WindowGeometry),
@@ -687,6 +689,9 @@ impl Recorder {
                 self.permitted = capture::permitted();
             }
             Msg::Tick => {}
+            Msg::Glass(on) => {
+                self.desktop.update(neo_desktop::DesktopMsg::Glass(on));
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -789,6 +794,10 @@ impl Recorder {
         }
         options = options.push(option("Launch at startup", format!("Starts in the tray, so {SHORTCUT} is always ready."), self.autostart, Msg::Autostart));
         options = options.push(option("Save as GIF", format!("{} frames a second, up to {} pixels wide.", media::GIF_FPS, media::GIF_MAX_WIDTH), self.gif, Msg::Gif));
+        // The Recorder has no menu bar to put a Settings entry in, so its
+        // glass switch lives with its other options.
+        let glass_note = if self.desktop.appearance.glass.enabled { "Translucent, like other Neo windows." } else { "Glass windows are off in Neo Settings." };
+        options = options.push(option("Glass window", glass_note.into(), self.desktop.prefs.glass, Msg::Glass));
         if cfg!(target_os = "macos") {
             options = options.push(option("Show mouse clicks", String::new(), self.show_clicks, Msg::ShowClicks));
         }

@@ -2,6 +2,10 @@
 
 use neo::prelude::*;
 use neo::theme::Icon;
+use neo::theme::Shadow;
+use neo::{Cx, DrawCx, Event, EventCx, Key, Limits, Point, Size, Status, ThemeCx, Widget};
+
+use crate::{Desktop, DesktopMsg};
 
 /// Width of an app's navigation sidebar.
 pub const SIDEBAR_W: f32 = 212.0;
@@ -56,4 +60,111 @@ pub fn notice<M: 'static>(tone: Tone, message: impl Into<String>) -> Element<M> 
         _ => neo::icons::CIRCLE_CHECK,
     };
     row().spacing(6.0).align(Align::Center).push(icon(glyph).size(14.0).tone(tone)).push(text(message).role(TextRole::Caption).tone(tone)).into()
+}
+
+/// Dims what is behind a panel and keeps the pointer and keyboard from
+/// reaching it. A click on it, or Escape, sends `on_dismiss`.
+struct Scrim<M> {
+    on_dismiss: M,
+}
+
+impl<M: Clone + 'static> Widget<M> for Scrim<M> {
+    fn width(&self) -> Length {
+        Length::Fill
+    }
+
+    fn height(&self) -> Length {
+        Length::Fill
+    }
+
+    fn layout(&mut self, _cx: &mut Cx, limits: Limits) -> Size {
+        limits.max
+    }
+
+    fn draw(&self, cx: &mut DrawCx) {
+        let b = cx.bounds();
+        // A new layer, so the dimming and the panel go over the text
+        // behind them as well as the shapes.
+        cx.scene.push_layer();
+        cx.scene.fill(b, 0.0, Color::BLACK.with_alpha(0.3), None);
+    }
+
+    fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
+        match event {
+            Event::PointerPressed { .. } => cx.emit(self.on_dismiss.clone()),
+            Event::Key(k) if k.pressed && k.key == Key::Escape => cx.emit(self.on_dismiss.clone()),
+            // Tab still moves between the panel's controls.
+            Event::Key(k) if k.key == Key::Tab => return Status::Ignored,
+            Event::PointerMoved { .. } | Event::PointerReleased { .. } | Event::Wheel { .. } | Event::Key(_) => {}
+            _ => return Status::Ignored,
+        }
+        Status::Captured
+    }
+}
+
+/// A solid sheet for a panel's content. Unlike a card it is never
+/// see-through, so it stays readable over anything, glass window or not,
+/// and a click on its empty parts stays with it.
+struct Sheet<M> {
+    content: [Element<M>; 1],
+    width: f32,
+}
+
+const SHEET_PAD: f32 = 20.0;
+
+impl<M: 'static> Widget<M> for Sheet<M> {
+    fn children_mut(&mut self) -> &mut [Element<M>] {
+        &mut self.content
+    }
+
+    fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
+        let inner = (self.width.min(limits.max.w) - SHEET_PAD * 2.0).max(0.0);
+        let size = self.content[0].layout(cx, Limits::new(Size::new(inner, 0.0), Size::new(inner, f32::INFINITY)));
+        self.content[0].set_position(Point::new(SHEET_PAD, SHEET_PAD));
+        Size::new(inner + SHEET_PAD * 2.0, size.h + SHEET_PAD * 2.0)
+    }
+
+    fn draw(&self, cx: &mut DrawCx) {
+        let b = cx.bounds();
+        let theme = *cx.theme();
+        let p = theme.palette();
+        let radius = theme.control_radius() + 2.0;
+        cx.scene.shadow(b, radius, &Shadow { offset: (0.0, 10.0), blur: 36.0, spread: 0.0, color: Color::BLACK.with_alpha(0.28), inset: false });
+        cx.scene.fill(b, radius, p.surface, Some((1.0, p.line)));
+        cx.with_content_color(p.text, |cx| self.content[0].draw(cx));
+    }
+
+    fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
+        let status = self.content[0].event(cx, event);
+        match event {
+            Event::PointerPressed { pos, .. } if cx.bounds().contains(*pos) => Status::Captured,
+            _ => status,
+        }
+    }
+}
+
+/// An app's settings panel, shown over `view`: the app's own rows, then
+/// the ones every Neo app has.
+pub(crate) fn settings_panel<M: Clone + 'static>(desktop: &Desktop, view: Element<M>, heading: &str, wrap: impl Fn(DesktopMsg) -> M + Clone + 'static, extra: Vec<Element<M>>) -> Element<M> {
+    let close = wrap(DesktopMsg::CloseSettings);
+    let help = if desktop.appearance.glass.enabled {
+        "Translucent, with what is behind the window blurred. Turn off to make this app's window solid."
+    } else {
+        "Glass windows are turned off in Neo Settings, so this has no effect for now."
+    };
+    let glass = wrap.clone();
+    let mut rows = column()
+        .spacing(16.0)
+        .width(Length::Fill)
+        .push(row().align(Align::Center).push(text(heading.to_owned()).role(TextRole::Title)).push(Space::fill_x()).push(icon_button(neo::icons::X, 28.0).kind(ButtonKind::Ghost).on_press(close.clone())))
+        .push(Divider::horizontal());
+    for e in extra {
+        rows = rows.push(e);
+    }
+    rows = rows.push(setting("Glass window", help, toggle(desktop.prefs.glass, move |on| glass(DesktopMsg::Glass(on)))));
+    if let Some(e) = &desktop.error {
+        rows = rows.push(notice(Tone::Bad, e.clone()));
+    }
+    let panel = Element::new(Sheet { content: [rows.into()], width: 480.0 });
+    stack().push(view).push(Element::new(Scrim { on_dismiss: close })).push(container(panel).width(Length::Fill).height(Length::Fill).center()).into()
 }

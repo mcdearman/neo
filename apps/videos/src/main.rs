@@ -48,6 +48,8 @@ enum Msg {
     Volume(f32),
     Mute,
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 /// `1:05` or `1:02:05`.
@@ -106,6 +108,10 @@ impl App for Videos {
 
     fn window(&self) -> WindowSettings {
         WindowSettings { size: Size::new(1040.0, 700.0), min_size: Some(Size::new(480.0, 320.0)), app_id: Some("org.neo.Videos".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -168,6 +174,9 @@ impl App for Videos {
                 self.muted = !self.muted;
                 self.apply_volume();
             }
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -176,6 +185,13 @@ impl App for Videos {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Videos Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Videos {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let body: Element<Msg> = match (&self.error, &self.player) {
             (Some(e), _) => message(icons::FILM, "This video can't be played", e.clone()),
             (None, Some(p)) => Element::new(Screen { frame: self.frame.clone(), turns: p.turns() }),

@@ -122,6 +122,8 @@ enum Msg {
     /// The worker finished a thumbnail, or found the file is not a picture.
     Thumb(PathBuf, Option<Image>),
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 /// How the folder's contents are laid out.
@@ -357,6 +359,10 @@ impl App for Files {
 
     fn window(&self) -> WindowSettings {
         WindowSettings { size: Size::new(1040.0, 680.0), min_size: Some(Size::new(640.0, 400.0)), app_id: Some("org.neo.Files".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -623,6 +629,9 @@ impl App for Files {
                     }
                 }
             }
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
                 if dir_stamp(&self.dir) != self.stamp {
@@ -635,6 +644,13 @@ impl App for Files {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Files Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Files {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         let main = split(self.places(), column().width(Length::Fill).height(Length::Fill).push(self.toolbar()).push(Divider::horizontal()).push(self.list()).push(Divider::horizontal()).push(self.status_bar()));
         let Some((target, at)) = &self.menu else { return main };
         let entry = target.as_ref().and_then(|p| self.entries.iter().find(|e| &e.path == p));

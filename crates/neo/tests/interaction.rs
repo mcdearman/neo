@@ -713,6 +713,7 @@ mod menu_bar {
         saved: u32,
         zoomed: u32,
         pressed: u32,
+        settings: u32,
         has_file: bool,
         system_title_bar: bool,
     }
@@ -723,6 +724,7 @@ mod menu_bar {
         Save,
         Zoom,
         Press,
+        Settings,
     }
 
     impl App for Editor {
@@ -738,6 +740,7 @@ mod menu_bar {
                 Msg::Save => self.saved += 1,
                 Msg::Zoom => self.zoomed += 1,
                 Msg::Press => self.pressed += 1,
+                Msg::Settings => self.settings += 1,
             }
         }
 
@@ -746,6 +749,10 @@ mod menu_bar {
                 Menu::new("File").push(MenuEntry::new("Open…", Msg::Open).shortcut(Shortcut::command("o"))).separator().push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(self.has_file)),
                 Menu::new("View").push(MenuEntry::new("Zoom In", Msg::Zoom)),
             ]
+        }
+
+        fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+            vec![MenuEntry::new("Settings…", Msg::Settings).shortcut(Shortcut::command(","))]
         }
 
         // A button filling the window under the bar.
@@ -843,6 +850,17 @@ mod menu_bar {
         assert_eq!(h.app().saved, 1);
         h.key(Key::Character("o".into()), Modifiers::default());
         assert_eq!(h.app().opened, 1, "not without the command key");
+    }
+
+    #[test]
+    fn the_apps_own_entries_follow_the_first_menu_where_there_is_no_application_menu() {
+        let mut h = harness(Editor::default());
+        h.click(FILE);
+        // Open, a separator, Save, another separator, then Settings.
+        h.click(Point::new(40.0, 44.0 + 32.0 + 9.0 + 32.0 + 9.0 + 16.0));
+        assert_eq!(h.app().settings, 1);
+        h.key(Key::Character(",".into()), command());
+        assert_eq!(h.app().settings, 2, "and its shortcut works");
     }
 
     #[test]

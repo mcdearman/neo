@@ -38,6 +38,8 @@ enum Msg {
     ClearHistory,
     Scientific(bool),
     Poll,
+    /// The Settings entry and panel every Neo app has.
+    Desktop(neo_desktop::DesktopMsg),
 }
 
 impl Calculator {
@@ -76,6 +78,10 @@ impl App for Calculator {
 
     fn window(&self) -> WindowSettings {
         WindowSettings { size: Size::new(760.0, 560.0), min_size: Some(Size::new(380.0, 480.0)), app_id: Some("org.neo.Calculator".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -127,6 +133,9 @@ impl App for Calculator {
             }
             Msg::ClearHistory => self.history.clear(),
             Msg::Scientific(s) => self.scientific = s,
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
             Msg::Poll => {
                 self.desktop.poll();
             }
@@ -134,6 +143,13 @@ impl App for Calculator {
     }
 
     fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Calculator Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Calculator {
+    /// The window's content, which the settings panel goes over.
+    fn content(&self) -> Element<Msg> {
         row().spacing(12.0).width(Length::Fill).height(Length::Fill).padding([0.0, 12.0, 12.0, 12.0]).push(self.main()).push(self.history_panel()).into()
     }
 }

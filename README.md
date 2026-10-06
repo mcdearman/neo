@@ -96,7 +96,9 @@ Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framewo
 
 Text, Icon, Picture, Container, Row, Column, Stack, Space, Divider, Scrollable, MouseArea, PopupMenu, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, TextEditor, ProgressBar, Gauge and Sparkline.
 
-An app's menu bar comes from `App::menus`: a list of `Menu`s holding `MenuEntry`s, each with an optional `Shortcut`. macOS shows them in its own menu bar at the top of the screen; on Windows and Linux Neo draws them in the title bar. Entries without a message are greyed out, and a shortcut works whether or not its menu is open.
+An app's menu bar comes from `App::menus`: a list of `Menu`s holding `MenuEntry`s, each with an optional `Shortcut`. macOS shows them in its own menu bar at the top of the screen; on Windows and Linux Neo draws them in the title bar. Entries without a message are greyed out, and a shortcut works whether or not its menu is open. `App::app_menu` holds entries about the app as a whole, such as Settings: macOS puts them under the app's name, and elsewhere they follow the first menu.
+
+Every Neo app has **Settings…** there (Cmd/Ctrl+,), opening a panel with that app's own settings. One of them is in every app: **Glass window**, which makes that one app's window solid while the rest of the desktop stays glass. `neo_desktop::Desktop` supplies the entry, the panel and the setting; an app adds its own rows.
 
 TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
 
