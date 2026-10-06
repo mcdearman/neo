@@ -31,17 +31,21 @@ pub struct Settings {
     pub restore: bool,
     /// How code is coloured.
     pub syntax: Syntax,
+    /// The colour of types being tried in the Meadow scheme.
+    pub types: neo::TypeColour,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { keymap: Keymap::Vim, font_size: 14.0, tab_size: 4, hover: true, hover_delay: 350, code_lens: true, dark: None, restore: true, syntax: Syntax::default() }
+        Self { keymap: Keymap::Vim, font_size: 14.0, tab_size: 4, hover: true, hover_delay: 350, code_lens: true, dark: None, restore: true, syntax: Syntax::default(), types: Default::default() }
     }
 }
 
 pub const KEYMAP: &str = "editor.keymap";
 pub const THEME: &str = "workbench.colorTheme";
 pub const SYNTAX: &str = "editor.colorScheme";
+/// Here while a colour for types is being chosen.
+pub const TYPES: &str = "editor.typeColor";
 
 /// How a keymap is written in the file.
 pub fn keymap_name(k: Keymap) -> &'static str {
@@ -105,6 +109,7 @@ impl Settings {
                     .map(|dark| s.dark = dark),
                 "window.restoreWorkspace" => value.as_bool().map(|b| s.restore = b),
                 SYNTAX => value.as_str().and_then(Syntax::from_name).map(|x| s.syntax = x),
+                TYPES => value.as_str().and_then(neo::TypeColour::from_name).map(|x| s.types = x),
                 _ => Some(()),
             };
             if ok.is_none() {
@@ -293,7 +298,7 @@ mod tests {
     fn settings_are_read_by_name_and_bad_values_keep_the_usual_one() {
         let Value::Object(values) = json!({ "editor.keymap": "Helix", "editor.fontSize": 16.5, "editor.tabSize": 2, "editor.hover.enabled": false, "editor.hover.delay": 100, "editor.codeLens": false, "workbench.colorTheme": "dark", "window.restoreWorkspace": false, "editor.colorScheme": "meadow", "someone.elses": [1, 2] }) else { panic!() };
         let (s, wrong) = Settings::from(&values);
-        assert_eq!(s, Settings { keymap: Keymap::Helix, font_size: 16.5, tab_size: 2, hover: false, hover_delay: 100, code_lens: false, dark: Some(true), restore: false, syntax: Syntax::Meadow });
+        assert_eq!(s, Settings { keymap: Keymap::Helix, font_size: 16.5, tab_size: 2, hover: false, hover_delay: 100, code_lens: false, dark: Some(true), restore: false, syntax: Syntax::Meadow, types: Default::default() });
         assert!(wrong.is_empty(), "a key that is not NeoCode's is nobody's mistake: {wrong:?}");
         let Value::Object(values) = json!({ "editor.colorScheme": "Monokai" }) else { panic!() };
         assert_eq!(Settings::from(&values).0.syntax, Syntax::Monokai);

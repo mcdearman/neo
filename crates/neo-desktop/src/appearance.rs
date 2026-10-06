@@ -177,6 +177,7 @@ impl Appearance {
             reduce_motion: self.reduce_motion,
             glass: self.glass,
             syntax: Default::default(),
+            types: Default::default(),
         }
     }
 }

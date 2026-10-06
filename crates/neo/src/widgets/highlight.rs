@@ -477,9 +477,9 @@ pub(crate) struct SyntaxColors {
 }
 
 impl SyntaxColors {
-    pub fn new(p: &Palette, scheme: Scheme, accent: Accent, syntax: Syntax) -> Self {
+    pub fn new(p: &Palette, scheme: Scheme, accent: Accent, syntax: Syntax, types: neo_theme::TypeColour) -> Self {
         if syntax == Syntax::Meadow {
-            return Self::meadow(p, scheme);
+            return Self::meadow(p, scheme, types);
         }
         match scheme {
             // Monokai Pro. Comments are brightened from #727072 to reach 4.5:1.
@@ -527,13 +527,16 @@ impl SyntaxColors {
     /// left as the text is. These are the shades Neo's own
     /// terminal gives those names, so code in the editor and the same code
     /// typed at the REPL beside it look alike.
-    fn meadow(p: &Palette, scheme: Scheme) -> Self {
+    fn meadow(p: &Palette, scheme: Scheme, types: neo_theme::TypeColour) -> Self {
         let hex = Color::hex;
         // magenta, cyan, blue, bright yellow, bright blue, yellow, green
-        let [keyword, ty, constructor, function, variable, number, string] = match scheme {
+        let [keyword, ty_cyan, constructor, function, variable, number, string] = match scheme {
             Scheme::Dark => [hex(0xAB9DF2), hex(0x78DCE8), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
             Scheme::Light => [hex(0x8A3FB5), hex(0x16706A), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
         };
+        // Types are whichever candidate is being tried.
+        let ty = types.tone(scheme);
+        let _ = ty_cyan;
         // Dim, as the REPL has comments: the text's colour, most of the
         // way to the ground, and for modules the type's.
         let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };

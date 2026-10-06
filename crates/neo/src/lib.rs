@@ -62,7 +62,7 @@ pub use armature::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use armature::{Menu, MenuEntry, Shortcut};
 
 pub use armature_render::{Corners, FontFamily, Image, Point, Rect, Scene, Size, TextLayout, TextStyle};
-pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, Syntax, TextRole, Theme, Weight};
+pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, Syntax, TextRole, Theme, TypeColour, Weight};
 
 /// Everything an application usually needs.
 pub mod prelude {

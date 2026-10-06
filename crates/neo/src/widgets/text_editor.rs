@@ -493,7 +493,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             Some(EditorPopup::Rich(lines)) => {
                 let colors = {
                     let theme = *cx.theme();
-                    SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent, theme.syntax)
+                    SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent, theme.syntax, theme.types)
                 };
                 // Carried from line to line, for comments that span them;
                 // a line of prose between two pieces of code ends one.
@@ -531,7 +531,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         self.longest = self.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32 * self.char_w;
 
         let theme = *cx.theme();
-        let colors = SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent, theme.syntax);
+        let colors = SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent, theme.syntax, theme.types);
         let text_w = size.w - self.gutter_w - PAD_X;
         let total_h = (self.lines.len() + self.lenses.len()) as f32 * self.line_h + PAD_Y * 2.0;
         let max_y = if total_h > size.h { total_h - size.h * 0.5 } else { 0.0 };
