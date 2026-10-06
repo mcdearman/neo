@@ -19,6 +19,9 @@ struct EditorState {
     pointed: Option<Pos>,
     /// The lens label the mouse is over.
     lens_hover: Option<(usize, usize)>,
+    /// The word that a click would jump from: the one under the mouse
+    /// while Command is held.
+    jump: Option<Pos>,
     last_click: Option<(Instant, Pos)>,
     blink_origin: Option<Instant>,
     view: Size,
@@ -50,6 +53,8 @@ pub struct TextEditor<M> {
     on_lens: Option<Box<dyn Fn(usize, usize) -> M>>,
     /// Each lens's labels as laid out.
     lens_rows: Vec<Vec<TextLayout>>,
+    /// The word marked as somewhere to jump from, and its length.
+    jump: Option<(Pos, usize)>,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
     /// The popup's rows as laid out, and the first list item among them.
     popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
@@ -90,6 +95,7 @@ impl<M> TextEditor<M> {
             lenses: vec![],
             on_lens: None,
             lens_rows: vec![],
+            jump: None,
             on_popup_key: None,
             popup_rows: vec![],
             popup_first: 0,
@@ -244,6 +250,11 @@ pub enum EditorPopup {
     /// Choices, each with an optional detail in a quieter colour, and which
     /// one is picked.
     List { items: Vec<(String, Option<String>)>, selected: usize },
+}
+
+/// How long the word starting at `col` is, in bytes.
+fn word_len(line: &str, col: usize) -> usize {
+    line.get(col..).map_or(0, |rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').map(char::len_utf8).sum())
 }
 
 /// Things that can be done to what starts on a line, shown in a row of
@@ -567,6 +578,12 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 highlight(self.language, l, &mut in_comment);
             }
         }
+        let jump = cx.state::<EditorState>().jump.filter(|j| j.line < self.lines.len() && self.lines[j.line].is_char_boundary(j.col));
+        let (ink, strongest) = {
+            let p = theme.palette();
+            (p.text, if p.text.luminance() > 0.5 { Color::WHITE } else { Color::BLACK })
+        };
+        self.jump = jump.map(|j| (j, word_len(&self.lines[j.line], j.col)));
         self.rows.clear();
         self.numbers.clear();
         let num_style = TextStyle { size: style.size * 0.92, ..style };
@@ -575,7 +592,24 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let own = highlight(self.language, line, &mut in_comment);
             let start = self.tokens.partition_point(|t| t.line < i);
             let theirs: Vec<(usize, usize, Kind)> = self.tokens[start..].iter().take_while(|t| t.line == i).map(|t| (t.from, t.to, t.kind)).collect();
-            let spans: Vec<(&str, Option<Color>)> = overlay(line, own, &theirs).into_iter().map(|(a, b, k)| (&line[a..b], colors.color(k))).collect();
+            let mut parts: Vec<(usize, usize, Option<Color>)> = overlay(line, own, &theirs).into_iter().map(|(a, b, k)| (a, b, colors.color(k))).collect();
+            // The word a click would jump from stands out from the rest:
+            // darker on a light ground, lighter on a dark one.
+            if let Some((from, to)) = jump.filter(|j| j.line == i).map(|j| (j.col, j.col + word_len(line, j.col))) {
+                let strong = |c: Option<Color>| Some(c.unwrap_or(ink).mix(strongest, 0.55));
+                if parts.is_empty() {
+                    parts.push((0, line.len(), None));
+                }
+                parts = parts
+                    .into_iter()
+                    .flat_map(|(a, b, c)| {
+                        let (lo, hi) = (from.clamp(a, b), to.clamp(a, b));
+                        [(a, lo, c), (lo, hi, strong(c)), (hi, b, c)]
+                    })
+                    .filter(|(a, b, _)| a < b)
+                    .collect();
+            }
+            let spans: Vec<(&str, Option<Color>)> = parts.into_iter().map(|(a, b, c)| (&line[a..b], c)).collect();
             let layout = if spans.len() <= 1 && spans.first().is_none_or(|s| s.1.is_none()) {
                 cx.text().layout(line, &style, None)
             } else {
@@ -668,6 +702,12 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         for (i, layout) in self.rows.iter().enumerate() {
             let y = self.line_y(b, scroll, self.first + i);
             cx.scene.text(layout, Point::new(tx.round(), (y + (self.line_h - layout.size().h) * 0.5).round()), default);
+        }
+        // Under the word a click would jump from.
+        if let Some((at, len)) = self.jump.filter(|(at, _)| self.row(at.line).is_some()) {
+            let (x0, x1) = (self.caret_x(at.line, at.col), self.caret_x(at.line, at.col + len));
+            let y = self.line_y(b, scroll, at.line) + self.line_h - 4.0;
+            cx.scene.fill(Rect::new((tx + x0).round(), y.round(), (x1 - x0).round(), 1.5), 0.0, p.text, None);
         }
         // Lenses, each in the row above its line: quiet until pointed at.
         for (k, lens) in self.lenses.iter().enumerate() {
@@ -826,6 +866,9 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 Status::Captured
             }
             Event::PointerLeft => {
+                if cx.state::<EditorState>().jump.take().is_some() {
+                    cx.request_layout();
+                }
                 self.point(cx, None);
                 Status::Ignored
             }
@@ -841,8 +884,14 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 if lens.is_some() {
                     cx.set_cursor(CursorIcon::Pointer);
                 } else if b.contains(*pos) {
-                    // With Command held, a word is somewhere to go.
+                    // With Command held, a word is somewhere to go, and is
+                    // marked so before it is clicked.
                     let jump = word.is_some() && self.on_jump.is_some() && cx.modifiers().command();
+                    let marked = word.filter(|_| jump);
+                    if cx.state::<EditorState>().jump != marked {
+                        cx.state::<EditorState>().jump = marked;
+                        cx.request_layout();
+                    }
                     cx.set_cursor(if jump {
                         CursorIcon::Pointer
                     } else if pos.x > b.x + self.gutter_w {

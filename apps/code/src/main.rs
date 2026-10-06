@@ -1675,9 +1675,25 @@ mod tests {
         assert_eq!(s.tab().doc.cursor().line, 1);
         assert!(!s.methods().contains(&"textDocument/definition".to_owned()));
         // With the key held it asks, about the place clicked.
+        // Pressing the key, with the mouse where it is, marks the word:
+        // darker and underlined, with a hand for a pointer.
+        let plain = s.h.render(1.0);
         s.h.set_modifiers(Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() });
-        s.h.move_to(spot);
         assert_eq!(s.h.cursor(), neo::CursorIcon::Pointer, "the word looks like somewhere to go");
+        let marked = s.h.render(1.0);
+        assert!(marked != plain, "and is drawn differently");
+        // Only that word: the line above is drawn as it was.
+        let changed: Vec<usize> = plain.chunks(4).zip(marked.chunks(4)).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i / 1280).collect();
+        let (top, bottom) = (*changed.first().unwrap(), *changed.last().unwrap());
+        assert!(bottom - top < 30 && (top as f32 - spot.y).abs() < 30.0, "rows {top} to {bottom}, around {}", spot.y);
+        // Letting go of the key puts it back, as does moving off the word.
+        s.h.set_modifiers(Modifiers::default());
+        assert!(s.h.render(1.0) == plain);
+        s.h.set_modifiers(Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() });
+        s.h.move_to(Point::new(spot.x, spot.y + 200.0));
+        assert!(s.h.render(1.0) == plain);
+        s.h.move_to(spot);
+        assert!(s.h.render(1.0) == marked);
         s.h.click(spot);
         let ask = s.request("textDocument/definition");
         assert_eq!(ask["params"]["position"]["line"], 1);
