@@ -15,6 +15,8 @@ struct EditorState {
     scroll: Point,
     last_cursor: Option<(Pos, usize)>,
     dragging: bool,
+    /// The word the mouse is over, by where it starts.
+    pointed: Option<Pos>,
     last_click: Option<(Instant, Pos)>,
     blink_origin: Option<Instant>,
     view: Size,
@@ -38,6 +40,8 @@ pub struct TextEditor<M> {
     /// Sorted by line.
     tokens: std::rc::Rc<[EditorToken]>,
     popup: Option<EditorPopup>,
+    popup_at: Option<Pos>,
+    on_point: Option<Box<dyn Fn(Option<Pos>) -> M>>,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
     /// The popup's rows as laid out, and the first list item among them.
     popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
@@ -72,6 +76,8 @@ impl<M> TextEditor<M> {
             marks: vec![],
             tokens: std::rc::Rc::from([]),
             popup: None,
+            popup_at: None,
+            on_point: None,
             on_popup_key: None,
             popup_rows: vec![],
             popup_first: 0,
@@ -120,6 +126,19 @@ impl<M> TextEditor<M> {
     /// Shows a popup at the caret.
     pub fn popup(mut self, popup: Option<EditorPopup>) -> Self {
         self.popup = popup;
+        self
+    }
+
+    /// Puts the popup at this place in the text rather than at the caret.
+    pub fn popup_at(mut self, at: Option<Pos>) -> Self {
+        self.popup_at = at;
+        self
+    }
+
+    /// Called when the mouse comes to rest over a different word, with
+    /// where that word starts, and with `None` when it is over no word.
+    pub fn on_point(mut self, f: impl Fn(Option<Pos>) -> M + 'static) -> Self {
+        self.on_point = Some(Box::new(f));
         self
     }
 
@@ -242,6 +261,41 @@ impl<M: 'static> TextEditor<M> {
         match self.row(line) {
             Some(l) if col > 0 => l.caret(col).x,
             _ => 0.0,
+        }
+    }
+
+    /// Where the word under window point `p` starts, if there is one: not
+    /// past the end of a line, in the margin, or between words.
+    fn word_at(&self, b: Rect, scroll: Point, p: Point) -> Option<Pos> {
+        if !b.contains(p) || p.x <= b.x + self.gutter_w {
+            return None;
+        }
+        let rel = p.y - b.y - PAD_Y + scroll.y;
+        let line = (rel >= 0.0).then(|| (rel / self.line_h) as usize).filter(|l| *l < self.lines.len())?;
+        let (row, text) = (self.row(line)?, &self.lines[line]);
+        let x = p.x - self.text_x(b, scroll);
+        if x < 0.0 || x >= row.size().w {
+            return None;
+        }
+        // The nearest gap between characters, then the character the
+        // point is actually on, which may be the one before that gap.
+        let mut at = row.hit(Point::new(x, self.line_h * 0.5)).min(text.len());
+        if at > 0 && row.caret(at).x > x {
+            at = text[..at].char_indices().next_back().map_or(0, |(i, _)| i);
+        }
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        text[at..].chars().next().filter(|c| word(*c))?;
+        let start = text[..at].char_indices().rev().take_while(|(_, c)| word(*c)).last().map_or(at, |(i, _)| i);
+        Some(Pos::new(line, start))
+    }
+
+    /// Tells the app which word the mouse is over, when that changes.
+    fn point(&self, cx: &mut EventCx<M>, word: Option<Pos>) {
+        let Some(on_point) = &self.on_point else { return };
+        let st = cx.state::<EditorState>();
+        if st.pointed != word {
+            st.pointed = word;
+            cx.emit(on_point(word));
         }
     }
 
@@ -562,15 +616,16 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let x = text_area.x + (text_area.w - w) * (scroll.x / (content_w - text_w).max(1.0));
             cx.scene.fill(Rect::new(x, b.bottom() - 9.0, w, 6.0), 3.0, p.faint.with_alpha(0.4), None);
         }
-        // A popup at the caret: under its line, or over it near the bottom.
+        // A popup at the caret, or where it was asked to be: under its line, or over it near the bottom.
         if !self.popup_rows.is_empty() {
             let row_h = self.line_h + 4.0;
             let wide = self.popup_rows.iter().map(|(l, d)| l.size().w + d.as_ref().map_or(0.0, |d| d.size().w + 18.0)).fold(0.0, f32::max);
             let size = Size::new((wide + 20.0).min(b.w - 16.0), self.popup_rows.len() as f32 * row_h + 8.0);
-            let line_top = self.line_y(b, scroll, self.cursor.line);
+            let at = self.popup_at.unwrap_or(self.cursor);
+            let line_top = self.line_y(b, scroll, at.line);
             let below = line_top + self.line_h + 2.0;
             let y = if below + size.h > b.bottom() - 4.0 && line_top - size.h - 2.0 > b.y { line_top - size.h - 2.0 } else { below };
-            let x = (self.text_x(b, scroll) + self.caret_x(self.cursor.line, self.cursor.col)).min(b.right() - size.w - 8.0).max(b.x + 8.0);
+            let x = (self.text_x(b, scroll) + self.caret_x(at.line, at.col)).min(b.right() - size.w - 8.0).max(b.x + 8.0);
             let rect = Rect::new(x.round(), y.round(), size.w, size.h);
             let picked = match &self.popup {
                 Some(EditorPopup::List { selected, .. }) => selected.checked_sub(self.popup_first),
@@ -632,10 +687,17 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 st.scroll.x += delta.x;
                 st.scroll.y += delta.y;
                 cx.request_layout();
+                // What was under the mouse has moved from under it.
+                self.point(cx, None);
                 Status::Captured
+            }
+            Event::PointerLeft => {
+                self.point(cx, None);
+                Status::Ignored
             }
             Event::PointerMoved { pos } => {
                 let dragging = cx.state::<EditorState>().dragging;
+                self.point(cx, if dragging { None } else { self.word_at(b, scroll, *pos) });
                 if b.contains(*pos) {
                     cx.set_cursor(if pos.x > b.x + self.gutter_w { CursorIcon::Text } else { CursorIcon::Default });
                 }

@@ -35,7 +35,8 @@ impl Servers {
 
 /// What is showing at the caret.
 pub enum Popup {
-    Hover(String),
+    /// What there is to say, and where in the text if not at the caret.
+    Hover(String, Option<Pos>),
     /// Everything the server offered, and which of those that still match
     /// what has been typed is picked.
     Complete { all: Vec<Completion>, selected: usize },
@@ -249,10 +250,23 @@ impl NeoCode {
                     self.tabs[i].diagnostics = items;
                 }
             }
-            Event::Hover(text) => match (text, self.active.and_then(|i| self.tabs.get_mut(i))) {
-                (Some(text), Some(t)) => t.popup = Some(Popup::Hover(text)),
-                _ => self.toast = Some("Nothing to say about that.".into()),
-            },
+            Event::Hover(text) => {
+                let Some(i) = self.active else { return };
+                // An answer about the word the mouse was on: shown there,
+                // under any problems, if the mouse has not moved on.
+                if let Some(at) = self.tabs.get_mut(i).and_then(|t| t.hover_for.take()) {
+                    let problems = self.problems_at(&self.tabs[i], at);
+                    let t = &mut self.tabs[i];
+                    if let (Some(text), true) = (text, t.pointed.is_some_and(|(p, _, _)| p == at)) {
+                        t.popup = Some(Popup::Hover(if problems.is_empty() { text } else { format!("{problems}\n\n{text}") }, Some(at)));
+                    }
+                    return;
+                }
+                match (text, self.tabs.get_mut(i)) {
+                    (Some(text), Some(t)) => t.popup = Some(Popup::Hover(text, None)),
+                    _ => self.toast = Some("Nothing to say about that.".into()),
+                }
+            }
             Event::Definition(None) => self.toast = Some("No definition found.".into()),
             Event::Definition(Some((path, place))) => {
                 let node = self.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if *p == path));
@@ -333,6 +347,7 @@ impl NeoCode {
         };
         let Some(disk) = t.disk.clone() else { return };
         let place = lsp::to_place(t.doc.lines(), t.doc.cursor(), client.utf8);
+        t.hover_for = None;
         match what {
             Ask::Hover => client.hover(&disk, place),
             Ask::Definition => client.definition(&disk, place),
@@ -404,6 +419,58 @@ impl NeoCode {
         }
     }
 
+    /// How long the mouse rests on a word before it is asked about.
+    pub(crate) const REST: std::time::Duration = std::time::Duration::from_millis(350);
+
+    /// The mouse came to rest on a word, or left it.
+    pub(crate) fn point(&mut self, word: Option<Pos>) {
+        let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) else { return };
+        t.pointed = word.map(|p| (p, std::time::Instant::now(), false));
+        // What was said about the last word goes when the mouse does.
+        if matches!(&t.popup, Some(Popup::Hover(_, Some(at))) if Some(*at) != word) {
+            t.popup = None;
+        }
+    }
+
+    /// Whether a word under the mouse is waiting to be asked about.
+    pub(crate) fn hover_waiting(&self) -> bool {
+        self.active.and_then(|i| self.tabs.get(i)).is_some_and(|t| matches!(t.pointed, Some((_, _, false))))
+    }
+
+    /// Once the mouse has rested long enough: shows the problems on that
+    /// word at once, and asks the server what else there is to say.
+    pub(crate) fn hover_rested(&mut self) {
+        let Some(i) = self.active else { return };
+        let Some((at, since, false)) = self.tabs.get(i).and_then(|t| t.pointed) else { return };
+        // Not over a list of completions, which the keyboard is working.
+        if since.elapsed() < Self::REST || matches!(self.tabs[i].popup, Some(Popup::Complete { .. })) {
+            return;
+        }
+        self.lsp_sync(i);
+        let problems = self.problems_at(&self.tabs[i], at);
+        let t = &mut self.tabs[i];
+        t.pointed = Some((at, since, true));
+        if !problems.is_empty() {
+            t.popup = Some(Popup::Hover(problems, Some(at)));
+        }
+        let Some((t, client)) = self.client_of(i) else { return };
+        let Some(disk) = t.disk.clone() else { return };
+        let place = lsp::to_place(t.doc.lines(), at, client.utf8);
+        t.hover_for = Some(at);
+        client.hover(&disk, place);
+    }
+
+    /// What the server found wrong with the word starting at `at`.
+    fn problems_at(&self, t: &Tab, at: Pos) -> String {
+        let utf8 = t.server.and_then(|s| self.servers.clients.get(s)).is_some_and(|(_, c)| c.utf8);
+        let Some(line) = t.doc.lines().get(at.line) else { return String::new() };
+        let len = line.get(at.col..).map_or(0, |rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').map(char::len_utf8).sum::<usize>());
+        let end = Pos::new(at.line, at.col + len);
+        let key = |p: Pos| (p.line, p.col);
+        let said: Vec<&str> = t.diagnostics.iter().filter(|d| key(lsp::to_pos(t.doc.lines(), d.from, utf8)) < key(end) && key(lsp::to_pos(t.doc.lines(), d.to, utf8)) > key(at)).map(|d| d.message.as_str()).collect();
+        said.join("\n\n")
+    }
+
     /// The problems in a file, as underlines for the editor.
     pub(crate) fn editor_marks(&self, t: &Tab) -> Vec<EditorMark> {
         let utf8 = t.server.and_then(|s| self.servers.clients.get(s)).is_some_and(|(_, c)| c.utf8);
@@ -422,9 +489,17 @@ impl NeoCode {
             .collect()
     }
 
+    /// Where the popup goes, if not at the caret.
+    pub(crate) fn editor_popup_at(&self, t: &Tab) -> Option<Pos> {
+        match t.popup.as_ref()? {
+            Popup::Hover(_, at) => *at,
+            Popup::Complete { .. } => None,
+        }
+    }
+
     pub(crate) fn editor_popup(&self, t: &Tab) -> Option<EditorPopup> {
         match t.popup.as_ref()? {
-            Popup::Hover(text) => Some(EditorPopup::Text(text.clone())),
+            Popup::Hover(text, _) => Some(EditorPopup::Text(text.clone())),
             Popup::Complete { all, selected } => {
                 let fits = matching(all, Self::typed_word(t));
                 (!fits.is_empty()).then(|| EditorPopup::List { items: fits.iter().map(|c| (c.label.clone(), c.detail.clone())).collect(), selected: (*selected).min(fits.len() - 1) })

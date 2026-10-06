@@ -9,7 +9,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod intel;
 mod lsp;
@@ -190,6 +190,12 @@ struct Tab {
     /// What the server says each stretch of the text is, for colouring.
     tokens: std::rc::Rc<[EditorToken]>,
     popup: Option<intel::Popup>,
+    /// The word the mouse is over, since when, and whether the server has
+    /// been asked about it yet.
+    pointed: Option<(Pos, Instant, bool)>,
+    /// The word a hover still unanswered was asked about, if it was the
+    /// mouse's and not the caret's.
+    hover_for: Option<Pos>,
 }
 
 impl Tab {
@@ -238,6 +244,10 @@ enum Msg {
     Lsp(&'static str, u64, lsp::Incoming),
     /// Ask the language server about the caret's position.
     Ask(intel::Ask),
+    /// The mouse is over the word starting here, or over none.
+    Point(Option<Pos>),
+    /// See whether the mouse has rested on a word long enough.
+    HoverTick,
     PopupKey(PopupKey),
 }
 
@@ -476,6 +486,10 @@ impl App for NeoCode {
         if self.toast.is_some() {
             subs.push(Subscription::every(Duration::from_secs(3), Msg::ClearToast));
         }
+        // Only while the mouse is resting on a word not yet asked about.
+        if self.hover_waiting() {
+            subs.push(Subscription::every(Duration::from_millis(60), Msg::HoverTick));
+        }
         subs
     }
 
@@ -545,7 +559,7 @@ impl App for NeoCode {
                 };
                 let mut doc = Document::new(&text);
                 doc.set_keymap(self.keymap);
-                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk, server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None });
+                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk, server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None, pointed: None, hover_for: None });
                 self.active = Some(self.tabs.len() - 1);
                 self.lsp_open(self.tabs.len() - 1);
             }
@@ -618,6 +632,8 @@ impl App for NeoCode {
             Msg::LspDirs(dirs) => self.servers_found(dirs),
             Msg::Lsp(name, launch, incoming) => self.lsp_incoming(name, launch, incoming),
             Msg::Ask(what) => self.ask(what),
+            Msg::Point(word) => self.point(word),
+            Msg::HoverTick => self.hover_rested(),
             Msg::PopupKey(key) => self.popup_key(key),
             Msg::Keys(i) => {
                 self.keymap = KEYMAPS.get(i).map_or(Keymap::Plain, |(k, _)| *k);
@@ -733,7 +749,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).on_point(Msg::Point).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1297,6 +1313,94 @@ mod tests {
         assert!(s.h.render(1.0) != plain);
         s.h.key(Key::Right, Modifiers::default());
         assert!(s.h.app().editor_popup(s.tab()).is_none(), "moving on dismisses it");
+    }
+
+    #[test]
+    fn resting_the_mouse_on_a_word_asks_about_it_and_shows_the_answer_there() {
+        let mut s = Served::new("lsp-mouse-hover", "pub fn one() {}\nfn two() { one() }\n");
+        s.sent();
+        let rested = |s: &mut Served| {
+            let i = s.h.app().active.unwrap();
+            let t = &mut s.h.app_mut().tabs[i];
+            t.pointed = t.pointed.map(|(p, _, asked)| (p, Instant::now() - NeoCode::REST * 2, asked));
+            s.h.app_mut().update(Msg::HoverTick);
+        };
+        // Just arrived: nothing is asked until it has stayed a moment.
+        s.h.app_mut().update(Msg::Point(Some(Pos::new(1, 11))));
+        assert!(s.h.app().hover_waiting());
+        s.h.app_mut().update(Msg::HoverTick);
+        assert!(!s.methods().contains(&"textDocument/hover".to_owned()), "not at once");
+        rested(&mut s);
+        let ask = s.request("textDocument/hover");
+        assert_eq!(ask["params"]["position"], json!({ "line": 1, "character": 11 }), "the word under the mouse, not the caret");
+        assert!(!s.h.app().hover_waiting(), "asked once, not on every tick");
+        let caret = s.tab().doc.cursor();
+        s.says(json!({ "id": ask["id"], "result": { "contents": "fn one()" } }));
+        assert_eq!(s.h.app().editor_popup(s.tab()), Some(EditorPopup::Text("fn one()".into())));
+        assert_eq!(s.h.app().editor_popup_at(s.tab()), Some(Pos::new(1, 11)), "shown at the word");
+        assert_eq!(s.tab().doc.cursor(), caret, "the caret stays where it was");
+        // Moving off the word takes it away.
+        s.h.app_mut().update(Msg::Point(None));
+        assert!(s.h.app().editor_popup(s.tab()).is_none());
+
+        // An answer that arrives after the mouse has moved on is dropped,
+        // and a spot with nothing to say is passed over quietly.
+        s.h.app_mut().update(Msg::Point(Some(Pos::new(0, 7))));
+        rested(&mut s);
+        let late = s.request("textDocument/hover");
+        s.h.app_mut().update(Msg::Point(Some(Pos::new(1, 3))));
+        s.says(json!({ "id": late["id"], "result": { "contents": "fn one()" } }));
+        assert!(s.h.app().editor_popup(s.tab()).is_none());
+        rested(&mut s);
+        let empty = s.request("textDocument/hover");
+        s.h.app_mut().toast = None;
+        s.says(json!({ "id": empty["id"], "result": null }));
+        assert!(s.h.app().editor_popup(s.tab()).is_none() && s.h.app().toast.is_none());
+
+        // A problem on the word shows at once, with the answer under it.
+        let uri = s.uri();
+        s.says(json!({ "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [{ "range": { "start": { "line": 1, "character": 11 }, "end": { "line": 1, "character": 14 } }, "severity": 1, "message": "mismatched types" }] } }));
+        s.h.app_mut().update(Msg::Point(Some(Pos::new(1, 11))));
+        rested(&mut s);
+        assert_eq!(s.h.app().editor_popup(s.tab()), Some(EditorPopup::Text("mismatched types".into())));
+        let ask = s.request("textDocument/hover");
+        s.says(json!({ "id": ask["id"], "result": { "contents": "fn one()" } }));
+        assert_eq!(s.h.app().editor_popup(s.tab()), Some(EditorPopup::Text("mismatched types\n\nfn one()".into())));
+        // Hover at the caret still works, and is shown at the caret.
+        s.h.app_mut().update(Msg::Point(None));
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Hover));
+        let ask = s.request("textDocument/hover");
+        s.says(json!({ "id": ask["id"], "result": { "contents": "at the caret" } }));
+        assert_eq!((s.h.app().editor_popup(s.tab()), s.h.app().editor_popup_at(s.tab())), (Some(EditorPopup::Text("at the caret".into())), None));
+    }
+
+    #[test]
+    fn the_editor_says_which_word_the_mouse_is_over() {
+        let mut s = Served::new("lsp-point", "pub fn one() {}\nfn two() { one() }\n");
+        s.h.render(1.0);
+        let pointed = |s: &Served| s.tab().pointed.map(|(p, _, _)| p);
+        // Find the text by sweeping across the first line: the words come
+        // up in order, each by where it starts, with gaps between them.
+        let mut seen = vec![];
+        let y = (60..200).step_by(2).map(|y| y as f32).find(|y| {
+            s.h.move_to(Point::new(700.0, *y));
+            s.h.move_to(Point::new(330.0, *y));
+            pointed(&s).is_some()
+        });
+        let y = y.expect("a line of text somewhere near the top");
+        for x in (250..700).step_by(2) {
+            s.h.move_to(Point::new(x as f32, y));
+            if seen.last() != Some(&pointed(&s)) {
+                seen.push(pointed(&s));
+            }
+        }
+        let at = |col| Some(Pos::new(0, col));
+        assert_eq!(seen, [None, at(0), None, at(4), None, at(7), None], "pub, fn and one; not the margin, the gaps, the brackets or past the end");
+        // Leaving the window is leaving the word.
+        s.h.move_to(Point::new(330.0, y));
+        assert!(pointed(&s).is_some());
+        s.h.event(neo::Event::PointerLeft);
+        assert_eq!(pointed(&s), None);
     }
 
     #[test]
