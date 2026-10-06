@@ -249,6 +249,9 @@ struct NeoCode {
     terminal_shown: bool,
     /// Raised to hand the keyboard back to the editor.
     editor_focus: u64,
+    /// Where jumps to definitions were made from, the latest last: the
+    /// tab and the place in it.
+    jumps: Vec<(String, Pos)>,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +284,8 @@ enum Msg {
     Point(Option<Pos>),
     /// A word was clicked with Command held: go to where it is defined.
     Jump,
+    /// Go back to where the last jump to a definition was made from.
+    Back,
     /// Open `settings.json` to edit.
     OpenSettings,
     /// Colour code by this scheme, counted in `Syntax::ALL`.
@@ -331,7 +336,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0 };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![] };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -372,7 +377,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0 }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![] }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -687,6 +692,7 @@ impl NeoCode {
                 }
                 self.keep(settings::KEYMAP, settings::keymap_name(self.keymap).into());
             }
+            Msg::Back => self.jump_back(),
             Msg::OpenSettings => self.open_settings(),
             Msg::Colours(i) => {
                 if let Some(syntax) = neo::Syntax::ALL.get(i) {
@@ -808,6 +814,7 @@ impl App for NeoCode {
             Menu::new("Go")
                 .push(MenuEntry::new("Show Hover", Msg::Ask(intel::Ask::Hover)).shortcut(Shortcut::command("i")).enabled(served))
                 .push(MenuEntry::new("Go to Definition", Msg::Ask(intel::Ask::Definition)).shortcut(Shortcut::command("g")).enabled(served))
+                .push(MenuEntry::new("Back", Msg::Back).shortcut(Shortcut::command("[")).enabled(!self.jumps.is_empty()))
                 .push(MenuEntry::new("Complete", Msg::Ask(intel::Ask::Complete)).shortcut(Shortcut::command(".")).enabled(served)),
             {
                 let (going, stopped) = (self.debug.as_ref().is_some_and(|d| !d.over()), self.debug.as_ref().is_some_and(|d| d.stopped()));
@@ -2123,6 +2130,48 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_in_another_package_opens_there_and_back_returns() {
+        let mut s = Served::new("lsp-far", "pub fn one() {}\nfn two() { helper() }\n");
+        // Another package, nowhere under the folder that is open.
+        let other = s.file.parent().unwrap().parent().unwrap().parent().unwrap().join(format!("far-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(other.join("src")).unwrap();
+        let lib = other.join("src/helpers.rs");
+        std::fs::write(&lib, "// helpers\n\npub fn helper() {}\npub fn deeper() {}\n").unwrap();
+        let lib = lib.canonicalize().unwrap();
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(1, 11), select: false }));
+        assert!(!s.h.app().menus()[2].entries.iter().any(|e| e.label == "Back" && e.message.is_some()), "nowhere to go back to yet");
+        s.sent();
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+        let ask = s.request("textDocument/definition");
+        s.says(json!({ "id": ask["id"], "result": [{ "uri": crate::lsp::client::uri(&lib), "range": { "start": { "line": 2, "character": 7 }, "end": { "line": 2, "character": 13 } } }] }));
+        // It opens beside the folder's own files, at the definition.
+        assert_eq!((s.tab().name.as_str(), s.tab().disk.clone(), s.tab().doc.cursor()), ("helpers.rs", Some(lib.clone()), Pos::new(2, 7)));
+        assert_eq!(s.h.app().tabs.len(), 2);
+        // The same server is told of it, so that hover and the next jump work there.
+        let opened = s.request("textDocument/didOpen");
+        assert_eq!(opened["params"]["textDocument"]["uri"], json!(crate::lsp::client::uri(&lib)));
+        assert_eq!(s.tab().server, Some("rust-analyzer"));
+        // On from there, within the other package: no second tab for the same file.
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+        let ask = s.request("textDocument/definition");
+        assert_eq!(ask["params"]["textDocument"]["uri"], json!(crate::lsp::client::uri(&lib)));
+        s.says(json!({ "id": ask["id"], "result": { "uri": crate::lsp::client::uri(&lib), "range": { "start": { "line": 3, "character": 7 }, "end": { "line": 3, "character": 13 } } } }));
+        assert_eq!((s.h.app().tabs.len(), s.tab().doc.cursor()), (2, Pos::new(3, 7)));
+        // Back retraces the jumps, one at a time, to where they began.
+        s.h.app_mut().update(Msg::Back);
+        assert_eq!((s.tab().name.as_str(), s.tab().doc.cursor()), ("helpers.rs", Pos::new(2, 7)));
+        s.h.app_mut().update(Msg::Back);
+        assert_eq!((s.tab().name.as_str(), s.tab().doc.cursor()), ("lib.rs", Pos::new(1, 11)));
+        s.h.app_mut().toast = None;
+        s.h.app_mut().update(Msg::Back);
+        assert_eq!(s.h.app().toast.as_deref(), Some("Nowhere to go back to."));
+        // A file from elsewhere is not one of this folder's to reopen next time.
+        assert!(!s.h.app().in_folder(&s.h.app().tabs[1]));
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
     fn a_function_with_arguments_asks_for_them_before_debugging() {
         let mut s = Served::new("debug-ask", "pub fn one() {}\n");
         let file = s.file.clone();
@@ -2253,7 +2302,7 @@ mod tests {
         let notes = crate::lsp::client::uri(&s.file.parent().unwrap().parent().unwrap().join("notes.md"));
         s.says(json!({ "id": ask["id"], "result": [{ "uri": notes, "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 7 } } }] }));
         assert_eq!((s.tab().name.as_str(), s.tab().doc.cursor()), ("notes.md", Pos::new(0, 2)));
-        // Nothing found, and somewhere outside the folder, both say so.
+        // Nothing found says so.
         s.h.app_mut().update(Msg::Select(0));
         s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
         let ask = s.request("textDocument/definition");
@@ -2261,8 +2310,9 @@ mod tests {
         assert_eq!(s.h.app().toast.as_deref(), Some("No definition found."));
         s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
         let ask = s.request("textDocument/definition");
+        // A file that is not there to open says where it was meant to be.
         s.says(json!({ "id": ask["id"], "result": { "uri": "file:///elsewhere/std.rs", "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } } } }));
-        assert!(s.h.app().toast.as_deref().unwrap().starts_with("That is defined outside this folder"));
+        assert!(s.h.app().toast.as_deref().unwrap().contains("/elsewhere/std.rs"));
     }
 
     #[test]
@@ -2522,6 +2572,22 @@ mod tests {
             }
             let shell = h.app().terminal.as_ref().unwrap();
             println!("terminal: running {}, in {}, error {:?}", shell.running(), shell.cwd.display(), shell.error);
+        }
+        // `NEO_LSP_DEF=line:col` (from one) asks where the word there is
+        // defined, goes there, and comes back.
+        if let Some((line, col)) = std::env::var("NEO_LSP_DEF").ok().and_then(|at| at.split_once(':').and_then(|(l, c)| Some((l.parse::<usize>().ok()?, c.parse::<usize>().ok()?)))) {
+            h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(line - 1, col - 1), select: false }));
+            h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+            for _ in 0..25 {
+                std::thread::sleep(Duration::from_millis(200));
+                h.advance(Duration::from_millis(200));
+            }
+            let t = h.app().active_tab().unwrap();
+            println!("definition: now in {:?} at line {}, column {}; server {:?}; message {:?}", t.disk, t.doc.cursor().line + 1, t.doc.cursor().col + 1, t.server, h.app().toast);
+            println!("    {}", t.doc.lines()[t.doc.cursor().line]);
+            h.app_mut().update(Msg::Back);
+            let t = h.app().active_tab().unwrap();
+            println!("back: {:?} at line {}", t.disk.as_ref().and_then(|d| d.file_name()), t.doc.cursor().line + 1);
         }
         // `NEO_LSP_HOVER=line:col` (from zero) rests the mouse there first.
         if let Some((line, col)) = std::env::var("NEO_LSP_HOVER").ok().and_then(|at| at.split_once(':').and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))) {

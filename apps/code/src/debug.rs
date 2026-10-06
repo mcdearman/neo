@@ -425,12 +425,10 @@ impl NeoCode {
 
     /// Opens a file with the caret on a line, wherever the file is.
     fn show_place(&mut self, path: &Path, line: usize) {
-        match self.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if p == path)) {
-            Some(i) => self.apply(Msg::Open(i)),
-            None if path.is_file() => self.open_file(path),
-            None => return,
+        if !self.show_file(path) {
+            return;
         }
-        if let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)).filter(|t| t.disk.as_deref() == Some(path)) {
+        if let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) {
             let line = line.min(t.doc.line_count().saturating_sub(1));
             t.doc.apply(Action::Click { pos: Pos::new(line, 0), select: false });
         }

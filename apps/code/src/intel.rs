@@ -291,16 +291,25 @@ impl NeoCode {
             }
             Event::Definition(None) => self.toast = Some("No definition found.".into()),
             Event::Definition(Some((path, place))) => {
-                let node = self.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if *p == path));
-                match node {
-                    Some(n) => {
-                        self.update(Msg::Open(n));
-                        if let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)).filter(|t| t.disk.as_deref() == Some(path.as_path())) {
-                            let pos = lsp::to_pos(t.doc.lines(), place, utf8);
-                            t.doc.apply(Action::Click { pos, select: false });
-                        }
+                // Where the jump is from, to come back to.
+                let from = self.active_tab().map(|t| (t.path.clone(), t.doc.cursor()));
+                // Wherever it is: in this folder, in another package, or
+                // in the language's own library.
+                if !self.show_file(&path) {
+                    self.toast = Some(format!("That is defined in {}, which could not be opened.", path.display()));
+                    return;
+                }
+                if let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) {
+                    let pos = lsp::to_pos(t.doc.lines(), place, utf8);
+                    t.doc.apply(Action::Click { pos, select: false });
+                }
+                let to = self.active_tab().map(|t| (t.path.clone(), t.doc.cursor()));
+                if let Some(from) = from.filter(|f| Some(f) != to.as_ref()) {
+                    self.jumps.push(from);
+                    // Nobody goes back further than this.
+                    if self.jumps.len() > 100 {
+                        self.jumps.remove(0);
                     }
-                    None => self.toast = Some(format!("That is defined outside this folder, in {}.", path.display())),
                 }
             }
             Event::Completions(items) => {
@@ -440,6 +449,56 @@ impl NeoCode {
                 }
             }
         }
+    }
+
+    /// Shows a file in a tab, wherever on disk it is: one of the folder's
+    /// own from the tree, any other opened beside them, with the same
+    /// language server looking after it so that hover and the next jump
+    /// work there too. False if it could not be opened.
+    pub(crate) fn show_file(&mut self, path: &Path) -> bool {
+        // Servers do not always spell a path the way the tree does.
+        let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let showing = |app: &Self| app.active_tab().is_some_and(|t| t.disk.as_deref() == Some(path) || t.disk.as_deref() == Some(real.as_path()));
+        if let Some(i) = self.tabs.iter().position(|t| t.disk.as_deref() == Some(path) || t.disk.as_deref() == Some(real.as_path())) {
+            self.active = Some(i);
+            return true;
+        }
+        match self.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if p == path || *p == real)) {
+            Some(n) => self.apply(Msg::Open(n)),
+            None if real.is_file() => {
+                self.open_file(&real);
+                if showing(self) {
+                    self.lsp_open(self.tabs.len() - 1);
+                }
+            }
+            None => {}
+        }
+        showing(self)
+    }
+
+    /// Goes back to where the last jump to a definition was made from.
+    pub(crate) fn jump_back(&mut self) {
+        while let Some((path, pos)) = self.jumps.pop() {
+            // A tab that has been closed since is opened again if it can be.
+            let open = self.tabs.iter().position(|t| t.path == path).or_else(|| {
+                let node = self.nodes.iter().position(|n| !n.dir && n.path == path);
+                match node {
+                    Some(n) => self.apply(Msg::Open(n)),
+                    None => self.open_file(Path::new(&path)),
+                }
+                self.tabs.iter().position(|t| t.path == path)
+            });
+            let Some(i) = open else { continue };
+            self.active = Some(i);
+            let t = &mut self.tabs[i];
+            let line = pos.line.min(t.doc.line_count().saturating_sub(1));
+            let col = pos.col.min(t.doc.lines()[line].len());
+            if t.doc.lines()[line].is_char_boundary(col) {
+                t.doc.apply(Action::Click { pos: Pos::new(line, col), select: false });
+            }
+            return;
+        }
+        self.toast = Some("Nowhere to go back to.".into());
     }
 
     /// The things the server offers to do, as rows of labels over lines.
