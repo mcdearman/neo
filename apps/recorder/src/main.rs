@@ -24,8 +24,8 @@
 //!
 //! While recording, the window shrinks to a small bar with the time, Pause
 //! and Stop, kept out of the recording where the system allows. Command+
-//! Shift+R on macOS, Ctrl+Shift+R elsewhere, brings up the area frame from
-//! anywhere and stops a recording. In Area mode the window becomes a hollow
+//! Shift+R on macOS, Ctrl+Shift+R elsewhere, brings up the window from
+//! anywhere, set to record the whole screen, and stops a recording. In Area mode the window becomes a hollow
 //! frame: drag and resize it over what you want, then press Record.
 
 // Release builds on Windows open no console window.
@@ -753,11 +753,11 @@ impl Recorder {
                 _ => {
                     self.shown = !self.shown;
                     if self.shown {
-                        // The shortcut goes straight to framing an area, the
-                        // quickest way to grab part of the screen. The other
-                        // modes are one click away in the frame's controls.
+                        // The shortcut comes up ready to record the whole
+                        // screen, the usual thing to want from a video. A
+                        // window or an area is one click away.
                         self.phase = Phase::Idle;
-                        self.mode = Mode::Area;
+                        self.mode = Mode::Screen;
                         self.intent = Intent::Record;
                         self.apply(Msg::Refresh);
                     }
@@ -924,8 +924,8 @@ fn mode_switch(mode: Mode) -> Element<Msg> {
 impl Recorder {
     fn shortcut_hint(&self) -> String {
         match &self.hotkey_error {
-            None if self.hotkeys.is_some() && capture::can_pick() => format!("{SHORTCUT} records an area. {SHOT_SHORTCUT} takes a screenshot: drag out an area, or press S for this window."),
-            None if self.hotkeys.is_some() => format!("{SHORTCUT} records an area; {SHOT_SHORTCUT} takes a screenshot."),
+            None if self.hotkeys.is_some() && capture::can_pick() => format!("{SHORTCUT} records the screen. {SHOT_SHORTCUT} takes a screenshot: drag out an area, or press S for this window."),
+            None if self.hotkeys.is_some() => format!("{SHORTCUT} records the screen; {SHOT_SHORTCUT} takes a screenshot."),
             Some(e) => format!("The {SHORTCUT} shortcut is unavailable: {e}"),
             None => String::new(),
         }
@@ -1375,8 +1375,12 @@ mod tests {
         assert!(!r.window_state().visible, "pressed while showing: hide");
         r.update(Msg::Hotkey);
         let s = r.window_state();
-        assert!(s.visible && s.bare && r.mode == Mode::Area, "pressed while hidden: show the area frame");
-        r.update(Msg::Mode(Mode::Screen));
+        assert!(s.visible && !s.bare && r.mode == Mode::Screen, "pressed while hidden: show the window, set to the whole screen");
+        // Whatever was chosen last time, the shortcut starts from the screen.
+        r.update(Msg::Mode(Mode::Area));
+        r.update(Msg::Hotkey);
+        r.update(Msg::Hotkey);
+        assert_eq!((r.mode, r.intent), (Mode::Screen, Intent::Record));
         r.update(Msg::Record);
         assert!(matches!(r.phase, Phase::Starting(Target::Screen)));
         r.update(Msg::Hotkey);
@@ -1563,12 +1567,12 @@ mod tests {
         r.phase = Phase::Recording;
         r.update(Msg::ScreenshotHotkey);
         assert_eq!(r.phase, Phase::Recording, "not while something is being recorded");
-        // The recording shortcut still frames an area to record.
+        // The recording shortcut still comes up ready to record the screen.
         let mut r = recorder();
         r.shown = false;
         r.update(Msg::Hotkey);
         let s = r.window_state();
-        assert!(s.visible && s.bare && r.mode == Mode::Area && r.intent == Intent::Record);
+        assert!(s.visible && !s.bare && r.mode == Mode::Screen && r.intent == Intent::Record);
     }
 
     #[test]
