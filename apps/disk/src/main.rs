@@ -5,21 +5,29 @@
 //! first, and a treemap in which each block's area is its size. Click
 //! either to go into a folder.
 //!
+//! What is found is kept, here and between runs, and brought up to date
+//! afterwards by reading only the folders that changed.
+//!
 //! A second tab lists the drives themselves, to mount, unmount, eject or
 //! format them. Formatting is offered for external drives only.
 //!
 //!     cargo run -p neo-disk
 //!     cargo run -p neo-disk -- ~/Downloads
 //!     cargo run -p neo-disk -- --snapshot target/snapshots
+//!     cargo run --release -p neo-disk -- --measure ~
 
+#[cfg(target_os = "macos")]
+mod bulk;
+mod changes;
 mod drives;
 mod scan;
+mod store;
 mod treemap;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use neo::prelude::*;
@@ -131,16 +139,83 @@ struct NeoDisk {
     scan_no: u64,
     started: Instant,
     took: Option<Duration>,
+    /// How the result showing was come by.
+    how: How,
+    /// The index behind the result showing, which the thread bringing it
+    /// up to date takes and puts back.
+    index: Arc<Mutex<Option<scan::Index>>>,
+    /// Where indexes are saved between runs, if they are.
+    cache: Option<PathBuf>,
     /// The scan showing was stopped before it finished.
     stopped: bool,
     proxy: Option<Proxy<Msg>>,
+}
+
+/// How a result was come by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum How {
+    /// Everything was read.
+    Measured,
+    /// What was known was brought up to date by reading this many folders.
+    Updated(usize),
+    /// Saved from before, this many seconds ago, and not yet checked.
+    Saved(u64),
+}
+
+/// One piece of measuring, done away from the window.
+struct Job {
+    no: u64,
+    target: PathBuf,
+    index: Arc<Mutex<Option<scan::Index>>>,
+    cache: Option<PathBuf>,
+    progress: Arc<Progress>,
+    /// Read everything, whatever is known already.
+    fully: bool,
+}
+
+impl Job {
+    fn run(self, send: &mut dyn FnMut(Msg)) {
+        let Job { no, target, index: slot, cache, progress, fully } = self;
+        let take = || slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // What is known: from this run, or saved by an earlier one, which
+        // is worth showing at once while it is checked.
+        let known = if fully {
+            take();
+            None
+        } else {
+            take().or_else(|| {
+                let saved = store::load(cache.as_deref()?, &target.canonicalize().unwrap_or_else(|_| target.clone()))?;
+                let age = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).saturating_sub(saved.taken);
+                send(Msg::Scanned(no, Arc::new(saved.entry()), How::Saved(age)));
+                Some(saved)
+            })
+        };
+        let (index, how) = match known {
+            Some(mut index) => {
+                let report = scan::refresh(&mut index, &progress);
+                (index, if report.full { How::Measured } else { How::Updated(report.reread) })
+            }
+            None => (scan::scan(&target, scan::Options::default(), &progress), How::Measured),
+        };
+        let entry = Arc::new(index.entry());
+        // Stopped part-way, it is good to look at but not to build on.
+        if !progress.cancel.load(Ordering::Relaxed) {
+            if let Some(dir) = &cache {
+                let _ = store::save(dir, &index);
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(index);
+        }
+        send(Msg::Scanned(no, entry, how));
+    }
 }
 
 #[derive(Clone, Debug)]
 enum Msg {
     Scan(PathBuf),
     ChooseFolder,
-    Scanned(u64, Arc<Entry>),
+    Scanned(u64, Arc<Entry>, How),
+    /// Measure from nothing, setting aside what is known.
+    RescanFully,
     /// Redraw the progress of a scan.
     Tick,
     /// Go into the showing folder's child at this index.
@@ -174,6 +249,17 @@ enum Msg {
 /// How many rows the list shows; a folder with more says how many more.
 const ROWS: usize = 200;
 
+/// How long ago, roughly.
+fn ago(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..60 => return "a moment ago".into(),
+        60..3600 => (secs / 60, "minute"),
+        3600..86_400 => (secs / 3600, "hour"),
+        _ => (secs / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 impl NeoDisk {
     fn new() -> Self {
         Self {
@@ -198,6 +284,10 @@ impl NeoDisk {
             scan_no: 0,
             started: Instant::now(),
             took: None,
+            how: How::Measured,
+            index: Arc::default(),
+            // Tests keep nothing on this computer unless they say where.
+            cache: (!cfg!(test)).then(store::folder),
             stopped: false,
             proxy: None,
         }
@@ -224,29 +314,47 @@ impl NeoDisk {
         self.map = Rc::new(self.current().map(treemap::items).unwrap_or_default());
     }
 
-    fn start(&mut self, target: PathBuf) {
+    /// The names of the folders gone into, from the top down.
+    fn names(&self) -> Vec<String> {
+        let mut names = vec![];
+        let mut at = self.tree.as_deref();
+        for i in &self.path {
+            at = at.and_then(|e| e.children.get(*i));
+            names.extend(at.map(|e| e.name.clone()));
+        }
+        names
+    }
+
+    /// Measures `target`. If it is the folder showing, what is known of it
+    /// is brought up to date, unless `fully` asks for everything again.
+    fn start(&mut self, target: PathBuf, fully: bool) {
         self.progress.cancel.store(true, Ordering::Relaxed);
         self.progress = Arc::default();
         self.scan_no += 1;
-        self.tree = None;
-        self.took = None;
         self.stopped = false;
         self.started = Instant::now();
-        self.show(vec![]);
+        if self.target.as_ref() != Some(&target) {
+            self.index = Arc::default();
+            self.tree = None;
+            self.took = None;
+            self.show(vec![]);
+        }
         self.target = Some(target.clone());
-        let (no, progress) = (self.scan_no, self.progress.clone());
+        let job = Job { no: self.scan_no, target, index: self.index.clone(), cache: self.cache.clone(), progress: self.progress.clone(), fully };
         match self.proxy.clone() {
             Some(proxy) => {
                 self.running = true;
                 std::thread::spawn(move || {
-                    let tree = scan::scan(&target, scan::Options::default(), &progress);
-                    proxy.send(Msg::Scanned(no, Arc::new(tree)));
+                    job.run(&mut |m| {
+                        proxy.send(m);
+                    })
                 });
             }
             // No event loop to report back to, as in tests: measure now.
             None => {
-                let tree = scan::scan(&target, scan::Options::default(), &progress);
-                self.update(Msg::Scanned(no, Arc::new(tree)));
+                let mut said = vec![];
+                job.run(&mut |m| said.push(m));
+                said.into_iter().for_each(|m| self.update(m));
             }
         }
     }
@@ -310,8 +418,16 @@ impl NeoDisk {
             .push(button("Show in Files").on_press(Msg::Reveal))
             .push(icon_button(icons::REFRESH_CW, 30.0).kind(ButtonKind::Ghost).on_press(Msg::Rescan));
         let mut note = format!("{} files", here.files);
-        if let Some(took) = self.took {
-            note.push_str(&format!("  ·  measured in {:.1} s", took.as_secs_f32()));
+        let took = self.took.map_or(0.0, |t| t.as_secs_f32());
+        match self.how {
+            How::Saved(age) => note.push_str(&format!("  ·  as it was {}", ago(age))),
+            How::Measured if self.took.is_some() => note.push_str(&format!("  ·  measured in {took:.1} s")),
+            How::Updated(0) => note.push_str(&format!("  ·  nothing has changed, checked in {took:.1} s")),
+            How::Updated(n) => note.push_str(&format!("  ·  brought up to date in {took:.1} s by reading {n} folder{} again", if n == 1 { "" } else { "s" })),
+            How::Measured => {}
+        }
+        if self.running {
+            note.push_str(&format!("  ·  checking for changes… {} files read", self.progress.files.load(Ordering::Relaxed)));
         }
         if self.stopped {
             note.push_str("  ·  stopped early, so this is not everything");
@@ -552,9 +668,14 @@ impl App for NeoDisk {
     }
 
     fn menus(&self) -> Vec<Menu<Msg>> {
-        let showing = self.tree.is_some() && !self.running;
+        let showing = self.tree.is_some();
         vec![
-            Menu::new("File").push(MenuEntry::new("Measure Folder…", Msg::ChooseFolder).shortcut(Shortcut::command("o"))).push(MenuEntry::new("Measure Again", Msg::Rescan).shortcut(Shortcut::command("r")).enabled(self.target.is_some() && !self.running)).separator().push(MenuEntry::new("Show in Files", Msg::Reveal).enabled(showing)),
+            Menu::new("File")
+                .push(MenuEntry::new("Measure Folder…", Msg::ChooseFolder).shortcut(Shortcut::command("o")))
+                .push(MenuEntry::new("Measure Again", Msg::Rescan).shortcut(Shortcut::command("r")).enabled(self.target.is_some() && !self.running))
+                .push(MenuEntry::new("Measure from Scratch", Msg::RescanFully).shortcut(Shortcut::command("r").shift()).enabled(self.target.is_some() && !self.running))
+                .separator()
+                .push(MenuEntry::new("Show in Files", Msg::Reveal).enabled(showing)),
             Menu::new("View").push(MenuEntry::new("Usage", Msg::Tab(Tab::Usage)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Drives", Msg::Tab(Tab::Drives)).shortcut(Shortcut::command("2"))).separator().push(MenuEntry::new("Look for Drives Again", Msg::FindDrives).enabled(self.tab == Tab::Drives && !self.listing)),
             Menu::new("Go").push(MenuEntry::new("Up", Msg::Up).shortcut(Shortcut { key: Key::Up, shift: false, alt: false }).enabled(showing && !self.path.is_empty())),
         ]
@@ -564,7 +685,7 @@ impl App for NeoDisk {
         self.proxy = Some(proxy);
         // A folder given on the command line was waiting for this.
         if let Some(target) = self.target.clone().filter(|_| self.tree.is_none()) {
-            self.start(target);
+            self.start(target, false);
         }
     }
 
@@ -580,7 +701,7 @@ impl App for NeoDisk {
         match m {
             Msg::Scan(target) => {
                 self.tab = Tab::Usage;
-                self.start(target);
+                self.start(target, false);
             }
             Msg::Tab(tab) => {
                 self.tab = tab;
@@ -652,17 +773,30 @@ impl App for NeoDisk {
             }
             Msg::ChooseFolder => {
                 if let Some(dir) = rfd::FileDialog::new().set_title("Measure Folder").pick_folder() {
-                    self.start(dir);
+                    self.start(dir, false);
                 }
             }
-            Msg::Scanned(no, tree) => {
+            Msg::Scanned(no, tree, how) => {
                 // A scan that was replaced by another has nothing to show.
                 if no == self.scan_no {
-                    self.stopped = self.progress.cancel.load(Ordering::Relaxed);
-                    self.running = false;
-                    self.took = Some(self.started.elapsed());
+                    // A saved result is shown while the checking goes on.
+                    if !matches!(how, How::Saved(_)) {
+                        self.stopped = self.progress.cancel.load(Ordering::Relaxed);
+                        self.running = false;
+                        self.took = Some(self.started.elapsed());
+                    }
+                    self.how = how;
+                    // Stay in the folder showing, as far down as it still goes.
+                    let names = self.names();
                     self.tree = Some(tree);
-                    self.show(vec![]);
+                    let mut path = vec![];
+                    let mut at = self.tree.as_deref();
+                    for name in names {
+                        let Some(i) = at.and_then(|e| e.children.iter().position(|c| c.dir && !c.group && c.name == name && !c.children.is_empty())) else { break };
+                        path.push(i);
+                        at = at.and_then(|e| e.children.get(i));
+                    }
+                    self.show(path);
                     // The disk may have changed while it was read.
                     self.disks = disks();
                 }
@@ -691,9 +825,14 @@ impl App for NeoDisk {
                     let _ = neo_desktop::fs::reveal(&path);
                 }
             }
-            Msg::Rescan => {
-                if let Some(target) = self.target.clone() {
-                    self.start(target);
+            Msg::Rescan | Msg::RescanFully => {
+                if let Some(target) = self.target.clone().filter(|_| !self.running) {
+                    if matches!(m, Msg::RescanFully) {
+                        self.tree = None;
+                        self.took = None;
+                        self.show(vec![]);
+                    }
+                    self.start(target, matches!(m, Msg::RescanFully));
                 }
             }
             Msg::Cancel => self.progress.cancel.store(true, Ordering::Relaxed),
@@ -716,7 +855,7 @@ impl NeoDisk {
     fn content(&self) -> Element<Msg> {
         let main = if self.tab == Tab::Drives {
             self.drives_view()
-        } else if self.running {
+        } else if self.running && self.tree.is_none() {
             self.scanning()
         } else {
             match self.current() {
@@ -732,6 +871,30 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--snapshot") {
         snapshots(PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "target/snapshots".into())));
+        return;
+    }
+    // Time a scan without opening a window: `neo-disk --measure ~/Downloads`.
+    if let Some(i) = args.iter().position(|a| a == "--measure") {
+        let root = PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| ".".into()));
+        let (progress, began) = (Progress::default(), Instant::now());
+        let mut index = scan::scan(&root, scan::Options::default(), &progress);
+        let tree = index.entry();
+        println!("{} files in {} folders, {}, in {:.2} s", tree.files, index.folders(), human_size(tree.size), began.elapsed().as_secs_f32());
+        // And again, reading only what has changed since.
+        let began = Instant::now();
+        let report = scan::refresh(&mut index, &Progress::default());
+        println!("brought up to date in {:.2} s: {}", began.elapsed().as_secs_f32(), if report.full { "everything read again".into() } else { format!("{} folders read again", report.reread) });
+        // And what keeping it between runs costs.
+        let dir = std::env::temp_dir().join(format!("neo-disk-measure-{}", std::process::id()));
+        let began = Instant::now();
+        if store::save(&dir, &index).is_ok() {
+            let size = std::fs::metadata(store::file(&dir, &index.root)).map_or(0, |m| m.len());
+            let saved = began.elapsed();
+            let began = Instant::now();
+            let back = store::load(&dir, &index.root);
+            println!("saved as {} in {:.2} s, read back in {:.2} s{}", human_size(size), saved.as_secs_f32(), began.elapsed().as_secs_f32(), if back.as_ref() == Some(&index) { "" } else { ", but not as it was saved" });
+        }
+        let _ = std::fs::remove_dir_all(dir);
         return;
     }
     let mut app = NeoDisk::new();
@@ -780,7 +943,7 @@ fn showing_sample() -> NeoDisk {
     const GB: u64 = 1_000_000_000;
     app.target = Some(PathBuf::from("/Users/sam"));
     app.scan_no = 1;
-    app.update(Msg::Scanned(1, Arc::new(sample())));
+    app.update(Msg::Scanned(1, Arc::new(sample()), How::Measured));
     app.took = Some(Duration::from_millis(8400));
     // After the result, which re-reads this computer's own disks.
     app.disks = vec![Disk { name: "Macintosh HD".into(), mount: "/".into(), total: 494 * GB, free: 59 * GB, removable: false }, Disk { name: "Backup".into(), mount: "/Volumes/Backup".into(), total: 2000 * GB, free: 1310 * GB, removable: true }];
@@ -906,15 +1069,64 @@ mod tests {
         assert!(here.size >= 3_400_000);
         assert_eq!(here.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["big", "note.txt"]);
         assert_eq!(app.title(), format!("{} · NeoDisk", root.display()));
-        // Measuring again starts over from the top.
+        // Measuring again stays in the folder showing, and reads little.
         app.update(Msg::Enter(0));
         app.update(Msg::Rescan);
+        assert_eq!(app.current().unwrap().name, "big");
+        assert!(matches!(app.how, How::Updated(_)), "{:?}", app.how);
+        // From scratch reads everything, and starts over from the top.
+        app.update(Msg::RescanFully);
         assert!(app.path.is_empty() && app.current().is_some());
+        assert_eq!(app.how, How::Measured);
         // A scan that another replaced is ignored when it reports.
         let stale = app.scan_no - 1;
-        app.update(Msg::Scanned(stale, Arc::new(Entry { name: "old".into(), ..Default::default() })));
+        app.update(Msg::Scanned(stale, Arc::new(Entry { name: "old".into(), ..Default::default() }), How::Measured));
         assert_ne!(app.current().unwrap().name, "old");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_result_is_saved_and_shown_again_next_time() {
+        let root = std::env::temp_dir().join(format!("neo-disk-saved-{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("neo-disk-saved-cache-{}", std::process::id()));
+        for dir in [&root, &cache] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::fs::create_dir_all(root.join("big")).unwrap();
+        std::fs::write(root.join("big/data.bin"), vec![1u8; 3_000_000]).unwrap();
+        let mut first = NeoDisk::new();
+        assert!(first.cache.is_none(), "tests keep nothing unless they say where");
+        first.cache = Some(cache.clone());
+        first.update(Msg::Scan(root.clone()));
+        assert_eq!(first.how, How::Measured);
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1, "the index was saved");
+        let size = first.current().unwrap().size;
+
+        // Another run: what was saved is found, and only checked.
+        let mut second = NeoDisk::new();
+        second.cache = Some(cache.clone());
+        let saved = store::load(&cache, &root.canonicalize().unwrap()).expect("an index to start from");
+        assert_eq!(saved.entry().size, size);
+        second.update(Msg::Scan(root.clone()));
+        assert!(matches!(second.how, How::Updated(_)), "brought up to date, not measured again: {:?}", second.how);
+        assert_eq!(second.current().unwrap().size, size);
+        // A saved result arriving is shown, with the checking still going on.
+        second.running = true;
+        let no = second.scan_no;
+        second.update(Msg::Scanned(no, Arc::new(saved.entry()), How::Saved(7200)));
+        assert!(second.running && second.current().is_some());
+        assert_eq!(ago(7200), "2 hours ago");
+        assert_eq!((ago(5), ago(60), ago(200_000)), ("a moment ago".into(), "1 minute ago".into(), "2 days ago".into()));
+        // A scan that was stopped is not saved over a whole one.
+        let before = std::fs::read(store::file(&cache, &root.canonicalize().unwrap())).unwrap();
+        second.running = false;
+        second.progress.cancel.store(true, Ordering::Relaxed);
+        let job = Job { no: 99, target: root.clone(), index: second.index.clone(), cache: Some(cache.clone()), progress: second.progress.clone(), fully: true };
+        job.run(&mut |_| {});
+        assert_eq!(std::fs::read(store::file(&cache, &root.canonicalize().unwrap())).unwrap(), before);
+        for dir in [&root, &cache] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -924,7 +1136,7 @@ mod tests {
         app.update(Msg::Cancel);
         assert!(app.progress.cancel.load(Ordering::Relaxed));
         let no = app.scan_no;
-        app.update(Msg::Scanned(no, Arc::new(sample())));
+        app.update(Msg::Scanned(no, Arc::new(sample()), How::Measured));
         assert!(app.stopped && !app.running && app.current().is_some());
     }
 

@@ -10,3 +10,7 @@ neo.workspace = true
 neo-desktop.workspace = true
 sysinfo = { version = "0.37", default-features = false, features = ["disk"] }
 rfd = "0.17.2"
+rayon = "1.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
