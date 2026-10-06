@@ -56,6 +56,8 @@ struct Proc {
     cpu: f32,
     memory: u64,
     virtual_memory: u64,
+    /// The part of `memory` that is in RAM right now.
+    resident: u64,
     threads: Option<u32>,
     /// Swapped-out bytes, on systems that report it cheaply for every process.
     swap: Option<u64>,
@@ -185,8 +187,11 @@ impl Monitor {
                 name: p.name().to_string_lossy().into_owned(),
                 user: p.user_id().and_then(|u| self.users.get_user_by_id(u)).map(|u| u.name().to_string()).unwrap_or_default(),
                 cpu: p.cpu_usage() / cores,
-                memory: p.memory(),
+                // The footprint where the system keeps one, as its own
+                // monitor shows; otherwise what is resident.
+                memory: quick.get(&p.pid().as_u32()).and_then(|q| q.footprint).unwrap_or(p.memory()),
                 virtual_memory: p.virtual_memory(),
+                resident: p.memory(),
                 threads: quick.get(&p.pid().as_u32()).and_then(|q| q.threads),
                 swap: quick.get(&p.pid().as_u32()).and_then(|q| q.swap),
             })

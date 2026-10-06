@@ -60,6 +60,11 @@ pub struct Quick {
     pub threads: Option<u32>,
     /// Swapped-out memory in bytes, where the system reports it cheaply.
     pub swap: Option<u64>,
+    /// All the memory the process is charged with, in bytes, counting what
+    /// has been compressed or swapped out as well as what is in RAM. Where
+    /// the system keeps this figure it is the one to show as "memory":
+    /// an idle process can have nearly everything outside RAM.
+    pub footprint: Option<u64>,
 }
 
 pub use imp::{quick, swap, threads};
@@ -79,7 +84,7 @@ mod imp {
         pids.iter()
             .filter_map(|&pid| {
                 let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-                Some((pid, Quick { threads: status_kb(&status, "Threads:").map(|n| n as u32), swap: status_kb(&status, "VmSwap:").map(|kb| kb * 1024) }))
+                Some((pid, Quick { threads: status_kb(&status, "Threads:").map(|n| n as u32), swap: status_kb(&status, "VmSwap:").map(|kb| kb * 1024), footprint: None }))
             })
             .collect()
     }
@@ -185,9 +190,22 @@ mod imp {
                 // SAFETY: the buffer is a zeroed proc_taskinfo of the size passed.
                 let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
                 let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast::<c_void>(), size) };
-                (n == size).then_some((pid, Quick { threads: Some(info.pti_threadnum as u32), swap: None }))
+                let threads = (n == size).then_some(info.pti_threadnum as u32);
+                let footprint = footprint(pid);
+                // Another user's process allows neither without permission.
+                (threads.is_some() || footprint.is_some()).then_some((pid, Quick { threads, swap: None, footprint }))
             })
             .collect()
+    }
+
+    /// The process's physical footprint: the figure Activity Monitor shows
+    /// as Memory. Unlike the resident size it includes memory the system
+    /// has compressed or swapped out.
+    pub fn footprint(pid: u32) -> Option<u64> {
+        // SAFETY: the buffer is a zeroed rusage_info_v2, which is what this flavour fills.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, (&raw mut info).cast::<libc::rusage_info_t>()) } == 0;
+        ok.then_some(info.ri_phys_footprint)
     }
 
     /// Bytes of the process's private memory held in the compressor or in
@@ -376,6 +394,35 @@ mod tests {
         assert_eq!(t.name, "tokio) worker (1)");
         assert_eq!(t.state, ThreadState::Waiting);
         assert_eq!(t.cpu_time, Duration::from_secs(3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_footprint_counts_memory_the_process_has_touched() {
+        let pid = std::process::id();
+        let before = imp::footprint(pid).expect("a process can read its own footprint");
+        assert!(before > 1 << 20, "more than a megabyte, got {before}");
+        // Touch every page of 64 MB so it is really the process's own.
+        let mut block = vec![0u8; 64 << 20];
+        for page in block.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        let after = imp::footprint(pid).unwrap();
+        assert!(after >= before + (48 << 20), "grew by about the block: {} MB to {} MB", before >> 20, after >> 20);
+        assert_eq!(quick(&[pid])[&pid].footprint.map(|f| f >> 24), Some(after >> 24), "and the per-sample reading carries it");
+        std::hint::black_box(&block);
+        // A process that does not exist has none.
+        assert_eq!(imp::footprint(u32::MAX - 7), None);
+    }
+
+    /// For checking by hand against `footprint <pid>` or Activity Monitor:
+    /// `NEO_PID=<pid> cargo test -p neo-monitor -- --ignored --nocapture prints_a_footprint`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn prints_a_footprint() {
+        let pid: u32 = std::env::var("NEO_PID").expect("set NEO_PID").parse().unwrap();
+        println!("footprint of {pid}: {:?} MB", imp::footprint(pid).map(|f| f as f64 / 1048576.0));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
