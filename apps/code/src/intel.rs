@@ -499,7 +499,16 @@ impl NeoCode {
 
     pub(crate) fn editor_popup(&self, t: &Tab) -> Option<EditorPopup> {
         match t.popup.as_ref()? {
-            Popup::Hover(text, _) => Some(EditorPopup::Text(text.clone())),
+            Popup::Hover(text, _) => {
+                let lines = lsp::hover_lines(text);
+                // Code is coloured as the language its fence names, or as
+                // the file's own where it names none or one not known.
+                Some(if lines.iter().all(|l| l.1.is_none()) {
+                    EditorPopup::Text(lines.into_iter().map(|l| l.0).collect::<Vec<_>>().join("\n"))
+                } else {
+                    EditorPopup::Rich(lines.into_iter().map(|(text, code)| PopupLine { text, code: code.map(|name| Language::from_name(&name).unwrap_or(t.language)) }).collect())
+                })
+            }
             Popup::Complete { all, selected } => {
                 let fits = matching(all, Self::typed_word(t));
                 (!fits.is_empty()).then(|| EditorPopup::List { items: fits.iter().map(|c| (c.label.clone(), c.detail.clone())).collect(), selected: (*selected).min(fits.len() - 1) })

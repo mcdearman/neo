@@ -69,6 +69,32 @@ impl Language {
         }
     }
 
+    /// The language a name stands for, as written after the opening of a
+    /// fenced block of code: `rust`, `py`, `c++`. `None` if it is not known.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        let known = match name.as_str() {
+            "c++" | "cxx" => Language::Cpp,
+            "c#" | "csharp" => Language::CSharp,
+            "golang" => Language::Go,
+            "haskell" => Language::Haskell,
+            "javascript" | "node" => Language::JavaScript,
+            "koka" => Language::Koka,
+            "kotlin" => Language::Kotlin,
+            "markdown" => Language::Markdown,
+            "meadow" => Language::Meadow,
+            "ocaml" => Language::OCaml,
+            "python" | "python3" => Language::Python,
+            "ruby" => Language::Ruby,
+            "rust" => Language::Rust,
+            "shell" | "console" => Language::Shell,
+            "typescript" => Language::TypeScript,
+            // Most other names are the file extension too.
+            other => Self::from_path(&format!("x.{other}")),
+        };
+        (known != Language::Plain).then_some(known)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Language::Plain => "Plain Text",
@@ -793,6 +819,15 @@ mod tests {
             assert_eq!(Language::from_path(path), lang, "{path}");
             assert_eq!(lang.name(), name);
         }
+    }
+
+    #[test]
+    fn a_fence_names_its_language_by_name_or_extension() {
+        for (name, lang) in [("rust", Language::Rust), ("rs", Language::Rust), ("Python", Language::Python), ("py", Language::Python), ("c++", Language::Cpp), ("meadow", Language::Meadow), ("mw", Language::Meadow), ("haskell", Language::Haskell), ("ts", Language::TypeScript), (" go ", Language::Go)] {
+            assert_eq!(Language::from_name(name), Some(lang), "{name}");
+        }
+        assert_eq!(Language::from_name(""), None);
+        assert_eq!(Language::from_name("text"), None);
     }
 
     #[test]

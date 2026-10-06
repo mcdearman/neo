@@ -42,6 +42,7 @@ pub struct TextEditor<M> {
     popup: Option<EditorPopup>,
     popup_at: Option<Pos>,
     on_point: Option<Box<dyn Fn(Option<Pos>) -> M>>,
+    on_jump: Option<Box<dyn Fn(Pos) -> M>>,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
     /// The popup's rows as laid out, and the first list item among them.
     popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
@@ -78,6 +79,7 @@ impl<M> TextEditor<M> {
             popup: None,
             popup_at: None,
             on_point: None,
+            on_jump: None,
             on_popup_key: None,
             popup_rows: vec![],
             popup_first: 0,
@@ -139,6 +141,14 @@ impl<M> TextEditor<M> {
     /// where that word starts, and with `None` when it is over no word.
     pub fn on_point(mut self, f: impl Fn(Option<Pos>) -> M + 'static) -> Self {
         self.on_point = Some(Box::new(f));
+        self
+    }
+
+    /// Called when a word is clicked with Command (Ctrl elsewhere) held,
+    /// after the caret has moved there: the usual way to ask where
+    /// something is defined.
+    pub fn on_jump(mut self, f: impl Fn(Pos) -> M + 'static) -> Self {
+        self.on_jump = Some(Box::new(f));
         self
     }
 
@@ -208,9 +218,19 @@ pub struct EditorToken {
 pub enum EditorPopup {
     /// A note about what is under the caret.
     Text(String),
+    /// A note in lines, some of them code to be coloured as code.
+    Rich(Vec<PopupLine>),
     /// Choices, each with an optional detail in a quieter colour, and which
     /// one is picked.
     List { items: Vec<(String, Option<String>)>, selected: usize },
+}
+
+/// One line of a popup's note.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PopupLine {
+    pub text: String,
+    /// The language to colour it as, if it is code.
+    pub code: Option<Language>,
 }
 
 /// A key the editor hands over while a popup is showing, instead of
@@ -345,6 +365,29 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 for line in text.lines().take(POPUP_LINES) {
                     let line: String = line.chars().take(100).collect();
                     self.popup_rows.push((cx.text().layout(&line, &style, None), None));
+                }
+            }
+            Some(EditorPopup::Rich(lines)) => {
+                let colors = {
+                    let theme = *cx.theme();
+                    SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent)
+                };
+                // Carried from line to line, for comments that span them;
+                // a line of prose between two pieces of code ends one.
+                let mut in_comment = false;
+                for line in lines.iter().take(POPUP_LINES) {
+                    let text: String = line.text.chars().take(100).collect();
+                    let layout = match line.code {
+                        Some(language) => {
+                            let spans: Vec<(&str, Option<Color>)> = highlight(language, &text, &mut in_comment).into_iter().map(|(a, b, k)| (&text[a..b], colors.color(k))).collect();
+                            if spans.is_empty() { cx.text().layout(&text, &style, None) } else { cx.text().layout_spans(&spans, &style, None) }
+                        }
+                        None => {
+                            in_comment = false;
+                            cx.text().layout(&text, &style, None)
+                        }
+                    };
+                    self.popup_rows.push((layout, None));
                 }
             }
             Some(EditorPopup::List { items, selected }) => {
@@ -697,9 +740,18 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             }
             Event::PointerMoved { pos } => {
                 let dragging = cx.state::<EditorState>().dragging;
-                self.point(cx, if dragging { None } else { self.word_at(b, scroll, *pos) });
+                let word = if dragging { None } else { self.word_at(b, scroll, *pos) };
+                self.point(cx, word);
                 if b.contains(*pos) {
-                    cx.set_cursor(if pos.x > b.x + self.gutter_w { CursorIcon::Text } else { CursorIcon::Default });
+                    // With Command held, a word is somewhere to go.
+                    let jump = word.is_some() && self.on_jump.is_some() && cx.modifiers().command();
+                    cx.set_cursor(if jump {
+                        CursorIcon::Pointer
+                    } else if pos.x > b.x + self.gutter_w {
+                        CursorIcon::Text
+                    } else {
+                        CursorIcon::Default
+                    });
                 }
                 if dragging {
                     // Scroll when dragging past the top or bottom edge.
@@ -722,6 +774,11 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 }
                 cx.request_focus();
                 let p = self.pos_at(b, scroll, *pos);
+                if let (Some(on_jump), true, Some(_)) = (&self.on_jump, cx.modifiers().command(), self.word_at(b, scroll, *pos)) {
+                    send(cx, Action::Click { pos: p, select: false });
+                    cx.emit(on_jump(p));
+                    return Status::Captured;
+                }
                 let now = Instant::now();
                 let shift = cx.modifiers().shift;
                 let double = {

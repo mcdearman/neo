@@ -31,7 +31,7 @@ pub use slider::{slider, Slider};
 pub use divider::Divider;
 pub use style::Tone;
 pub use text::{text, Text};
-pub use text_editor::{text_editor, EditorMark, EditorPopup, EditorToken, PopupKey, TextEditor};
+pub use text_editor::{text_editor, EditorMark, EditorPopup, EditorToken, PopupKey, PopupLine, TextEditor};
 pub use text_input::{text_input, TextInput};
 pub use toggle::{checkbox, toggle, Checkbox, Toggle};
 

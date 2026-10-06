@@ -246,6 +246,8 @@ enum Msg {
     Ask(intel::Ask),
     /// The mouse is over the word starting here, or over none.
     Point(Option<Pos>),
+    /// A word was clicked with Command held: go to where it is defined.
+    Jump,
     /// See whether the mouse has rested on a word long enough.
     HoverTick,
     PopupKey(PopupKey),
@@ -634,6 +636,7 @@ impl App for NeoCode {
             Msg::Ask(what) => self.ask(what),
             Msg::Point(word) => self.point(word),
             Msg::HoverTick => self.hover_rested(),
+            Msg::Jump => self.ask(intel::Ask::Definition),
             Msg::PopupKey(key) => self.popup_key(key),
             Msg::Keys(i) => {
                 self.keymap = KEYMAPS.get(i).map_or(Keymap::Plain, |(k, _)| *k);
@@ -749,7 +752,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).on_point(Msg::Point).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1404,6 +1407,60 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_word_with_command_held_goes_to_its_definition() {
+        let mut s = Served::new("lsp-jump", "pub fn one() {}\nfn two() { one() }\n");
+        s.h.render(1.0);
+        // Find `one` on the second line with the mouse, as the hover test does.
+        let pointed = |s: &Served| s.tab().pointed.map(|(p, _, _)| p);
+        let spot = (60..240).step_by(2).flat_map(|y| (250..700).step_by(4).map(move |x| Point::new(x as f32, y as f32))).find(|p| {
+            s.h.move_to(*p);
+            pointed(&s) == Some(Pos::new(1, 11))
+        });
+        let spot = spot.expect("the word on screen");
+        // A plain click only moves the caret.
+        s.sent();
+        s.h.click(spot);
+        assert_eq!(s.tab().doc.cursor().line, 1);
+        assert!(!s.methods().contains(&"textDocument/definition".to_owned()));
+        // With the key held it asks, about the place clicked.
+        s.h.set_modifiers(Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() });
+        s.h.move_to(spot);
+        assert_eq!(s.h.cursor(), neo::CursorIcon::Pointer, "the word looks like somewhere to go");
+        s.h.click(spot);
+        let ask = s.request("textDocument/definition");
+        assert_eq!(ask["params"]["position"]["line"], 1);
+        let col = ask["params"]["position"]["character"].as_u64().unwrap();
+        assert!((11..=14).contains(&col), "inside `one`: {col}");
+        let uri = s.uri();
+        s.says(json!({ "id": ask["id"], "result": { "uri": uri, "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 10 } } } }));
+        assert_eq!(s.tab().doc.cursor(), Pos::new(0, 7), "the caret is at the definition");
+    }
+
+    #[test]
+    fn code_in_a_hover_is_coloured_as_code() {
+        let mut s = Served::new("lsp-hover-colour", "pub fn one() {}\n");
+        let hover = |s: &mut Served, contents: Value| {
+            s.h.app_mut().update(Msg::Ask(intel::Ask::Hover));
+            let ask = s.request("textDocument/hover");
+            s.says(json!({ "id": ask["id"], "result": { "contents": contents } }));
+            s.h.app().editor_popup(s.tab())
+        };
+        let line = |text: &str, code| PopupLine { text: text.into(), code };
+        // A fence names its language; prose around it stays prose.
+        let rich = hover(&mut s, json!({ "kind": "markdown", "value": "```python\ndef one(): pass\n```\n\nReturns **one**." }));
+        assert_eq!(rich, Some(EditorPopup::Rich(vec![line("def one(): pass", Some(Language::Python)), line("", None), line("Returns one.", None)])));
+        // No language named, an unknown one, or plain text: the file's own.
+        for contents in [json!({ "kind": "markdown", "value": "```\nfn one()\n```" }), json!({ "kind": "markdown", "value": "```nonsense\nfn one()\n```" }), json!({ "kind": "plaintext", "value": "fn one()" }), json!({ "language": "rust", "value": "fn one()" })] {
+            assert_eq!(hover(&mut s, contents.clone()), Some(EditorPopup::Rich(vec![line("fn one()", Some(Language::Rust))])), "{contents}");
+        }
+        // The colours show: the same words as prose look different.
+        let coloured = s.h.render(1.0);
+        hover(&mut s, json!("fn one()"));
+        assert_eq!(s.h.app().editor_popup(s.tab()), Some(EditorPopup::Text("fn one()".into())));
+        assert!(s.h.render(1.0) != coloured);
+    }
+
+    #[test]
     fn go_to_definition_opens_the_file_and_moves_the_caret() {
         let mut s = Served::new("lsp-definition", "pub fn one() {}\n");
         s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
@@ -1589,6 +1646,17 @@ mod tests {
             if h.app().toast.is_some() {
                 println!("        message: {}", h.app_mut().toast.take().unwrap());
             }
+        }
+        // `NEO_LSP_HOVER=line:col` (from zero) rests the mouse there first.
+        if let Some((line, col)) = std::env::var("NEO_LSP_HOVER").ok().and_then(|at| at.split_once(':').and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))) {
+            h.app_mut().update(Msg::Point(Some(Pos::new(line, col))));
+            std::thread::sleep(NeoCode::REST);
+            h.app_mut().update(Msg::HoverTick);
+            for _ in 0..25 {
+                std::thread::sleep(Duration::from_millis(200));
+                h.advance(Duration::from_millis(200));
+            }
+            println!("hover: {:?}", h.app().active_tab().and_then(|t| h.app().editor_popup(t)));
         }
         if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
             h.app_mut().toast = None;

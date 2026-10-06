@@ -267,43 +267,63 @@ pub fn plain_snippet(s: &str) -> String {
     out
 }
 
-/// Hover contents in any of the shapes servers send, as text.
+/// Hover contents in any of the shapes servers send, as Markdown. Code
+/// that came marked as code is put in a fence naming its language, and
+/// plain text in a bare fence, which stands for the file's own language:
+/// from a language server it is nearly always a signature or a type.
 fn hover_text(contents: &Value) -> Option<String> {
-    let one = |v: &Value| v.as_str().map(str::to_owned).or_else(|| v["value"].as_str().map(str::to_owned));
+    let one = |v: &Value| -> Option<String> {
+        if let Some(text) = v.as_str() {
+            return Some(text.to_owned());
+        }
+        let value = v["value"].as_str()?;
+        Some(match (v["language"].as_str(), v["kind"].as_str()) {
+            (Some(language), _) => format!("```{language}\n{value}\n```"),
+            (None, Some("plaintext")) => format!("```\n{value}\n```"),
+            _ => value.to_owned(),
+        })
+    };
     let text = match contents {
         Value::Array(parts) => parts.iter().filter_map(one).collect::<Vec<_>>().join("\n\n"),
         other => one(other)?,
     };
-    let text = plain_markdown(&text);
-    (!text.is_empty()).then_some(text)
+    (!hover_lines(&text).is_empty()).then(|| text.trim().to_owned())
 }
 
-/// Markdown as plain text, for a popup that shows no formatting: code
-/// fences and rules go, emphasis marks and backticks are removed, and runs
-/// of blank lines become one.
-pub fn plain_markdown(text: &str) -> String {
-    let mut out: Vec<String> = vec![];
-    let mut in_code = false;
+/// Markdown as lines for a popup that shows no formatting, each with the
+/// language named by the fence it was in, if it was in one (empty for a
+/// fence that names none). Fences and rules go, emphasis marks and
+/// backticks are removed, and runs of blank lines become one.
+pub fn hover_lines(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = vec![];
+    let mut code: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
+        if let Some(info) = trimmed.strip_prefix("```") {
+            // The language is the first word; some add options after it.
+            code = if code.is_some() { None } else { Some(info.split(|c: char| c.is_whitespace() || c == ',' || c == '{').next().unwrap_or_default().to_ascii_lowercase()) };
             continue;
         }
-        if !in_code && (trimmed == "---" || trimmed == "***") {
+        if code.is_none() && (trimmed == "---" || trimmed == "***") {
             continue;
         }
         // Inside a fence the text is code, and is kept as written.
-        let line = if in_code { line.to_owned() } else { line.replace("**", "").replace("__", "").replace('`', "").trim_start_matches('#').trim_start().to_owned() };
-        if line.trim().is_empty() && out.last().is_none_or(|l| l.trim().is_empty()) {
+        let line = if code.is_some() { line.to_owned() } else { line.replace("**", "").replace("__", "").replace('`', "").trim_start_matches('#').trim_start().to_owned() };
+        if line.trim().is_empty() && out.last().is_none_or(|l| l.0.trim().is_empty()) {
             continue;
         }
-        out.push(line);
+        out.push((line, code.clone()));
     }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
+    while out.last().is_some_and(|l| l.0.trim().is_empty()) {
         out.pop();
     }
-    out.join("\n")
+    out
+}
+
+/// Markdown as plain text: [`hover_lines`] without saying which are code.
+#[cfg(test)]
+pub fn plain_markdown(text: &str) -> String {
+    hover_lines(text).into_iter().map(|l| l.0).collect::<Vec<_>>().join("\n")
 }
 
 impl Client {
@@ -777,8 +797,11 @@ mod tests {
             c.handle(&json!({ "id": sent[0]["id"], "result": { "contents": contents } }))
         };
         assert_eq!(ask(json!("plain")), [Event::Hover(Some("plain".into()))]);
-        assert_eq!(ask(json!({ "kind": "markdown", "value": "  **bold**\n" })), [Event::Hover(Some("bold".into()))]);
-        assert_eq!(ask(json!([{ "language": "rust", "value": "fn f()" }, "docs"])), [Event::Hover(Some("fn f()\n\ndocs".into()))]);
+        // Kept as Markdown, so whoever shows it knows which lines are code.
+        assert_eq!(ask(json!({ "kind": "markdown", "value": "  **bold**\n" })), [Event::Hover(Some("**bold**".into()))]);
+        assert_eq!(ask(json!([{ "language": "rust", "value": "fn f()" }, "docs"])), [Event::Hover(Some("```rust\nfn f()\n```\n\ndocs".into()))]);
+        assert_eq!(ask(json!({ "kind": "plaintext", "value": "one : Int" })), [Event::Hover(Some("```\none : Int\n```".into()))], "plain text is taken for code in the file's language");
+        assert_eq!(ask(json!({ "kind": "markdown", "value": "```rust\n```\n---\n" })), [Event::Hover(None)], "nothing but marks is nothing");
         assert_eq!(ask(json!("")), [Event::Hover(None)]);
         let (mut c, sink) = ready(json!({}));
         c.hover(Path::new("/work/demo/a.rs"), (0, 0));
@@ -791,6 +814,12 @@ mod tests {
         // What rust-analyzer sends for a function: its crate, a rule, its signature, its docs.
         let hover = "```rust\nprobe\n```\n\n```rust\nfn answer() -> u32\n```\n\n---\n\nThe **answer**, as a `u32`.\n\n\n# Examples\n";
         assert_eq!(plain_markdown(hover), "probe\n\nfn answer() -> u32\n\nThe answer, as a u32.\n\nExamples");
+        let lines = hover_lines(hover);
+        let code: Vec<(&str, Option<&str>)> = lines.iter().map(|(text, code)| (text.as_str(), code.as_deref())).collect();
+        assert_eq!(code[..4], [("probe", Some("rust")), ("", None), ("fn answer() -> u32", Some("rust")), ("", None)]);
+        assert_eq!(code[4], ("The answer, as a u32.", None), "prose is not code");
+        assert_eq!(hover_lines("```Python {.numberLines}\nx = 1\n```")[0], ("x = 1".into(), Some("python".into())));
+        assert_eq!(hover_lines("```\nx : Int\n```")[0].1.as_deref(), Some(""), "a fence that names no language");
         assert_eq!(plain_markdown("```\nlet a = `b` ** 2;\n```"), "let a = `b` ** 2;", "code is kept as written");
         assert_eq!(plain_markdown("\n\n"), "");
     }
