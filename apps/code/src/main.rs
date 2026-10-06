@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 
 mod dap;
 mod debug;
+mod git;
 mod intel;
 mod lsp;
 mod runner;
 mod settings;
+mod side;
 
 use neo::prelude::*;
 use neo::{Color, Key, KeyEvent, Proxy, Size};
@@ -252,6 +254,10 @@ struct NeoCode {
     /// Where jumps to definitions were made from, the latest last: the
     /// tab and the place in it.
     jumps: Vec<(String, Pos)>,
+    /// The page of the side pane, and whether the pane is showing.
+    page: side::Page,
+    side_shown: bool,
+    source: side::Source,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +290,15 @@ enum Msg {
     Point(Option<Pos>),
     /// A word was clicked with Command held: go to where it is defined.
     Jump,
+    /// Show this page of the side pane, or put the pane away if it is showing.
+    Page(side::Page),
+    /// Show the side pane, or put it away.
+    ToggleSide,
+    Git(side::GitDo),
+    GitRead(u64, Option<PathBuf>, Result<git::Status, String>),
+    GitDone(side::GitDo, Result<String, String>),
+    GitMessage(String),
+    GitOpen(String),
     /// Go back to where the last jump to a definition was made from.
     Back,
     /// Open `settings.json` to edit.
@@ -336,7 +351,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![] };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -377,7 +392,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![] }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -460,6 +475,10 @@ impl NeoCode {
             run.stop();
         }
         self.end_debugging();
+        self.source = Default::default();
+        if self.page == side::Page::SourceControl {
+            self.git_refresh();
+        }
         // The shell was in the old folder.
         self.terminal = None;
         self.terminal_shown = false;
@@ -692,6 +711,13 @@ impl NeoCode {
                 }
                 self.keep(settings::KEYMAP, settings::keymap_name(self.keymap).into());
             }
+            Msg::Page(page) => self.show_page(page),
+            Msg::ToggleSide => self.side_shown = !self.side_shown,
+            Msg::Git(what) => self.git_do(what),
+            Msg::GitRead(reading, top, status) => self.git_read(reading, top, status),
+            Msg::GitDone(what, result) => self.git_done(what, result),
+            Msg::GitMessage(message) => self.source.message = message,
+            Msg::GitOpen(path) => self.git_open(&path),
             Msg::Back => self.jump_back(),
             Msg::OpenSettings => self.open_settings(),
             Msg::Colours(i) => {
@@ -717,6 +743,10 @@ impl NeoCode {
                             self.load_settings();
                         }
                         self.save_workspace();
+                        // The list of changes follows what is on disk.
+                        if self.source.status.is_some() {
+                            self.git_refresh();
+                        }
                         if let Some(i) = self.active {
                             self.lsp_saved(i);
                         }
@@ -829,7 +859,7 @@ impl App for NeoCode {
                     .separator()
                     .push(MenuEntry::new("Toggle Breakpoint  (F9)", Msg::Margin(self.active_tab().map_or(0, |t| t.doc.cursor().line))).enabled(file_open))
             },
-            keys.fold(Menu::new("View").push(MenuEntry::new(if self.terminal_shown { "Hide Terminal  (Ctrl+Tab)" } else { "Terminal  (Ctrl+Tab)" }, Msg::ToggleTerminal)).push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
+            keys.fold(Menu::new("View").push(MenuEntry::new(if self.side_shown { "Hide Side Pane" } else { "Show Side Pane" }, Msg::ToggleSide).shortcut(Shortcut::command("b"))).push(MenuEntry::new("Explorer", Msg::Page(side::Page::Explorer)).shortcut(Shortcut::command("e").shift())).push(MenuEntry::new("Source Control", Msg::Page(side::Page::SourceControl)).shortcut(Shortcut::command("g").shift())).separator().push(MenuEntry::new(if self.terminal_shown { "Hide Terminal  (Ctrl+Tab)" } else { "Terminal  (Ctrl+Tab)" }, Msg::ToggleTerminal)).push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
         ]
     }
 
@@ -881,7 +911,17 @@ impl NeoCode {
     fn content(&self) -> Element<Msg> {
         // Edge to edge, as in most code editors: the explorer, the editor
         // under a thin strip of tabs, and a thin status bar.
-        let body = row().width(Length::Fill).height(Length::Fill).push(self.sidebar()).push(Divider::vertical()).push(self.main());
+        // The strip of pages, the page showing if the pane is out, and the editor.
+        let mut body = row().width(Length::Fill).height(Length::Fill).push(self.activity_bar()).push(Divider::vertical());
+        if self.side_shown {
+            body = body
+                .push(match self.page {
+                    side::Page::Explorer => self.sidebar(),
+                    side::Page::SourceControl => self.source_page(),
+                })
+                .push(Divider::vertical());
+        }
+        let body = body.push(self.main());
         let all = column().width(Length::Fill).height(Length::Fill).push(body).push(Divider::horizontal()).push(self.status_bar());
         mouse_area(all).on_drop(Msg::Dropped).into()
     }
@@ -930,7 +970,8 @@ impl NeoCode {
         // The card fill, which is translucent on a glass window, so what is
         // behind the window still shows through the editor, blurred.
         let surface = self.theme(if self.is_dark() { Scheme::Dark } else { Scheme::Light }).paint(Surface::Card).fill;
-        let mut tabs = row().spacing(2.0).align(Align::Center);
+        // At the top, before the tabs: the side pane's own on and off.
+        let mut tabs = row().spacing(2.0).align(Align::Center).push(icon_button(if self.side_shown { icons::PANEL_LEFT_CLOSE } else { icons::PANEL_LEFT_OPEN }, 24.0).kind(ButtonKind::Ghost).on_press(Msg::ToggleSide)).push(Space::new(4.0, 0.0));
         for (i, t) in self.tabs.iter().enumerate() {
             let active = self.active == Some(i);
             let label = row()
@@ -1789,12 +1830,12 @@ mod tests {
         // up in order, each by where it starts, with gaps between them.
         let mut seen = vec![];
         let y = (60..200).step_by(2).map(|y| y as f32).find(|y| {
-            s.h.move_to(Point::new(700.0, *y));
-            s.h.move_to(Point::new(330.0, *y));
+            s.h.move_to(Point::new(760.0, *y));
+            s.h.move_to(Point::new(380.0, *y));
             pointed(&s).is_some()
         });
         let y = y.expect("a line of text somewhere near the top");
-        for x in (250..700).step_by(2) {
+        for x in (300..760).step_by(2) {
             s.h.move_to(Point::new(x as f32, y));
             if seen.last() != Some(&pointed(&s)) {
                 seen.push(pointed(&s));
@@ -1803,7 +1844,7 @@ mod tests {
         let at = |col| Some(Pos::new(0, col));
         assert_eq!(seen, [None, at(0), None, at(4), None, at(7), None], "pub, fn and one; not the margin, the gaps, the brackets or past the end");
         // Leaving the window is leaving the word.
-        s.h.move_to(Point::new(330.0, y));
+        s.h.move_to(Point::new(380.0, y));
         assert!(pointed(&s).is_some());
         s.h.event(neo::Event::PointerLeft);
         assert_eq!(pointed(&s), None);
@@ -2169,6 +2210,102 @@ mod tests {
         // A file from elsewhere is not one of this folder's to reopen next time.
         assert!(!s.h.app().in_folder(&s.h.app().tabs[1]));
         std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn the_side_pane_has_pages_and_can_be_put_away() {
+        let mut h = editing(0);
+        assert!(h.app().side_shown && h.app().page == side::Page::Explorer);
+        let with = h.render(1.0);
+        // The button before the tabs, and Command+B, put the pane away
+        // and bring it back.
+        h.app_mut().update(Msg::ToggleSide);
+        assert!(!h.app().side_shown);
+        let without = h.render(1.0);
+        assert!(without != with);
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        h.key(Key::Character("b".into()), cmd);
+        assert!(h.app().side_shown);
+        assert!(h.render(1.0) != without);
+        // A page's button in the strip shows it; pressed again, it puts the pane away.
+        h.app_mut().update(Msg::Page(side::Page::SourceControl));
+        assert!(h.app().side_shown && h.app().page == side::Page::SourceControl);
+        assert!(h.render(1.0) != with);
+        h.app_mut().update(Msg::Page(side::Page::SourceControl));
+        assert!(!h.app().side_shown);
+        h.app_mut().update(Msg::Page(side::Page::Explorer));
+        assert!(h.app().side_shown && h.app().page == side::Page::Explorer);
+        // The strip is clicked: its second button is Source Control.
+        h.render(1.0);
+        h.click(Point::new(23.0, 100.0));
+        assert_eq!(h.app().page, side::Page::SourceControl);
+    }
+
+    #[test]
+    fn source_control_stages_commits_and_follows_the_files() {
+        let dir = project("git-page");
+        let git = |args: &[&str]| crate::git::run(&dir, &[], args).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        git(&["init", "-q", "-b", "main"]);
+        for (key, value) in [("user.email", "test@example.com"), ("user.name", "Test"), ("commit.gpgsign", "false")] {
+            git(&["config", key, value]);
+        }
+        std::fs::write(dir.join(".gitignore"), "target\n").unwrap();
+        git(&["add", "--all"]);
+        git(&["commit", "-q", "-m", "first"]);
+        // Open a folder inside the repository: paths are still the repository's.
+        let mut app = NeoCode::folder(&dir.join("src"));
+        assert!(app.source.status.is_none(), "not read until the page is shown");
+        app.update(Msg::Page(side::Page::SourceControl));
+        let status = |app: &NeoCode| app.source.status.clone().unwrap().unwrap();
+        assert_eq!((status(&app).branch.as_str(), status(&app).changes.len()), ("main", 0));
+        assert_eq!(app.source.top.as_ref().map(|t| t.canonicalize().unwrap()), Some(dir.canonicalize().unwrap()));
+        // Edit and save a file: the list follows.
+        let lib = app.nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+        app.update(Msg::Open(lib));
+        app.update(Msg::Edit(Action::Insert("// changed\n".into())));
+        app.update(Msg::Save);
+        std::fs::write(dir.join("aaa-new.md"), "new\n").unwrap();
+        app.update(Msg::Git(side::GitDo::Refresh));
+        let seen = |app: &NeoCode| status(app).changes.iter().map(|c| (c.path.clone(), c.staged, c.unstaged)).collect::<Vec<_>>();
+        // Git lists what it already tracks before what is new to it.
+        assert_eq!(seen(&app), [("src/lib.rs".to_owned(), None, Some('M')), ("aaa-new.md".to_owned(), None, Some('?'))]);
+        // Nothing staged, or no message: no commit, and it says why.
+        app.update(Msg::GitMessage("  ".into()));
+        app.update(Msg::Git(side::GitDo::Commit));
+        assert!(app.source.said.as_ref().is_some_and(|s| s.as_ref().is_err_and(|e| e.contains("message"))));
+        app.update(Msg::GitMessage("Change the library".into()));
+        app.update(Msg::Git(side::GitDo::Commit));
+        assert!(app.source.said.as_ref().is_some_and(|s| s.as_ref().is_err_and(|e| e.contains("staged"))));
+        // Stage one, take it back, stage it again, and commit only that.
+        app.update(Msg::Git(side::GitDo::Stage("src/lib.rs".into())));
+        assert_eq!(seen(&app)[0], ("src/lib.rs".to_owned(), Some('M'), None));
+        app.update(Msg::Git(side::GitDo::Unstage("src/lib.rs".into())));
+        assert_eq!(seen(&app)[0], ("src/lib.rs".to_owned(), None, Some('M')));
+        assert!(std::fs::read_to_string(dir.join("src/lib.rs")).unwrap().contains("// changed"), "unstaging leaves the file as it is");
+        app.update(Msg::Git(side::GitDo::Stage("src/lib.rs".into())));
+        app.update(Msg::Git(side::GitDo::Commit));
+        assert_eq!(app.source.said, Some(Ok("Committed.".into())));
+        assert!(app.source.message.is_empty(), "the message is used up");
+        assert_eq!(seen(&app), [("aaa-new.md".to_owned(), None, Some('?'))], "the other file was not swept in");
+        assert_eq!(git(&["log", "-1", "--format=%s"]).trim(), "Change the library");
+        // Everything at once, and back.
+        app.update(Msg::Git(side::GitDo::StageAll));
+        assert_eq!(seen(&app), [("aaa-new.md".to_owned(), Some('A'), None)]);
+        app.update(Msg::Git(side::GitDo::UnstageAll));
+        assert_eq!(seen(&app), [("aaa-new.md".to_owned(), None, Some('?'))]);
+        // A changed file opens from the list, wherever in the repository it is.
+        app.update(Msg::GitOpen("aaa-new.md".into()));
+        assert_eq!(app.active_tab().map(|t| t.name.as_str()), Some("aaa-new.md"));
+        // Pushing with nowhere to push to passes on what git says.
+        app.update(Msg::Git(side::GitDo::Push));
+        assert!(app.source.said.as_ref().is_some_and(|s| s.is_err()) && app.source.busy.is_none());
+        // A folder that is in no repository says so.
+        let plain = std::env::temp_dir().join(format!("neo-code-no-git-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut none = NeoCode::folder(&plain);
+        none.update(Msg::Page(side::Page::SourceControl));
+        assert_eq!(none.source.status, Some(Err("This folder is not in a git repository.".into())));
+        std::fs::remove_dir_all(plain).unwrap();
     }
 
     #[test]
@@ -2599,6 +2736,16 @@ mod tests {
                 h.advance(Duration::from_millis(200));
             }
             println!("hover: {:?}", h.app().active_tab().and_then(|t| h.app().editor_popup(t)));
+        }
+        // `NEO_PAGE=source` shows the Source Control page.
+        if std::env::var("NEO_PAGE").as_deref() == Ok("source") {
+            h.app_mut().update(Msg::Page(side::Page::SourceControl));
+            for _ in 0..15 {
+                std::thread::sleep(Duration::from_millis(100));
+                h.advance(Duration::from_millis(100));
+            }
+            let s = h.app().source.status.clone();
+            println!("source control: {:?}", s.map(|s| s.map(|s| (s.branch, s.upstream, s.ahead, s.behind, s.changes.len()))));
         }
         // `NEO_LSP_LINE=n` (from one) puts the caret there first, to see that part.
         if let Some(line) = std::env::var("NEO_LSP_LINE").ok().and_then(|l| l.parse::<usize>().ok()) {
