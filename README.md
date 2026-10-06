@@ -17,7 +17,7 @@ Every widget paints through a theme: a flat design with hairline borders and hig
 | Videos | `neo-videos` | Plays video with play/pause, seeking and volume. Uses AVFoundation on macOS; `ffmpeg` and `ffplay` on Linux and Windows. |
 | Launcher | `neo-launcher` | A search box that opens apps. ⌘' (Ctrl+' on Windows) brings it up from anywhere. The search is fuzzy and always shows the closest matches, and apps opened often rank higher. On Linux, bind `neo-launcher` to a key in the window manager. |
 | Recorder | `neo-recorder` | Records the full screen, one window, or an area you frame by dragging and resizing a see-through outline. While recording, a small bar shows the time with Pause and Stop, and is left out of the recording where the system allows. Options for the microphone and for saving a GIF. ⌘⇧S (Ctrl+Shift+S) takes a screenshot of the same three kinds. It keeps an icon in the menu bar or system tray, and the installed app starts at login (a setting, on by default) so the shortcut is always ready. ⌘⇧R (Ctrl+Shift+R elsewhere) brings up the area frame from anywhere and stops a recording. Uses the system's `screencapture` on macOS, `wf-recorder` or `ffmpeg` on Linux and `ffmpeg` on Windows. |
-| Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim keys. |
+| Neo Code | `neo-code` | A code editor with a file tree, tabs, syntax highlighting and optional Vim or Helix keys. |
 
 ```sh
 cargo run -p neo-files [folder]
@@ -98,7 +98,9 @@ Text, Icon, Picture, Container, Row, Column, Stack, Space, Divider, Scrollable, 
 
 TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
 
-Call `Document::set_vim(true)` for Vim-style editing:
+A document can be driven by standard, Vim or Helix keys: `Document::set_keymap(Keymap::Vim)`, and `Document::mode_status` gives a status bar the mode, pending keys and messages for either.
+
+**Vim** (`Keymap::Vim`):
 
 - **Modes:** Normal, Insert, Visual, Visual Line and Visual Block (`Ctrl-v`, with `I`, `A`, `c`, `r` and block paste).
 - **Editing:** counts; `d c y > < gu gU g~` with motions and text objects; `x D C s S r J gJ ~ p P`; `u` and `Ctrl-r`; `.` repeat, including Visual changes and a new count; counted inserts such as `3ix<Esc>`.
@@ -107,7 +109,17 @@ Call `Document::set_vim(true)` for Vim-style editing:
 - **Search and Ex:** `/ ? n N * #` with Rust regex syntax plus Vim's `\<`, `\>` and `\c`; `:s/pat/rep/gi` with `&`, `\1` and `\n`; ranges (`%`, `N,M`, `.`, `$`, `'<,'>`, `+N`); `:d :y :> :< :j :{line}`; `:set ic scs`; `:reg`, `:marks`; `:w :q :q! :wq :x`.
 - **Scrolling:** `Ctrl-d u f b e y`, `zz zt zb` and `H M L`, using the editor's real height.
 
-The application carries out `:w` and `:q` through `Document::take_vim_requests`.
+**Helix** (`Keymap::Helix`), where you select first and then act:
+
+- **Modes:** Normal, Insert and Select (`v`). Outside Insert there is always a selection at least one character wide.
+- **Moving and selecting:** counts; `h j k l`; `w b e W B E`, which select what they pass; `f t F T`; `gg ge gh gl gs gt gc gb` and `G`; `x` and `X` for lines; `%` for everything; `;` to collapse and `Alt-;` to flip; `mm`, and the text objects `mi` and `ma` with `w W p ( [ { < " ' `` ` ``.
+- **Changing:** `i a I A o O`; `d` and `c` (`Alt-d` and `Alt-c` skip the yank); `y p P R`; `r`; `~`, `` ` `` and ``Alt-` `` for case; `> <`; `J`; `u` and `U`; surround with `ms`, `md` and `mr`.
+- **Registers and clipboard:** `"a` and other named registers; `Space y`, `Space p`, `Space P` and `Space R` for the system clipboard.
+- **Search and commands:** `/ ? n N *` with Rust regex syntax; `:w :q :q! :wq :x` and `:{line}`.
+- **Scrolling:** `Ctrl-d u f b`, `zz zt zb zj zk`.
+- **Not included:** multiple selections (`C`, `s`, `S`, `,`), since a document has one selection; macros; the jump list; `.` repeat.
+
+The application carries out `:w` and `:q` from either keymap through `Document::take_vim_requests`.
 
 ### How it works
 

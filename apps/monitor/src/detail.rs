@@ -271,14 +271,19 @@ mod tests {
     fn measures_a_busy_thread_between_samples() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
+        let (started, running) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("neo-spin".into())
             .spawn(move || {
+                let _ = started.send(());
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                     std::hint::spin_loop();
                 }
             })
             .unwrap();
+        // The first sample must see the thread, or there is nothing to
+        // measure its second sample against.
+        running.recv().unwrap();
         let mut inspect = Inspect::new(Pid::from_u32(std::process::id()));
         inspect.refresh(None);
         assert!(inspect.threads.as_ref().unwrap().iter().all(|r| r.cpu.is_none()), "nothing to compare against on the first sample");

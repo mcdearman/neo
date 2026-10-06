@@ -120,7 +120,8 @@ impl<M> TextEditor<M> {
     }
 }
 
-/// Ctrl keys that Vim mode handles; the rest go to the application.
+/// Ctrl keys that the modal keymaps (Vim and Helix) handle; the rest go to
+/// the application.
 fn vim_ctrl(key: &Key) -> bool {
     matches!(key, Key::Character(c) if matches!(c.as_str(), "r" | "d" | "u" | "f" | "b" | "n" | "p" | "w" | "h" | "[" | "c" | "e" | "y" | "v"))
 }
@@ -476,8 +477,8 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 Status::Captured
             }
             Event::Key(k) if k.pressed && cx.is_focused() && self.vim.is_some() && !k.modifiers.logo && (!k.modifiers.ctrl || vim_ctrl(&k.key)) => {
-                // Vim mode: the document interprets every key. Cmd/Super
-                // shortcuts, and Ctrl keys Vim does not use, fall through
+                // A modal keymap: the document interprets every key. Cmd/Super
+                // shortcuts, and Ctrl keys the keymaps do not use, fall through
                 // to the clipboard and application shortcuts below.
                 let view = self.vim.as_ref().expect("vim view present in vim mode");
                 if view.viewport != self.viewport {

@@ -1,4 +1,5 @@
-//! Neo Code: a small code editor built with Neo, with optional Vim keys.
+//! Neo Code: a small code editor built with Neo, with optional Vim or
+//! Helix keys.
 //!
 //!     cargo run -p neo-code                  # sample project
 //!     cargo run -p neo-code -- path/to/dir   # a real folder (Cmd/Ctrl+S saves)
@@ -149,6 +150,9 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 
+/// The key sets on offer, in the order the status bar lists them.
+const KEYMAPS: [(Keymap, &str); 3] = [(Keymap::Plain, "Standard"), (Keymap::Vim, "Vim"), (Keymap::Helix, "Helix")];
+
 #[derive(Clone)]
 enum Source {
     Memory(&'static str),
@@ -187,7 +191,7 @@ struct NeoCode {
     active: Option<usize>,
     dark: Option<bool>,
     toast: Option<String>,
-    vim: bool,
+    keymap: Keymap,
     desktop: Desktop,
 }
 
@@ -202,7 +206,8 @@ enum Msg {
     ToggleScheme,
     ClearToast,
     Poll,
-    Vim(bool),
+    /// The keys to edit with: an index into [`KEYMAPS`].
+    Keys(usize),
 }
 
 impl NeoCode {
@@ -222,7 +227,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, vim: true, desktop: Desktop::load() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, desktop: Desktop::load() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -256,7 +261,7 @@ impl NeoCode {
         let mut nodes = vec![];
         walk(root, "", 0, &mut nodes);
         let project = root.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| root.display().to_string());
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, vim: true, desktop: Desktop::load() }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, desktop: Desktop::load() }
     }
 
     fn visible_nodes(&self) -> Vec<usize> {
@@ -371,7 +376,7 @@ impl App for NeoCode {
                     None => return,
                 };
                 let mut doc = Document::new(&text);
-                doc.set_vim(self.vim);
+                doc.set_keymap(self.keymap);
                 self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk });
                 self.active = Some(self.tabs.len() - 1);
             }
@@ -414,10 +419,10 @@ impl App for NeoCode {
                     }
                 }
             }
-            Msg::Vim(on) => {
-                self.vim = on;
+            Msg::Keys(i) => {
+                self.keymap = KEYMAPS.get(i).map_or(Keymap::Plain, |(k, _)| *k);
                 for t in &mut self.tabs {
-                    t.doc.set_vim(on);
+                    t.doc.set_keymap(self.keymap);
                 }
             }
             Msg::Save => {
@@ -526,7 +531,7 @@ impl NeoCode {
                     .align(Align::Center)
                     .push(icon(icons::FILE_CODE).size(40.0).tone(Tone::Faint))
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
-                    .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work in Vim mode").role(TextRole::Caption).tone(Tone::Faint)),
+                    .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work with Vim and Helix keys").role(TextRole::Caption).tone(Tone::Faint)),
             )
             .surface(Surface::Card)
             .center()
@@ -539,9 +544,9 @@ impl NeoCode {
 
     fn status_bar(&self) -> Element<Msg> {
         let mut left = row().spacing(18.0).align(Align::Center);
-        if let Some(v) = self.active_tab().and_then(|t| t.doc.vim()) {
-            let insert = v.mode == VimMode::Insert;
-            let badge = container(text(v.mode.label()).role(TextRole::Label))
+        if let Some(v) = self.active_tab().and_then(|t| t.doc.mode_status()) {
+            let insert = v.insert;
+            let badge = container(text(v.label).role(TextRole::Label))
                 .padding([4.0, 10.0])
                 .radius(6.0)
                 .background(if insert { Background::Surface(Surface::Accent) } else { Background::Surface(Surface::Pressed) });
@@ -585,7 +590,7 @@ impl NeoCode {
             .padding([0.0, 6.0])
             .push(left)
             .push(Space::fill_x())
-            .push(row().spacing(8.0).align(Align::Center).push(text("Vim").role(TextRole::Caption).tone(Tone::Muted)).push(toggle(self.vim, Msg::Vim)))
+            .push(row().spacing(8.0).align(Align::Center).push(text("Keys").role(TextRole::Caption).tone(Tone::Muted)).push(segmented(KEYMAPS.map(|(_, name)| name), KEYMAPS.iter().position(|(k, _)| *k == self.keymap), Msg::Keys)))
             .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 34.0).on_press(Msg::ToggleScheme))
             .into()
     }
@@ -628,9 +633,12 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     use neo::{Modifiers, Point};
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true)] {
+    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true), ("editor-helix", true)] {
         let mut app = NeoCode::sample();
         app.dark = Some(dark);
+        if name == "editor-helix" {
+            app.update(Msg::Keys(2));
+        }
         let mut h = Harness::new(app, Size::new(1280.0, 820.0)).expect("GPU");
         // Focus the editor, then use Vim keys: move down, select to the end of a word.
         h.click(Point::new(700.0, 300.0));
@@ -643,10 +651,88 @@ fn snapshots(dir: PathBuf) {
             }
             "editor-dark" => h.type_text("jVj"),
             "editor-insert" => h.type_text("jA // edited"),
+            // Helix: three lines selected, with a pending text-object command.
+            "editor-helix" => h.type_text("ggjxxxmi"),
             _ => h.type_text("qad2"),
         }
         let path = dir.join(format!("{name}.png"));
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use neo::testing::Harness;
+    use neo::{Modifiers, Point};
+
+    use super::*;
+
+    /// The sample project with the editor focused.
+    fn editing(keys: usize) -> Harness<NeoCode> {
+        let mut app = NeoCode::sample();
+        app.update(Msg::Keys(keys));
+        let mut h = Harness::new(app, Size::new(1280.0, 820.0)).expect("a GPU adapter is required for these tests");
+        h.click(Point::new(700.0, 300.0));
+        h
+    }
+
+    fn lines(h: &Harness<NeoCode>) -> Vec<String> {
+        h.app().active_tab().expect("the sample opens a file").doc.lines().to_vec()
+    }
+
+    fn label(h: &Harness<NeoCode>) -> Option<&'static str> {
+        h.app().active_tab().and_then(|t| t.doc.mode_status()).map(|s| s.label)
+    }
+
+    #[test]
+    fn helix_keys_select_then_act_in_the_editor() {
+        let mut h = editing(2);
+        assert_eq!(label(&h), Some("NOR"));
+        let before = lines(&h);
+        // Top of the file, select two lines, delete them.
+        h.type_text("ggxxd");
+        assert_eq!(lines(&h), before[2..]);
+        h.type_text("u");
+        assert_eq!(lines(&h), before);
+        // Insert mode types text and Escape leaves it.
+        h.type_text("ggi// ");
+        assert_eq!(label(&h), Some("INS"));
+        h.key(Key::Escape, Modifiers::default());
+        assert_eq!(label(&h), Some("NOR"));
+        assert_eq!(lines(&h)[0], format!("// {}", before[0]));
+    }
+
+    #[test]
+    fn the_same_keys_mean_different_things_in_each_keymap() {
+        // `x` deletes a character in Vim, selects the line in Helix, and is
+        // typed as text with standard keys.
+        let first = |h: &Harness<NeoCode>| lines(h)[0].clone();
+        let original = first(&editing(0));
+
+        let mut vim = editing(1);
+        assert_eq!(label(&vim), Some("NORMAL"));
+        vim.type_text("ggx");
+        assert_eq!(first(&vim), original[1..]);
+
+        let mut helix = editing(2);
+        helix.type_text("ggx");
+        assert_eq!(first(&helix), original);
+        assert_eq!(helix.app().active_tab().unwrap().doc.selected_text(), format!("{original}\n"));
+
+        let mut plain = editing(0);
+        assert_eq!(label(&plain), None);
+        plain.type_text("x");
+        assert!(lines(&plain).iter().any(|l| l.contains('x')) && lines(&plain) != lines(&editing(0)));
+    }
+
+    #[test]
+    fn changing_keymap_applies_to_open_files() {
+        let mut h = editing(1);
+        assert_eq!(label(&h), Some("NORMAL"));
+        h.app_mut().update(Msg::Keys(2));
+        assert_eq!(label(&h), Some("NOR"));
+        h.app_mut().update(Msg::Keys(0));
+        assert_eq!(label(&h), None);
     }
 }

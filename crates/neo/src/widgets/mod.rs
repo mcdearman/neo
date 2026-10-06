@@ -19,7 +19,7 @@ mod toggle;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
-pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, Mode as VimMode, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
+pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::Language;
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack};
