@@ -86,7 +86,8 @@ enum Phase {
     Starting(Target),
     /// The window has been told to hide; the screenshot is taken once it is gone.
     Shooting(Target),
-    /// The system's crosshair is up for the user to drag out an area.
+    /// The user is dragging out an area: on NeoCap's own dimmed overlay,
+    /// or with the system's crosshair where that is used instead.
     Picking,
     /// A screenshot was just taken: the screen flashes, so it feels taken.
     Flash(Saved),
@@ -141,6 +142,14 @@ struct Recorder {
     /// The drag-to-select in progress, to take down if the user asks for
     /// NeoCap's window instead.
     picker: Option<capture::Picker>,
+    /// Whether NeoCap draws the selection itself: the screen dimmed, and
+    /// the area dragged out left clear. Otherwise the system's does.
+    own_overlay: bool,
+    /// NeoCap's own selection is up.
+    overlay: bool,
+    /// The drag so far, from where it began to where the mouse is, within
+    /// the overlay.
+    drag: Option<(Point, Point)>,
     /// When the flash after a screenshot began.
     flash_from: Option<Instant>,
     /// Kept alive after a screenshot is copied: on Linux the picture stays
@@ -184,6 +193,11 @@ enum Msg {
     /// `S` pressed while dragging out a screenshot: show NeoCap's window
     /// for its other choices instead.
     PickMore,
+    /// The mouse went down, or moved while down, on NeoCap's own overlay.
+    PickDrag(Point, Point),
+    /// It was let go.
+    PickDrop,
+    PickCancel,
     /// The drag-to-select ended: with a picture, an error, or neither.
     Picked(Option<Result<Saved, String>>),
     /// The flash after a screenshot moves on, or is over.
@@ -281,6 +295,9 @@ impl Recorder {
             auto_shot: false,
             shot_in_flight: false,
             picker: None,
+            own_overlay: cfg!(target_os = "macos"),
+            overlay: false,
+            drag: None,
             flash_from: None,
             clipboard: None,
             copied: None,
@@ -434,9 +451,12 @@ impl Recorder {
     /// Hands over to the system's drag-to-select. Returns false if that
     /// could not be started, so the caller can fall back to the frame.
     fn start_pick(&mut self) -> bool {
+        // NeoCap's own overlay needs to know how big the screen is.
+        self.overlay = self.own_overlay && self.screen != Rect::ZERO;
+        self.drag = None;
         // Without an event loop there is nothing to report back to, which
         // is how tests run: they stand in for the crosshair themselves.
-        if let Some(proxy) = self.proxy.clone() {
+        if let Some(proxy) = self.proxy.clone().filter(|_| !self.overlay) {
             let name = format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"));
             match capture::pick(&self.shots_dir.join(name), move |result| {
                 proxy.send(Msg::Picked(result));
@@ -457,11 +477,88 @@ impl Recorder {
     /// Takes the crosshair down if it is up, and gives `S` back to
     /// whatever the user types next.
     fn end_pick(&mut self) {
+        self.overlay = false;
+        self.drag = None;
         if let Some(picker) = self.picker.take() {
             picker.cancel();
         }
         if let Some(keys) = &self.hotkeys {
             let _ = keys.unregister(Self::more_key());
+        }
+    }
+}
+
+/// How dark the screen goes while an area is dragged out.
+const DIM: f32 = 0.42;
+
+/// NeoCap's own selection: the whole screen dimmed, and the area being
+/// dragged out left as it is, so what will be in the picture stands out.
+struct PickArea {
+    drag: Option<(Point, Point)>,
+}
+
+impl PickArea {
+    /// The area dragged out so far, within `b`.
+    fn chosen(&self, b: Rect) -> Option<Rect> {
+        let (from, to) = self.drag?;
+        let (x0, x1) = (from.x.min(to.x).max(b.x), from.x.max(to.x).min(b.right()));
+        let (y0, y1) = (from.y.min(to.y).max(b.y), from.y.max(to.y).min(b.bottom()));
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+}
+
+impl Widget<Msg> for PickArea {
+    fn width(&self) -> Length {
+        Length::Fill
+    }
+
+    fn height(&self) -> Length {
+        Length::Fill
+    }
+
+    fn layout(&mut self, _cx: &mut Cx, limits: Limits) -> Size {
+        limits.max
+    }
+
+    fn draw(&self, cx: &mut DrawCx) {
+        let b = cx.bounds();
+        let dim = Color::BLACK.with_alpha(DIM);
+        let Some(r) = self.chosen(b) else {
+            cx.scene.fill(b, 0.0, dim, None);
+            return;
+        };
+        // Four pieces around the area, which is left untouched.
+        cx.scene.fill(Rect::new(b.x, b.y, b.w, r.y - b.y), 0.0, dim, None);
+        cx.scene.fill(Rect::new(b.x, r.bottom(), b.w, b.bottom() - r.bottom()), 0.0, dim, None);
+        cx.scene.fill(Rect::new(b.x, r.y, r.x - b.x, r.h), 0.0, dim, None);
+        cx.scene.fill(Rect::new(r.right(), r.y, b.right() - r.right(), r.h), 0.0, dim, None);
+        // A thin edge, just outside it so it is not in the picture.
+        cx.scene.fill(Rect::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0), 0.0, Color::TRANSPARENT, Some((1.0, Color::WHITE.with_alpha(0.9))));
+    }
+
+    fn event(&mut self, cx: &mut EventCx<Msg>, event: &Event) -> Status {
+        match event {
+            Event::PointerPressed { pos, button: PointerButton::Primary } => {
+                cx.emit(Msg::PickDrag(*pos, *pos));
+                Status::Captured
+            }
+            Event::PointerPressed { .. } => {
+                // Any other button backs out.
+                cx.emit(Msg::PickCancel);
+                Status::Captured
+            }
+            Event::PointerMoved { pos } => {
+                cx.set_cursor(CursorIcon::Crosshair);
+                if let Some((from, _)) = self.drag {
+                    cx.emit(Msg::PickDrag(from, *pos));
+                }
+                Status::Captured
+            }
+            Event::PointerReleased { button: PointerButton::Primary, .. } if self.drag.is_some() => {
+                cx.emit(Msg::PickDrop);
+                Status::Captured
+            }
+            _ => Status::Ignored,
         }
     }
 }
@@ -484,6 +581,10 @@ impl App for Recorder {
     fn window_state(&self) -> WindowState {
         let recording = self.busy();
         let framing = self.mode == Mode::Area && self.phase == Phase::Idle;
+        if self.phase == Phase::Picking && self.overlay {
+            // Over the whole screen, and out of the picture it is about to take.
+            return WindowState { visible: true, always_on_top: true, bare: true, size: Some(Size::new(self.screen.w, self.screen.h)), position: Some(Point::new(self.screen.x, self.screen.y)), hidden_from_capture: true, passive: false };
+        }
         if matches!(self.phase, Phase::Flash(_)) {
             // Over the whole screen for an instant, without taking the keyboard.
             return WindowState { visible: true, always_on_top: true, bare: true, size: Some(Size::new(self.screen.w, self.screen.h)), position: Some(Point::new(self.screen.x, self.screen.y)), hidden_from_capture: true, passive: true };
@@ -571,6 +672,7 @@ impl App for Recorder {
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
         match k.key {
+            Key::Escape if self.phase == Phase::Picking && self.overlay => Some(Msg::PickCancel),
             Key::Enter if self.phase == Phase::Idle => Some(if self.intent == Intent::Screenshot { Msg::Screenshot } else { Msg::Record }),
             Key::Enter if self.phase == Phase::Recording => Some(Msg::Stop),
             Key::Space if self.phase == Phase::Recording => Some(if self.session.as_ref().is_some_and(|s| s.paused()) { Msg::Resume } else { Msg::Pause }),
@@ -780,6 +882,29 @@ impl Recorder {
                     self.apply(Msg::Refresh);
                 }
             }
+            Msg::PickDrag(from, to) => {
+                if self.phase == Phase::Picking && self.overlay {
+                    self.drag = Some((from, to));
+                }
+            }
+            Msg::PickDrop => {
+                if self.phase == Phase::Picking && self.overlay {
+                    let area = self.drag.map(|(a, b)| Rect::new(a.x.min(b.x) + self.screen.x, a.y.min(b.y) + self.screen.y, (a.x - b.x).abs(), (a.y - b.y).abs()));
+                    self.end_pick();
+                    match area {
+                        // The overlay goes, and then the picture is taken.
+                        Some(area) if area.w >= 4.0 && area.h >= 4.0 => self.phase = Phase::Shooting(Target::Area(area)),
+                        // A click without a drag picks nothing.
+                        _ => self.phase = Phase::Idle,
+                    }
+                }
+            }
+            Msg::PickCancel => {
+                if self.phase == Phase::Picking {
+                    self.end_pick();
+                    self.phase = Phase::Idle;
+                }
+            }
             Msg::Picked(result) => {
                 // Word from a crosshair that was since taken down is stale.
                 if self.phase == Phase::Picking {
@@ -835,7 +960,8 @@ impl Recorder {
                 self.screen = g.screen;
                 self.scale = g.scale;
                 // The recording bar's own frame is not the area to record.
-                if !self.busy() {
+                // Nor are the overlays that cover the whole screen.
+                if !self.busy() && !self.overlay && !matches!(self.phase, Phase::Flash(_)) {
                     self.frame = g.frame;
                 }
             }
@@ -873,6 +999,9 @@ impl Recorder {
         // not be mistaken for the area frame.
         if matches!(self.phase, Phase::Flash(_)) {
             return self.flash();
+        }
+        if self.phase == Phase::Picking && self.overlay {
+            return Element::new(PickArea { drag: self.drag });
         }
         if self.window_state().bare {
             return self.frame_view();
@@ -1559,6 +1688,96 @@ mod tests {
         let film = Saved { path: "/tmp/film.mov".into(), bytes: 10, length: Duration::from_secs(3) };
         r.update(Msg::Finished(Ok(film.clone())));
         assert_eq!(r.phase, Phase::Done(film));
+    }
+
+    /// A recorder that draws its own selection, on a screen of known size.
+    fn overlaying() -> Recorder {
+        let mut r = recorder();
+        r.own_overlay = true;
+        r.shown = false;
+        r.update(Msg::Geometry(WindowGeometry { frame: Rect::new(100.0, 100.0, 400.0, 300.0), screen: Rect::new(0.0, 25.0, 800.0, 500.0), scale: 2.0 }));
+        r
+    }
+
+    #[test]
+    fn dragging_on_the_dimmed_screen_takes_a_picture_of_that_area() {
+        let mut r = overlaying();
+        r.update(Msg::ScreenshotHotkey);
+        assert_eq!(r.phase, Phase::Picking);
+        let s = r.window_state();
+        assert!(s.visible && s.bare && s.always_on_top && s.hidden_from_capture && !s.passive, "over everything, and taking the mouse");
+        assert_eq!((s.position, s.size), (Some(Point::new(0.0, 25.0)), Some(Size::new(800.0, 500.0))), "the whole screen");
+        // Dragged up and to the left: the area is the same either way, and
+        // is in the screen's coordinates, not the overlay's.
+        r.update(Msg::PickDrag(Point::new(300.0, 200.0), Point::new(300.0, 200.0)));
+        r.update(Msg::PickDrag(Point::new(300.0, 200.0), Point::new(100.0, 50.0)));
+        r.update(Msg::PickDrop);
+        assert_eq!(r.phase, Phase::Shooting(Target::Area(Rect::new(100.0, 75.0, 200.0, 150.0))));
+        assert!(!r.window_state().visible, "the overlay is gone before the picture is taken");
+        assert_eq!(r.frame, Rect::new(100.0, 100.0, 400.0, 300.0), "the overlay's size is not taken for the frame's");
+        // The picture arrives like any other screenshot.
+        let saved = Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO };
+        r.update(Msg::Finished(Ok(saved.clone())));
+        assert!(matches!(r.phase, Phase::Flash(_) | Phase::Done(_)));
+    }
+
+    #[test]
+    fn the_dimmed_screen_can_be_backed_out_of() {
+        // A click with no drag, Escape, and S for the window instead.
+        let mut r = overlaying();
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::PickDrag(Point::new(50.0, 50.0), Point::new(51.0, 50.0)));
+        r.update(Msg::PickDrop);
+        assert_eq!(r.phase, Phase::Idle);
+        assert!(!r.window_state().visible && !r.overlay);
+
+        r.update(Msg::ScreenshotHotkey);
+        let escape = KeyEvent { key: Key::Escape, pressed: true, repeat: false, modifiers: Default::default(), text: None };
+        assert!(matches!(r.on_key(&escape), Some(Msg::PickCancel)));
+        r.update(Msg::PickCancel);
+        assert_eq!(r.phase, Phase::Idle);
+        assert!(!r.window_state().visible);
+
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::PickDrag(Point::new(50.0, 50.0), Point::new(200.0, 200.0)));
+        r.update(Msg::PickMore);
+        assert_eq!((r.phase.clone(), r.mode, r.intent), (Phase::Idle, Mode::Screen, Intent::Screenshot));
+        let s = r.window_state();
+        assert!(s.visible && !s.bare && r.drag.is_none(), "the ordinary window, not the overlay");
+        // A drop that arrives late does nothing.
+        r.update(Msg::PickDrop);
+        assert_eq!(r.phase, Phase::Idle);
+        // Without a screen size to cover, the system's crosshair is used.
+        let mut r = recorder();
+        r.own_overlay = true;
+        r.shown = false;
+        r.update(Msg::ScreenshotHotkey);
+        assert!(!r.overlay);
+    }
+
+    #[test]
+    fn the_screen_is_dimmed_except_for_the_area_dragged_out() {
+        use neo::testing::Harness;
+        let mut r = overlaying();
+        r.update(Msg::ScreenshotHotkey);
+        let size = Size::new(800.0, 500.0);
+        let mut h = Harness::new(r, size).unwrap();
+        let at = |px: &[u8], x: usize, y: usize| px[(y * 800 + x) * 4 + 3];
+        let px = h.render(1.0);
+        let dim = at(&px, 400, 250);
+        assert!(dim > 60 && dim < 160, "dimmed, and still seen through: {dim}");
+        assert_eq!(at(&px, 10, 10), dim, "all of it");
+        // Press, drag and let go, as the mouse would.
+        h.event(Event::PointerPressed { pos: Point::new(200.0, 100.0), button: PointerButton::Primary });
+        h.move_to(Point::new(500.0, 300.0));
+        assert_eq!(h.cursor(), CursorIcon::Crosshair);
+        let px = h.render(1.0);
+        assert_eq!(at(&px, 350, 200), 0, "nothing is drawn over the area chosen");
+        for (x, y) in [(100, 200), (600, 200), (350, 50), (350, 400), (10, 10), (790, 490)] {
+            assert_eq!(at(&px, x, y), dim, "({x}, {y}) is outside it, and stays dim");
+        }
+        h.event(Event::PointerReleased { pos: Point::new(500.0, 300.0), button: PointerButton::Primary });
+        assert_eq!(h.app().phase, Phase::Shooting(Target::Area(Rect::new(200.0, 125.0, 300.0, 200.0))));
     }
 
     #[test]

@@ -190,7 +190,8 @@ fn pick_command(path: &Path) -> Option<Command> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         // slurp draws the selection and grim takes the picture of it.
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "area=$(slurp) && grim -g \"$area\" \"$0\""]).arg(path);
+        // The screen dimmed, and the area chosen left clear.
+        cmd.args(["-c", "area=$(slurp -b 0000006b -s 00000000 -c ffffffe6) && grim -g \"$area\" \"$0\""]).arg(path);
         return Some(cmd);
     }
     let mut cmd = Command::new("maim");
