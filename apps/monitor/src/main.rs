@@ -1,4 +1,4 @@
-//! Neo System Monitor: processes, CPU, memory, disks and network.
+//! System Monitor: processes, CPU, memory, disks and network.
 //!
 //!     cargo run -p neo-monitor
 //!     cargo run -p neo-monitor -- --snapshot target/snapshots

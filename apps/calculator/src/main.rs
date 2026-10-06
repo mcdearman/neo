@@ -1,4 +1,4 @@
-//! Neo Calculator: type an expression or use the keypad.
+//! NeoCal: type an expression or use the keypad.
 //!
 //!     cargo run -p neo-calculator
 //!     cargo run -p neo-calculator -- --snapshot target/snapshots
@@ -73,7 +73,7 @@ impl App for Calculator {
     type Message = Msg;
 
     fn title(&self) -> String {
-        "Calculator".into()
+        "NeoCal".into()
     }
 
     fn window(&self) -> WindowSettings {
@@ -143,7 +143,7 @@ impl App for Calculator {
     }
 
     fn view(&self) -> Element<Msg> {
-        self.desktop.with_settings(self.content(), "Calculator Settings", Msg::Desktop, vec![])
+        self.desktop.with_settings(self.content(), "NeoCal Settings", Msg::Desktop, vec![])
     }
 }
 

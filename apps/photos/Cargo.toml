@@ -1,6 +1,6 @@
 [package]
 name = "neo-photos"
-description = "Neo Photos: view pictures, with zoom, rotate and a walk through the folder"
+description = "Photos: view pictures, with zoom, rotate and a walk through the folder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

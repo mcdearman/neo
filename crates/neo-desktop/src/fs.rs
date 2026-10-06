@@ -137,10 +137,10 @@ pub fn transfer(sources: &[PathBuf], target: &Path, move_from: Option<&Path>) ->
     Ok(done)
 }
 
-/// Picture formats Neo Photos opens, by lower-case extension.
+/// Picture formats Photos opens, by lower-case extension.
 pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico", "heic", "heif", "avif"];
 
-/// Video formats Neo Videos opens, by lower-case extension.
+/// Video formats Videos opens, by lower-case extension.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "wmv", "flv", "3gp", "ts"];
 
 /// Whether `path` has one of `extensions`, ignoring case.
@@ -241,7 +241,7 @@ pub fn open(path: &Path) -> std::io::Result<()> {
 /// Where another Neo app's program might be: beside this program, in a
 /// macOS app bundle next to this one or in `~/Applications`, then on the
 /// `PATH`. `program` is the binary's name, such as `neo-files`, and
-/// `bundle` its macOS app name, such as `Neo Files`.
+/// `bundle` its macOS app name, such as `Files`.
 fn neo_app_candidates(program: &str, bundle: &str) -> Vec<PathBuf> {
     let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let mut out = Vec::new();
@@ -262,10 +262,10 @@ fn neo_app_candidates(program: &str, bundle: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Shows a file in Neo Files, selected in its folder. Falls back to the
-/// system's file manager, opened on the folder, when Neo Files is not installed.
+/// Shows a file in Files, selected in its folder. Falls back to the
+/// system's file manager, opened on the folder, when Files is not installed.
 pub fn reveal(path: &Path) -> std::io::Result<()> {
-    if open_in("neo-files", "Neo Files", path) {
+    if open_in("neo-files", "Files", path) {
         return Ok(());
     }
     open(path.parent().unwrap_or(path))
@@ -276,14 +276,14 @@ pub fn open_in(program: &str, bundle: &str, path: &Path) -> bool {
     neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).arg(path).spawn().is_ok())
 }
 
-/// Opens a file the way Neo Files does: pictures in Neo Photos, videos in
-/// Neo Videos, and everything else with the system's default app. Falls
+/// Opens a file the way Files does: pictures in Photos, videos in
+/// Videos, and everything else with the system's default app. Falls
 /// back to the system's choice when the Neo app is not installed.
 pub fn open_file(path: &Path) -> std::io::Result<()> {
     let viewer = if has_extension(path, IMAGE_EXTENSIONS) {
-        Some(("neo-photos", "Neo Photos"))
+        Some(("neo-photos", "Photos"))
     } else if has_extension(path, VIDEO_EXTENSIONS) {
-        Some(("neo-videos", "Neo Videos"))
+        Some(("neo-videos", "Videos"))
     } else {
         None
     };

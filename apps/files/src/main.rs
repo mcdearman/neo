@@ -1,4 +1,4 @@
-//! Neo Files: browse, open and organise files.
+//! Files: browse, open and organise files.
 //!
 //!     cargo run -p neo-files [folder]
 //!     cargo run -p neo-files -- --snapshot target/snapshots
@@ -623,8 +623,8 @@ impl App for Files {
                     Choice::Hidden => self.update(Msg::Hidden),
                     Choice::Terminal => {
                         let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
-                        if !neo_desktop::fs::open_in("neo-terminal", "Neo Terminal", &dir) {
-                            self.status = Some((Tone::Bad, "Neo Terminal is not installed.".into()));
+                        if !neo_desktop::fs::open_in("neo-terminal", "NeoTerm", &dir) {
+                            self.status = Some((Tone::Bad, "NeoTerm is not installed.".into()));
                         }
                     }
                 }

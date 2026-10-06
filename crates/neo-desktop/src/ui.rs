@@ -150,7 +150,7 @@ pub(crate) fn settings_panel<M: Clone + 'static>(desktop: &Desktop, view: Elemen
     let help = if desktop.appearance.glass.enabled {
         "Translucent, with what is behind the window blurred. Turn off to make this app's window solid."
     } else {
-        "Glass windows are turned off in Neo Settings, so this has no effect for now."
+        "Glass windows are turned off in Settings, so this has no effect for now."
     };
     let glass = wrap.clone();
     let mut rows = column()

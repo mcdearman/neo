@@ -1,4 +1,4 @@
-//! Neo Photos: view pictures.
+//! Photos: view pictures.
 //!
 //!     cargo run -p neo-photos -- picture.jpg     # or a folder of pictures
 //!     cargo run -p neo-photos -- --snapshot target/snapshots

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Calculator
+Name=NeoCal
 GenericName=Calculator
 Comment=Calculate with expressions, functions and history
 Exec=neo-calculator

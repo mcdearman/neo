@@ -1,6 +1,6 @@
 [package]
 name = "neo-code"
-description = "Neo Code: a code editor with optional Vim or Helix keys"
+description = "NeoCode: a code editor with optional Vim or Helix keys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

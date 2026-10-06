@@ -1,4 +1,4 @@
-//! Neo Settings: appearance, accessibility and information about this computer.
+//! Settings: appearance, accessibility and information about this computer.
 //!
 //! Changes are saved to the shared appearance file straight away, and every
 //! running Neo app restyles itself to match.

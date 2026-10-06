@@ -1,6 +1,6 @@
 [package]
 name = "neo-calculator"
-description = "Neo Calculator: expressions, functions and history"
+description = "NeoCal: expressions, functions and history"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

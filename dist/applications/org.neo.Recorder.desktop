@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Recorder
+Name=NeoCap
 GenericName=Screen Recorder
 Comment=Record the screen, a window or an area
 Exec=neo-recorder

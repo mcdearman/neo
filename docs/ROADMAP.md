@@ -18,7 +18,7 @@ Done:
 - **Toolkit:** `neo-theme`, `armature-render` and `neo`.
   - Widgets, layout, focus, animation, glass windows and a headless test harness.
   - Background-thread messages (`Proxy`) and layout-time messages (`Cx::defer`).
-- **Apps:** Files, Terminal, Settings, System Monitor, Calculator and Neo Code.
+- **Apps:** Files, Terminal, Settings, System Monitor, NeoCal and NeoCode.
   - They share one appearance file, and every app restyles live when Settings changes it.
 - **Linux integration:** `.desktop` entries, Wayland app IDs and `dist/install.sh`.
 
@@ -57,7 +57,7 @@ In rough priority order:
 
 Next apps, most useful first:
 
-- **Text Editor:** Neo Code accepts a file, not just a folder, and becomes the default for `text/plain`.
+- **Text Editor:** NeoCode accepts a file, not just a folder, and becomes the default for `text/plain`.
 - **Image Viewer**, once images exist.
 - **Music:** the gallery's player made real, with `symphonia` for decoding, PipeWire output and MPRIS controls.
 - **Clock and Calendar:** alarms, timers and a month view. The panel reuses the calendar later.

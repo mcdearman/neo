@@ -46,7 +46,16 @@ fn app_dir() -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn bundle(app: &AppInfo) -> PathBuf {
-    app_dir().join(format!("{}.app", app.long_name))
+    app_dir().join(format!("{}.app", app.name))
+}
+
+/// The bundle this app was installed as under its earlier name, if that
+/// is still there and really is this app.
+#[cfg(target_os = "macos")]
+fn former_bundle(app: &AppInfo) -> Option<PathBuf> {
+    let old = app_dir().join(format!("{}.app", app.former));
+    let ours = std::fs::read_to_string(old.join("Contents/Info.plist")).is_ok_and(|plist| plist.contains(&format!("<string>{}</string>", app.id)));
+    (app.former != app.name && ours).then_some(old)
 }
 
 #[cfg(target_os = "macos")]
@@ -73,7 +82,7 @@ fn info_plist(app: &AppInfo) -> String {
 </dict>
 </plist>
 "#,
-        name = app.long_name,
+        name = app.name,
         bin = app.bin,
         id = app.id,
         version = env!("CARGO_PKG_VERSION"),
@@ -85,7 +94,7 @@ fn info_plist(app: &AppInfo) -> String {
             }
             if app.bin == "neo-recorder" {
                 // macOS refuses microphone access to apps that do not say why they want it.
-                extra.push_str("\n    <key>NSMicrophoneUsageDescription</key><string>Neo Recorder records sound from the microphone when you turn that option on.</string>");
+                extra.push_str("\n    <key>NSMicrophoneUsageDescription</key><string>NeoCap records sound from the microphone when you turn that option on.</string>");
             }
             extra
         },
@@ -97,6 +106,10 @@ pub fn install() -> Result<(), String> {
     for app in APPS {
         // Update in place, so Spotlight keeps the bundle it already indexed.
         let b = bundle(app);
+        if let Some(old) = former_bundle(app) {
+            std::fs::remove_dir_all(&old).map_err(io(old.display()))?;
+            println!("removed {}, now called {}", old.display(), app.name);
+        }
         let contents = b.join("Contents");
         copy(&built(app.bin), &contents.join("MacOS").join(app.bin))?;
         std::fs::write(contents.join("Info.plist"), info_plist(app)).map_err(io("write Info.plist"))?;
@@ -106,7 +119,7 @@ pub fn install() -> Result<(), String> {
         let icns = resources.join("AppIcon.icns");
         let ok = Command::new("iconutil").arg("-c").arg("icns").arg(&iconset).arg("-o").arg(&icns).status().is_ok_and(|s| s.success());
         if !ok {
-            eprintln!("warning: could not make {}; {} will have a generic icon", icns.display(), app.long_name);
+            eprintln!("warning: could not make {}; {} will have a generic icon", icns.display(), app.name);
         }
         // An ad-hoc signature, so macOS treats the bundle as one signed app.
         // By default such a signature is identified by a hash of the binary,
@@ -127,10 +140,11 @@ pub fn uninstall() -> Result<(), String> {
     for app in APPS {
         // A removed app must not be started at login.
         let _ = std::fs::remove_file(home().join("Library/LaunchAgents").join(format!("{}.plist", app.id)));
-        let b = bundle(app);
-        if b.exists() {
-            std::fs::remove_dir_all(&b).map_err(io(b.display()))?;
-            println!("removed {}", b.display());
+        for b in [Some(bundle(app)), former_bundle(app)].into_iter().flatten() {
+            if b.exists() {
+                std::fs::remove_dir_all(&b).map_err(io(b.display()))?;
+                println!("removed {}", b.display());
+            }
         }
     }
     Ok(())
@@ -246,7 +260,8 @@ pub fn install() -> Result<(), String> {
         }
         let ico = dir.join(format!("{}.ico", app.bin));
         write_ico(&pngs, &ico).map_err(io(ico.display()))?;
-        let lnk = menu.join(format!("{}.lnk", app.long_name));
+        let _ = std::fs::remove_file(menu.join(format!("{}.lnk", app.former)));
+        let lnk = menu.join(format!("{}.lnk", app.name));
         let script = format!(
             "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({lnk}); $s.TargetPath = {exe}; $s.IconLocation = {ico}; $s.WorkingDirectory = $env:USERPROFILE; $s.Save()",
             lnk = ps_quote(&lnk),
@@ -257,7 +272,7 @@ pub fn install() -> Result<(), String> {
         if !ok {
             return Err(format!("could not create the Start menu shortcut {}", lnk.display()));
         }
-        println!("installed {}", app.long_name);
+        println!("installed {}", app.name);
     }
     println!("\nThe apps are in the Start menu's Neo folder.");
     Ok(())

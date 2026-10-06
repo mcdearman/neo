@@ -1,4 +1,4 @@
-//! Neo Videos: play video files.
+//! Videos: play video files.
 //!
 //!     cargo run -p neo-videos -- clip.mp4
 //!     cargo run -p neo-videos -- --snapshot target/snapshots

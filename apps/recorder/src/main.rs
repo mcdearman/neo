@@ -1,4 +1,4 @@
-//! Neo Recorder: record the screen, one window, or an area you frame.
+//! NeoCap: record the screen, one window, or an area you frame.
 //!
 //!     cargo run -p neo-recorder
 //!     cargo run -p neo-recorder -- --mode area --record --for 10
@@ -213,7 +213,7 @@ mod settings {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, format!("# Neo Recorder settings.\nlaunch-at-startup = {launch_at_startup}\n"));
+        let _ = std::fs::write(path, format!("# NeoCap settings.\nlaunch-at-startup = {launch_at_startup}\n"));
     }
 
     /// Whether this is an installed copy and not one run from Cargo's build
@@ -323,7 +323,7 @@ impl Recorder {
     /// Makes startup match the setting, and points it at this copy of the app.
     fn apply_autostart(&mut self) {
         let Ok(program) = std::env::current_exe() else { return };
-        let entry = neo_desktop::autostart::Entry { id: "org.neo.Recorder", name: "Neo Recorder", program: &program, args: &["--hidden"] };
+        let entry = neo_desktop::autostart::Entry { id: "org.neo.Recorder", name: "NeoCap", program: &program, args: &["--hidden"] };
         let result = if self.autostart {
             if neo_desktop::autostart::is_enabled(&entry) { Ok(()) } else { neo_desktop::autostart::enable(&entry) }
         } else {
@@ -371,7 +371,7 @@ impl App for Recorder {
     type Message = Msg;
 
     fn title(&self) -> String {
-        "Recorder".into()
+        "NeoCap".into()
     }
 
     fn window(&self) -> WindowSettings {
@@ -674,7 +674,7 @@ impl Recorder {
             }
             Msg::Open => {
                 if let Phase::Done(saved) = &self.phase {
-                    // Screenshots open in Neo Photos and recordings in Neo Videos, when installed.
+                    // Screenshots open in Photos and recordings in Videos, when installed.
                     let _ = neo_desktop::fs::open_file(&saved.path);
                 }
             }
@@ -796,7 +796,7 @@ impl Recorder {
         options = options.push(option("Save as GIF", format!("{} frames a second, up to {} pixels wide.", media::GIF_FPS, media::GIF_MAX_WIDTH), self.gif, Msg::Gif));
         // The Recorder has no menu bar to put a Settings entry in, so its
         // glass switch lives with its other options.
-        let glass_note = if self.desktop.appearance.glass.enabled { "Translucent, like other Neo windows." } else { "Glass windows are off in Neo Settings." };
+        let glass_note = if self.desktop.appearance.glass.enabled { "Translucent, like other Neo windows." } else { "Glass windows are off in Settings." };
         options = options.push(option("Glass window", glass_note.into(), self.desktop.prefs.glass, Msg::Glass));
         if cfg!(target_os = "macos") {
             options = options.push(option("Show mouse clicks", String::new(), self.show_clicks, Msg::ShowClicks));
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn reads_the_startup_setting() {
-        assert_eq!(settings::parse("# Neo Recorder settings.\nlaunch-at-startup = false\n"), Some(false));
+        assert_eq!(settings::parse("# NeoCap settings.\nlaunch-at-startup = false\n"), Some(false));
         assert_eq!(settings::parse("launch-at-startup = true"), Some(true));
         assert_eq!(settings::parse(""), None, "never chosen: the default applies");
         assert!(!settings::installed(), "a test binary lives in Cargo's target folder");

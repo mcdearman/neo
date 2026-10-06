@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Neo Code
+Name=NeoCode
 GenericName=Code Editor
 Comment=Edit code and text, with optional Vim keys
 Exec=neo-code

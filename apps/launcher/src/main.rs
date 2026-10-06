@@ -1,4 +1,4 @@
-//! Neo Launcher: type a few letters to find and open an app.
+//! Launcher: type a few letters to find and open an app.
 //!
 //!     cargo run -p neo-launcher            # opens the search window
 //!     cargo run -p neo-launcher -- --hidden
@@ -340,7 +340,7 @@ fn keep_at_startup() {
     }
     let wanted = !std::fs::read_to_string(neo_desktop::config_dir().join("launcher.conf")).unwrap_or_default().lines().any(|l| l.replace(' ', "") == "launch-at-startup=false");
     let Ok(program) = std::env::current_exe() else { return };
-    let entry = neo_desktop::autostart::Entry { id: "org.neo.Launcher", name: "Neo Launcher", program: &program, args: &["--hidden"] };
+    let entry = neo_desktop::autostart::Entry { id: "org.neo.Launcher", name: "Launcher", program: &program, args: &["--hidden"] };
     let _ = if !wanted {
         neo_desktop::autostart::disable(&entry)
     } else if !neo_desktop::autostart::is_enabled(&entry) {

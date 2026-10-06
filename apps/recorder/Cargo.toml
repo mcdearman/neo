@@ -1,6 +1,6 @@
 [package]
 name = "neo-recorder"
-description = "Neo Recorder: record the screen, a window or an area"
+description = "NeoCap: record the screen, a window or an area"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

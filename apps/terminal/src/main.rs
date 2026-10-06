@@ -1,4 +1,4 @@
-//! Neo Terminal: a GPU-drawn terminal emulator.
+//! NeoTerm: a GPU-drawn terminal emulator.
 //!
 //! Terminal emulation and the pty come from `alacritty_terminal`; Neo draws
 //! the grid and handles input.
@@ -174,7 +174,7 @@ impl App for Terminal {
     type Message = Msg;
 
     fn title(&self) -> String {
-        self.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "Terminal".into())
+        self.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "NeoTerm".into())
     }
 
     fn window(&self) -> WindowSettings {
@@ -223,7 +223,7 @@ impl App for Terminal {
     }
 
     fn view(&self) -> Element<Msg> {
-        self.desktop.with_settings(self.content(), "Terminal Settings", Msg::Desktop, vec![])
+        self.desktop.with_settings(self.content(), "NeoTerm Settings", Msg::Desktop, vec![])
     }
 }
 

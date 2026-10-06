@@ -1,4 +1,4 @@
-//! Neo Code: a small code editor built with Neo, with optional Vim or
+//! NeoCode: a small code editor built with Neo, with optional Vim or
 //! Helix keys.
 //!
 //!     cargo run -p neo-code                  # sample project
@@ -364,7 +364,7 @@ impl App for NeoCode {
     fn title(&self) -> String {
         match self.active_tab() {
             Some(t) => format!("{}{} · {}", if t.dirty() { "• " } else { "" }, t.name, self.project),
-            None => format!("Neo Code · {}", self.project),
+            None => format!("NeoCode · {}", self.project),
         }
     }
 
@@ -540,7 +540,7 @@ impl App for NeoCode {
     }
 
     fn view(&self) -> Element<Msg> {
-        self.desktop.with_settings(self.content(), "Code Settings", Msg::Desktop, self.settings_rows())
+        self.desktop.with_settings(self.content(), "NeoCode Settings", Msg::Desktop, self.settings_rows())
     }
 }
 

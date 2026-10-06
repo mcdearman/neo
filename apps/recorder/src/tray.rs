@@ -65,7 +65,7 @@ mod imp {
             let shot = MenuItem::new("Take Screenshot…", true, None);
             let toggle = MenuItem::new(toggle_label(state.recording), true, None);
             let autostart = CheckMenuItem::new("Launch at Startup", true, state.autostart, None);
-            let quit = MenuItem::new("Quit Neo Recorder", true, None);
+            let quit = MenuItem::new("Quit NeoCap", true, None);
             let menu = Menu::new();
             menu.append_items(&[&show, &shot, &toggle, &PredefinedMenuItem::separator(), &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
             let (show_id, shot_id, toggle_id, autostart_id, quit_id) = (show.id().clone(), shot.id().clone(), toggle.id().clone(), autostart.id().clone(), quit.id().clone());
@@ -87,7 +87,7 @@ mod imp {
                 send(action);
             }));
             // A template icon is tinted by the system to suit a light or dark menu bar.
-            let icon = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Neo Recorder");
+            let icon = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("NeoCap");
             #[cfg(target_os = "macos")]
             let icon = if state.recording { icon.with_icon(icon_for(true)?) } else { icon.with_icon_templated(icon_for(false)?) };
             #[cfg(not(target_os = "macos"))]
@@ -128,7 +128,7 @@ mod imp {
         }
 
         fn title(&self) -> String {
-            "Neo Recorder".into()
+            "NeoCap".into()
         }
 
         fn icon_name(&self) -> String {
@@ -150,7 +150,7 @@ mod imp {
                 ksni::MenuItem::Separator,
                 CheckmarkItem { label: "Launch at Startup".into(), checked: self.state.autostart, activate: Box::new(|t: &mut Self| (t.send)(TrayAction::ToggleAutostart)), ..Default::default() }.into(),
                 ksni::MenuItem::Separator,
-                item("Quit Neo Recorder", TrayAction::Quit),
+                item("Quit NeoCap", TrayAction::Quit),
             ]
         }
     }

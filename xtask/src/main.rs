@@ -6,7 +6,7 @@
 //!
 //! Where things go:
 //!
-//! - macOS: `~/Applications/Neo Files.app` and so on, which Launchpad,
+//! - macOS: `~/Applications/Files.app` and so on, which Launchpad,
 //!   Spotlight and the Dock pick up.
 //! - Linux: binaries in `~/.local/bin`, menu entries in
 //!   `~/.local/share/applications` and icons in `~/.local/share/icons`.
