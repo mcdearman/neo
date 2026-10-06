@@ -17,6 +17,8 @@ struct EditorState {
     dragging: bool,
     /// The word the mouse is over, by where it starts.
     pointed: Option<Pos>,
+    /// The lens label the mouse is over.
+    lens_hover: Option<(usize, usize)>,
     last_click: Option<(Instant, Pos)>,
     blink_origin: Option<Instant>,
     view: Size,
@@ -43,6 +45,11 @@ pub struct TextEditor<M> {
     popup_at: Option<Pos>,
     on_point: Option<Box<dyn Fn(Option<Pos>) -> M>>,
     on_jump: Option<Box<dyn Fn(Pos) -> M>>,
+    /// Sorted by line, one to a line.
+    lenses: Vec<EditorLens>,
+    on_lens: Option<Box<dyn Fn(usize, usize) -> M>>,
+    /// Each lens's labels as laid out.
+    lens_rows: Vec<Vec<TextLayout>>,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
     /// The popup's rows as laid out, and the first list item among them.
     popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
@@ -80,6 +87,9 @@ impl<M> TextEditor<M> {
             popup_at: None,
             on_point: None,
             on_jump: None,
+            lenses: vec![],
+            on_lens: None,
+            lens_rows: vec![],
             on_popup_key: None,
             popup_rows: vec![],
             popup_first: 0,
@@ -149,6 +159,17 @@ impl<M> TextEditor<M> {
     /// something is defined.
     pub fn on_jump(mut self, f: impl Fn(Pos) -> M + 'static) -> Self {
         self.on_jump = Some(Box::new(f));
+        self
+    }
+
+    /// Shows things that can be done above lines of the text, each a
+    /// row of labels to click. Called with the line and which label.
+    pub fn lenses(mut self, mut lenses: Vec<EditorLens>, on_lens: impl Fn(usize, usize) -> M + 'static) -> Self {
+        lenses.retain(|l| l.line < self.lines.len() && !l.labels.is_empty());
+        lenses.sort_by_key(|l| l.line);
+        lenses.dedup_by_key(|l| l.line);
+        self.lenses = lenses;
+        self.on_lens = Some(Box::new(on_lens));
         self
     }
 
@@ -225,6 +246,14 @@ pub enum EditorPopup {
     List { items: Vec<(String, Option<String>)>, selected: usize },
 }
 
+/// Things that can be done to what starts on a line, shown in a row of
+/// their own above it: "Run Test", "Debug".
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorLens {
+    pub line: usize,
+    pub labels: Vec<String>,
+}
+
 /// One line of a popup's note.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PopupLine {
@@ -274,7 +303,7 @@ impl<M: 'static> TextEditor<M> {
     }
 
     fn line_y(&self, b: Rect, scroll: Point, line: usize) -> f32 {
-        b.y + PAD_Y + line as f32 * self.line_h - scroll.y
+        b.y + PAD_Y + self.top_of(line) - scroll.y
     }
 
     fn caret_x(&self, line: usize, col: usize) -> f32 {
@@ -284,6 +313,55 @@ impl<M: 'static> TextEditor<M> {
         }
     }
 
+    /// How far down the text line `line` starts: every line above it, and
+    /// every row of lenses above or on it.
+    fn top_of(&self, line: usize) -> f32 {
+        (line + self.lenses.partition_point(|l| l.line <= line)) as f32 * self.line_h
+    }
+
+    /// The line at this height from the top of the text, and whether the
+    /// height is on that line's row of lenses rather than on its text.
+    fn line_at(&self, rel: f32) -> (usize, bool) {
+        let row = (rel.max(0.0) / self.line_h.max(1.0)) as usize;
+        // The k-th lens has k rows of lenses above it.
+        for (k, lens) in self.lenses.iter().enumerate() {
+            match row.cmp(&(lens.line + k)) {
+                std::cmp::Ordering::Less => return (row - k, false),
+                std::cmp::Ordering::Equal => return (lens.line, true),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        (row - self.lenses.len(), false)
+    }
+
+    /// Where each label of a lens is drawn, given the row's top.
+    fn lens_spots(&self, b: Rect, scroll: Point, k: usize) -> Vec<Rect> {
+        let Some((lens, labels)) = self.lenses.get(k).zip(self.lens_rows.get(k)) else { return vec![] };
+        let top = self.line_y(b, scroll, lens.line) - self.line_h;
+        // In line with where the text of the line below starts.
+        let text = &self.lines[lens.line];
+        let indent = text.len() - text.trim_start().len();
+        let mut x = self.text_x(b, scroll) + self.char_w * text[..indent].chars().count() as f32;
+        labels
+            .iter()
+            .map(|l| {
+                let r = Rect::new(x, top, l.size().w, self.line_h);
+                x += l.size().w + self.char_w * 2.5;
+                r
+            })
+            .collect()
+    }
+
+    /// The lens label at window point `p`: which lens, and which label.
+    fn lens_at(&self, b: Rect, scroll: Point, p: Point) -> Option<(usize, usize)> {
+        if !b.contains(p) || p.x <= b.x + self.gutter_w {
+            return None;
+        }
+        let (line, true) = self.line_at(p.y - b.y - PAD_Y + scroll.y) else { return None };
+        let k = self.lenses.iter().position(|l| l.line == line)?;
+        self.lens_spots(b, scroll, k).iter().position(|r| p.x >= r.x - 2.0 && p.x <= r.right() + 2.0).map(|i| (k, i))
+    }
+
     /// Where the word under window point `p` starts, if there is one: not
     /// past the end of a line, in the margin, or between words.
     fn word_at(&self, b: Rect, scroll: Point, p: Point) -> Option<Pos> {
@@ -291,7 +369,7 @@ impl<M: 'static> TextEditor<M> {
             return None;
         }
         let rel = p.y - b.y - PAD_Y + scroll.y;
-        let line = (rel >= 0.0).then(|| (rel / self.line_h) as usize).filter(|l| *l < self.lines.len())?;
+        let line = (rel >= 0.0).then(|| self.line_at(rel)).filter(|(l, lens)| !lens && *l < self.lines.len())?.0;
         let (row, text) = (self.row(line)?, &self.lines[line]);
         let x = p.x - self.text_x(b, scroll);
         if x < 0.0 || x >= row.size().w {
@@ -322,7 +400,7 @@ impl<M: 'static> TextEditor<M> {
     /// Document position under window point `p`, clamped to the text.
     fn pos_at(&self, b: Rect, scroll: Point, p: Point) -> Pos {
         let rel = p.y - b.y - PAD_Y + scroll.y;
-        let line = if rel < 0.0 { 0 } else { ((rel / self.line_h) as usize).min(self.lines.len() - 1) };
+        let line = if rel < 0.0 { 0 } else { self.line_at(rel).0.min(self.lines.len() - 1) };
         let x = p.x - self.text_x(b, scroll);
         let col = if x <= 0.0 {
             0
@@ -410,7 +488,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let theme = *cx.theme();
         let colors = SyntaxColors::new(&theme.palette(), theme.scheme, theme.accent);
         let text_w = size.w - self.gutter_w - PAD_X;
-        let total_h = self.lines.len() as f32 * self.line_h + PAD_Y * 2.0;
+        let total_h = (self.lines.len() + self.lenses.len()) as f32 * self.line_h + PAD_Y * 2.0;
         let max_y = if total_h > size.h { total_h - size.h * 0.5 } else { 0.0 };
         let max_x = (self.longest + PAD_X * 2.0 + self.char_w - text_w).max(0.0);
 
@@ -426,6 +504,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             cx.text().layout(line, &style, None)
         };
         let (line_h, cursor, revision) = (self.line_h, self.cursor, self.revision);
+        let cursor_top = self.top_of(cursor.line);
         let caret = if cursor.col > 0 { cursor_line_layout.caret(cursor.col).x } else { 0.0 };
         // Vim: copy yanks to the system clipboard once each.
         if let Some((serial, text)) = self.vim.as_ref().and_then(|v| v.clipboard.clone())
@@ -440,7 +519,6 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         if let Some((serial, request)) = scroll_request
             && st.scroll_serial != serial {
                 st.scroll_serial = serial;
-                let cursor_top = cursor.line as f32 * line_h;
                 match request {
                     Scroll::Center => st.scroll.y = cursor_top + PAD_Y + line_h * 0.5 - size.h * 0.5,
                     Scroll::Top => st.scroll.y = cursor_top,
@@ -453,7 +531,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let moved = st.last_cursor.is_some_and(|(p, _)| p != cursor) || st.last_cursor.is_none_or(|(_, r)| r != revision as usize);
             st.last_cursor = Some((cursor, revision as usize));
             if moved {
-                let top = cursor.line as f32 * line_h;
+                let top = cursor_top;
                 if top < st.scroll.y {
                     st.scroll.y = top;
                 } else if top + line_h + PAD_Y * 2.0 > st.scroll.y + size.h {
@@ -471,12 +549,15 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         st.scroll.x = st.scroll.x.clamp(0.0, max_x);
         let scroll = st.scroll;
 
-        let top = ((scroll.y - PAD_Y).max(0.0) / self.line_h).ceil() as usize;
+        let top = self.line_at(((scroll.y - PAD_Y).max(0.0) / self.line_h).ceil() * self.line_h).0;
         let whole = ((size.h - PAD_Y * 2.0) / self.line_h).floor().max(1.0) as usize;
         self.viewport = (top.min(self.lines.len() - 1), whole);
 
         // Lay out only the visible lines.
-        self.first = ((scroll.y - PAD_Y) / self.line_h).floor().max(0.0) as usize;
+        self.first = self.line_at(scroll.y - PAD_Y).0;
+        // The labels over lines, smaller than the text they sit above.
+        let lens_style = TextStyle { size: style.size * 0.86, family: FontFamily::Sans, ..style };
+        self.lens_rows = self.lenses.iter().map(|l| l.labels.iter().map(|label| cx.text().layout(label, &lens_style, None)).collect()).collect();
         let count = (size.h / self.line_h).ceil() as usize + 2;
         let last = (self.first + count).min(self.lines.len());
         self.first = self.first.min(last);
@@ -512,9 +593,9 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let p = theme.palette();
         let now = cx.now();
         let focused = cx.is_focused();
-        let (scroll, blink_origin) = {
+        let (scroll, blink_origin, lens_hover) = {
             let st = cx.state::<EditorState>();
-            (st.scroll, st.blink_origin)
+            (st.scroll, st.blink_origin, st.lens_hover)
         };
         let text_area = Rect::new(b.x + self.gutter_w, b.y, (b.w - self.gutter_w).max(0.0), b.h);
         let sel = self.selection();
@@ -588,6 +669,16 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let y = self.line_y(b, scroll, self.first + i);
             cx.scene.text(layout, Point::new(tx.round(), (y + (self.line_h - layout.size().h) * 0.5).round()), default);
         }
+        // Lenses, each in the row above its line: quiet until pointed at.
+        for (k, lens) in self.lenses.iter().enumerate() {
+            if lens.line + 1 < self.first || lens.line > self.first + self.rows.len() {
+                continue;
+            }
+            for (i, (spot, label)) in self.lens_spots(b, scroll, k).iter().zip(&self.lens_rows[k]).enumerate() {
+                let color = if lens_hover == Some((k, i)) { p.accent_text } else { p.muted };
+                cx.scene.text(label, Point::new(spot.x.round(), (spot.y + (self.line_h - label.size().h) * 0.5 + 1.0).round()), color);
+            }
+        }
         // The other selections' carets, a little fainter than the main one.
         let shown = self.first..self.first + self.rows.len();
         for c in self.extras.iter().map(|x| x.cursor).filter(|c| shown.contains(&c.line)) {
@@ -645,7 +736,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         }
 
         // Scrollbars.
-        let total_h = self.lines.len() as f32 * self.line_h + PAD_Y * 2.0;
+        let total_h = (self.lines.len() + self.lenses.len()) as f32 * self.line_h + PAD_Y * 2.0;
         if total_h > b.h {
             let content = total_h + b.h * 0.5;
             let h = (b.h * b.h / content).max(28.0);
@@ -742,7 +833,14 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 let dragging = cx.state::<EditorState>().dragging;
                 let word = if dragging { None } else { self.word_at(b, scroll, *pos) };
                 self.point(cx, word);
-                if b.contains(*pos) {
+                let lens = if dragging { None } else { self.lens_at(b, scroll, *pos) };
+                if cx.state::<EditorState>().lens_hover != lens {
+                    cx.state::<EditorState>().lens_hover = lens;
+                    cx.request_redraw();
+                }
+                if lens.is_some() {
+                    cx.set_cursor(CursorIcon::Pointer);
+                } else if b.contains(*pos) {
                     // With Command held, a word is somewhere to go.
                     let jump = word.is_some() && self.on_jump.is_some() && cx.modifiers().command();
                     cx.set_cursor(if jump {
@@ -771,6 +869,11 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             Event::PointerPressed { pos, button: PointerButton::Primary } => {
                 if !b.contains(*pos) {
                     return Status::Ignored;
+                }
+                // A lens is a button, not somewhere to put the caret.
+                if let (Some((k, i)), Some(on_lens)) = (self.lens_at(b, scroll, *pos), &self.on_lens) {
+                    cx.emit(on_lens(self.lenses[k].line, i));
+                    return Status::Captured;
                 }
                 cx.request_focus();
                 let p = self.pos_at(b, scroll, *pos);

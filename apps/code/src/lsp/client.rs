@@ -164,6 +164,19 @@ const TOKEN_TYPES: &[&str] = &[
     "number", "regexp", "operator", "decorator",
 ];
 
+/// Something that can be done to a part of a file, which the server
+/// offers and the editor shows above the line it is about.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lens {
+    /// The line it is about, from zero.
+    pub line: usize,
+    pub title: String,
+    /// What to do when it is chosen. Some commands the server carries out
+    /// when asked; others it only names, and the editor has to know how.
+    pub command: String,
+    pub arguments: Value,
+}
+
 /// Something a server told the client.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -179,6 +192,10 @@ pub enum Event {
     Tokens { path: PathBuf, tokens: Vec<Token> },
     /// The server's view of the code changed: ask for tokens again.
     RefreshTokens,
+    /// The things that can be done to parts of a file: run this test,
+    /// debug that function.
+    Lenses { path: PathBuf, lenses: Vec<Lens> },
+    RefreshLenses,
     /// Something for the user to read.
     Message(String),
     Failed(String),
@@ -199,6 +216,8 @@ enum Pending {
     Completion,
     Formatting(PathBuf),
     Tokens(PathBuf),
+    Lenses(PathBuf),
+    Executed,
 }
 
 /// One running language server.
@@ -217,6 +236,12 @@ pub struct Client {
     pub can_format: bool,
     /// The server can say what each stretch of a file is.
     pub can_colour: bool,
+    /// Whether it offers things to do above lines of a file.
+    pub can_lens: bool,
+    /// The commands it will carry out itself when asked.
+    pub commands: Vec<String>,
+    /// The program that was started, for running it in other ways.
+    pub program: Option<PathBuf>,
     /// The server's names for token kinds, by the numbers it sends.
     legend: Vec<String>,
     /// The last lines the server wrote to its error output, which is where
@@ -330,7 +355,7 @@ impl Client {
     /// A client writing to `out`. It starts the handshake at once; other
     /// messages wait until the server answers it.
     pub fn new(out: Box<dyn Write + Send>, root: &Path) -> Self {
-        let mut client = Self { out, child: None, next_id: 1, pending: HashMap::new(), ready: false, queued: vec![], utf8: false, triggers: vec![], can_format: false, can_colour: false, legend: vec![], errors: Default::default() };
+        let mut client = Self { out, child: None, next_id: 1, pending: HashMap::new(), ready: false, queued: vec![], utf8: false, triggers: vec![], can_format: false, can_colour: false, can_lens: false, commands: vec![], program: None, legend: vec![], errors: Default::default() };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let params = json!({
             "processId": std::process::id(),
@@ -346,9 +371,13 @@ impl Client {
                     "definition": {},
                     "completion": { "completionItem": { "snippetSupport": false } },
                     "formatting": {},
+                    "codeLens": {},
                     "semanticTokens": { "requests": { "full": true }, "tokenTypes": TOKEN_TYPES, "tokenModifiers": [], "formats": ["relative"] },
                 },
-                "workspace": { "semanticTokens": { "refreshSupport": true } },
+                "workspace": { "semanticTokens": { "refreshSupport": true }, "codeLens": { "refreshSupport": true } },
+                // rust-analyzer only offers Run and Debug to an editor that
+                // says it knows what those commands mean.
+                "experimental": { "commands": { "commands": ["rust-analyzer.runSingle", "rust-analyzer.debugSingle"] } },
             },
         });
         let id = client.take_id(Pending::Initialize);
@@ -392,6 +421,7 @@ impl Client {
             });
         }
         client.child = Some(child);
+        client.program = Some(found.program.clone());
         Ok(client)
     }
 
@@ -481,6 +511,21 @@ impl Client {
         self.request("textDocument/formatting", params, Pending::Formatting(path.to_path_buf()));
     }
 
+    /// Asks what can be done to parts of the file. As with tokens, only
+    /// the answer about the latest text is wanted.
+    pub fn lenses(&mut self, path: &Path) {
+        if !self.can_lens {
+            return;
+        }
+        self.pending.retain(|_, p| !matches!(p, Pending::Lenses(other) if other == path));
+        self.request("textDocument/codeLens", json!({ "textDocument": { "uri": uri(path) } }), Pending::Lenses(path.to_path_buf()));
+    }
+
+    /// Asks the server to carry out one of its own commands.
+    pub fn execute(&mut self, command: &str, arguments: &Value) {
+        self.request("workspace/executeCommand", json!({ "command": command, "arguments": arguments }), Pending::Executed);
+    }
+
     /// Asks what each stretch of the file is. Only the answer about the
     /// file's latest text is wanted, so earlier requests are dropped.
     pub fn tokens(&mut self, path: &Path) {
@@ -506,7 +551,11 @@ impl Client {
                     _ => Value::Null,
                 };
                 self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-                if method == "workspace/semanticTokens/refresh" { vec![Event::RefreshTokens] } else { vec![] }
+                match method {
+                    "workspace/semanticTokens/refresh" => vec![Event::RefreshTokens],
+                    "workspace/codeLens/refresh" => vec![Event::RefreshLenses],
+                    _ => vec![],
+                }
             }
             (None, Some("textDocument/publishDiagnostics")) => {
                 let params = &message["params"];
@@ -559,6 +608,8 @@ impl Client {
                 let colours = &caps["semanticTokensProvider"];
                 self.legend = colours["legend"]["tokenTypes"].as_array().map(|a| a.iter().map(|t| t.as_str().unwrap_or_default().to_owned()).collect()).unwrap_or_default();
                 self.can_colour = !self.legend.is_empty() && (colours["full"].as_bool() == Some(true) || colours["full"].is_object());
+                self.can_lens = caps["codeLensProvider"].is_object() || caps["codeLensProvider"].as_bool() == Some(true);
+                self.commands = caps["executeCommandProvider"]["commands"].as_array().map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect()).unwrap_or_default();
                 self.triggers = caps["completionProvider"]["triggerCharacters"].as_array().map(|a| a.iter().filter_map(|c| c.as_str().and_then(|s| s.chars().next())).collect()).unwrap_or_default();
                 self.send(&json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
                 self.ready = true;
@@ -602,6 +653,13 @@ impl Client {
                 list.sort_by(|a, b| a.0.cmp(&b.0));
                 vec![Event::Completions(list.into_iter().map(|(_, c)| c).collect())]
             }
+            Pending::Lenses(path) => {
+                // One with no command yet would have to be asked about
+                // again to get one; those are left out.
+                let lenses = result.as_array().map(|a| a.iter().filter_map(|l| Some(Lens { line: l["range"]["start"]["line"].as_u64()? as usize, title: l["command"]["title"].as_str()?.to_owned(), command: l["command"]["command"].as_str().filter(|c| !c.is_empty())?.to_owned(), arguments: l["command"]["arguments"].clone() })).collect()).unwrap_or_default();
+                vec![Event::Lenses { path, lenses }]
+            }
+            Pending::Executed => error.map(|e| vec![Event::Message(e.to_owned())]).unwrap_or_default(),
             Pending::Tokens(path) => {
                 // Five numbers a token: lines and columns relative to the
                 // token before, a length, a kind, and modifiers.

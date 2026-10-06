@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 mod intel;
 mod lsp;
+mod runner;
 
 use neo::prelude::*;
-use neo::{Key, KeyEvent, Proxy, Size};
+use neo::{Color, Key, KeyEvent, Proxy, Size};
 use neo_desktop::Desktop;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,8 @@ struct Tab {
     /// What the server says each stretch of the text is, for colouring.
     tokens: std::rc::Rc<[EditorToken]>,
     popup: Option<intel::Popup>,
+    /// What the server offers to do to parts of the file.
+    lenses: Vec<lsp::Lens>,
     /// The word the mouse is over, since when, and whether the server has
     /// been asked about it yet.
     pointed: Option<(Pos, Instant, bool)>,
@@ -216,6 +219,11 @@ struct NeoCode {
     root: Option<PathBuf>,
     desktop: Desktop,
     servers: intel::Servers,
+    /// What was last run from a lens, showing under the editor.
+    run: Option<runner::Run>,
+    runs: u64,
+    /// Whether choosing a lens really starts its command.
+    runs_commands: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +256,14 @@ enum Msg {
     Point(Option<Pos>),
     /// A word was clicked with Command held: go to where it is defined.
     Jump,
+    /// The lens on this line, and which of its labels, was clicked.
+    Lens(usize, usize),
+    /// A line printed by what is running, and how it ended.
+    RunSaid(u64, String),
+    RunEnded(u64, Option<i32>),
+    RunStop,
+    RunAgain,
+    RunClose,
     /// See whether the mouse has rested on a word long enough.
     HoverTick,
     PopupKey(PopupKey),
@@ -270,7 +286,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test) };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -311,7 +327,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default() }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test) }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -561,7 +577,7 @@ impl App for NeoCode {
                 };
                 let mut doc = Document::new(&text);
                 doc.set_keymap(self.keymap);
-                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk, server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None, pointed: None, hover_for: None });
+                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk, server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None, lenses: vec![], pointed: None, hover_for: None });
                 self.active = Some(self.tabs.len() - 1);
                 self.lsp_open(self.tabs.len() - 1);
             }
@@ -636,6 +652,33 @@ impl App for NeoCode {
             Msg::Ask(what) => self.ask(what),
             Msg::Point(word) => self.point(word),
             Msg::HoverTick => self.hover_rested(),
+            Msg::Lens(line, index) => self.lens_chosen(line, index),
+            Msg::RunSaid(id, line) => {
+                if let Some(run) = self.run.as_mut().filter(|r| r.id == id) {
+                    run.push(&line);
+                }
+            }
+            Msg::RunEnded(id, code) => {
+                // One that was stopped stays stopped, whatever it exited with.
+                if let Some(run) = self.run.as_mut().filter(|r| r.id == id && r.status == runner::Status::Running) {
+                    run.status = runner::Status::Ended(code);
+                }
+            }
+            Msg::RunStop => {
+                if let Some(run) = &mut self.run {
+                    run.stop();
+                }
+            }
+            Msg::RunAgain => {
+                if let Some(spec) = self.run.as_ref().map(|r| r.spec.clone()) {
+                    self.start_run(spec);
+                }
+            }
+            Msg::RunClose => {
+                if let Some(mut run) = self.run.take() {
+                    run.stop();
+                }
+            }
             Msg::Jump => self.ask(intel::Ask::Definition),
             Msg::PopupKey(key) => self.popup_key(key),
             Msg::Keys(i) => {
@@ -752,7 +795,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).lenses(self.editor_lenses(t), Msg::Lens).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -772,7 +815,38 @@ impl NeoCode {
             .height(Length::Fill)
             .into(),
         };
-        column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor).into()
+        let mut col = column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor);
+        if let Some(run) = &self.run {
+            col = col.push(Divider::horizontal()).push(self.run_panel(run, surface));
+        }
+        col.into()
+    }
+
+    /// What was run from a lens: its name, how it stands, and what it
+    /// has printed, under the editor.
+    fn run_panel(&self, run: &runner::Run, surface: Color) -> Element<Msg> {
+        let running = run.status == runner::Status::Running;
+        let tone = match &run.status {
+            runner::Status::Running => Tone::Accent,
+            _ if run.ended_well() => Tone::Good,
+            runner::Status::Stopped => Tone::Muted,
+            _ => Tone::Bad,
+        };
+        let mut head = row()
+            .spacing(8.0)
+            .align(Align::Center)
+            .width(Length::Fill)
+            .push(icon(if running { icons::PLAY } else if run.ended_well() { icons::CIRCLE_CHECK } else { icons::CIRCLE_ALERT }).size(14.0).tone(tone))
+            .push(text(run.spec.title.clone()).role(TextRole::Strong).no_wrap())
+            .push(container(text(run.summary()).role(TextRole::Caption).tone(tone).no_wrap()).width(Length::Fill));
+        head = if running { head.push(Button::new(text("Stop").role(TextRole::Caption)).padding([10.0, 3.0]).radius(6.0).on_press(Msg::RunStop)) } else { head.push(Button::new(text("Run Again").role(TextRole::Caption)).padding([10.0, 3.0]).radius(6.0).on_press(Msg::RunAgain)) };
+        head = head.push(icon_button(icons::X, 22.0).kind(ButtonKind::Ghost).on_press(Msg::RunClose));
+        column()
+            .width(Length::Fill)
+            .height(220.0)
+            .push(container(head).padding([10.0, 4.0]).width(Length::Fill))
+            .push(container(text_editor(&run.output).language(Language::Plain).into_element_keyed("run-output")).background(Background::Color(surface)).width(Length::Fill).height(Length::Fill))
+            .into()
     }
 
     /// Code's own rows for the settings panel.
@@ -1187,7 +1261,7 @@ mod tests {
             let mut s = Self { h, sink, file: root.join("src/lib.rs") };
             // The handshake: answer `initialize`.
             let hello = s.sink.take();
-            let caps = json!({ "positionEncoding": "utf-8", "documentFormattingProvider": true, "completionProvider": { "triggerCharacters": ["."] }, "semanticTokensProvider": { "legend": { "tokenTypes": ["function", "keyword", "type"] }, "full": true } });
+            let caps = json!({ "positionEncoding": "utf-8", "documentFormattingProvider": true, "completionProvider": { "triggerCharacters": ["."] }, "semanticTokensProvider": { "legend": { "tokenTypes": ["function", "keyword", "type"] }, "full": true }, "codeLensProvider": {}, "executeCommandProvider": { "commands": ["tool.tidy"] } });
             s.says(json!({ "id": hello[0]["id"], "result": { "capabilities": caps } }));
             let lib = s.h.app().nodes.iter().position(|n| n.name == "lib.rs").unwrap();
             s.h.app_mut().update(Msg::Open(lib));
@@ -1437,6 +1511,71 @@ mod tests {
     }
 
     #[test]
+    fn lenses_show_above_their_lines_and_run_what_they_offer() {
+        let mut s = Served::new("lsp-lens", "pub fn one() {}\n\n#[test]\nfn adds() {\n    assert_eq!(1 + 1, 2);\n}\n");
+        let ask = s.request("textDocument/codeLens");
+        let plain = s.h.render(1.0);
+        let run = json!({ "label": "test adds", "kind": "cargo", "args": { "cargoArgs": ["test", "--lib"], "executableArgs": ["adds", "--exact"], "cwd": s.file.parent().unwrap().parent().unwrap() } });
+        let lens = |title: &str, command: &str, arguments: Value| json!({ "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 7 } }, "command": { "title": title, "command": command, "arguments": arguments } });
+        s.says(json!({ "id": ask["id"], "result": [
+            lens("▶\u{fe0e} Run Test", "rust-analyzer.runSingle", json!([run.clone()])),
+            lens("⚙\u{fe0e} Debug", "rust-analyzer.debugSingle", json!([run])),
+            lens("Tidy", "tool.tidy", json!(["x"])),
+            lens("Odd", "tool.unheard_of", json!([])),
+            { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } } },
+        ] }));
+        assert_eq!(s.h.app().editor_lenses(s.tab()), [EditorLens { line: 3, labels: vec!["Run Test".into(), "Debug".into(), "Tidy".into(), "Odd".into()] }], "one row over the line, without the symbols; one with no command is left out");
+        assert!(s.h.render(1.0) != plain, "they show");
+        // The text below the row moves down by a line, and the mouse finds
+        // the labels: sweep for the first, which is a button.
+        // Below the tabs, which are buttons too.
+        let spot = (92..300).step_by(2).flat_map(|y| (300..700).step_by(4).map(move |x| Point::new(x as f32, y as f32))).find(|p| {
+            s.h.move_to(*p);
+            s.h.cursor() == neo::CursorIcon::Pointer
+        });
+        let spot = spot.expect("a lens to click");
+        let caret = s.tab().doc.cursor();
+        s.h.click(spot);
+        assert_eq!(s.tab().doc.cursor(), caret, "a lens is a button, not somewhere to put the caret");
+        let run = s.h.app().run.as_ref().expect("something running");
+        assert_eq!(run.spec.line(), "cargo test --lib -- adds --exact");
+        assert_eq!((run.spec.title.as_str(), run.status.clone()), ("test adds", runner::Status::Running));
+        // What it prints shows under the editor, and how it ended.
+        let id = run.id;
+        let before = s.h.render(1.0);
+        s.h.app_mut().update(Msg::RunSaid(id, "\u{1b}[32mtest adds ... ok\u{1b}[0m\n".into()));
+        s.h.app_mut().update(Msg::RunSaid(id + 7, "from a run long gone\n".into()));
+        s.h.app_mut().update(Msg::RunEnded(id, Some(0)));
+        let run = s.h.app().run.as_ref().unwrap();
+        assert_eq!(run.output.text(), "$ cargo test --lib -- adds --exact\ntest adds ... ok");
+        assert!(run.ended_well() && run.summary() == "finished");
+        assert!(s.h.render(1.0) != before);
+        // Debug says there is no debugger; a command the server runs is
+        // sent to it; one nobody knows says so.
+        s.sent();
+        s.h.app_mut().update(Msg::Lens(3, 1));
+        assert!(s.h.app().toast.as_deref().is_some_and(|t| t.contains("no debugger")));
+        s.h.app_mut().update(Msg::Lens(3, 2));
+        let sent = s.request("workspace/executeCommand");
+        assert_eq!(sent["params"], json!({ "command": "tool.tidy", "arguments": ["x"] }));
+        s.h.app_mut().update(Msg::Lens(3, 3));
+        assert!(s.h.app().toast.as_deref().is_some_and(|t| t.contains("Odd") && t.contains("tool.unheard_of")));
+        // Running again replaces what was there; closing takes it away.
+        s.h.app_mut().update(Msg::RunAgain);
+        assert!(s.h.app().run.as_ref().is_some_and(|r| r.id != id && r.status == runner::Status::Running));
+        s.h.app_mut().update(Msg::RunStop);
+        let stopped = s.h.app().run.as_ref().unwrap().id;
+        s.h.app_mut().update(Msg::RunEnded(stopped, Some(9)));
+        assert_eq!(s.h.app().run.as_ref().unwrap().status, runner::Status::Stopped, "stopped, whatever it exited with");
+        s.h.app_mut().update(Msg::RunClose);
+        assert!(s.h.app().run.is_none());
+        // Editing asks for the lenses again, since lines have moved.
+        s.sent();
+        s.h.type_text("x");
+        assert!(s.methods().contains(&"textDocument/codeLens".to_owned()));
+    }
+
+    #[test]
     fn code_in_a_hover_is_coloured_as_code() {
         let mut s = Served::new("lsp-hover-colour", "pub fn one() {}\n");
         let hover = |s: &mut Served, contents: Value| {
@@ -1645,6 +1784,30 @@ mod tests {
             }
             if h.app().toast.is_some() {
                 println!("        message: {}", h.app_mut().toast.take().unwrap());
+            }
+        }
+        for lens in h.app().active_tab().map(|t| t.lenses.clone()).unwrap_or_default().iter().take(6) {
+            println!("lens on line {}: {:?} runs {} with {}", lens.line + 1, lens.title, lens.command, lens.arguments);
+        }
+        // `NEO_LSP_LENS=title` chooses the first lens so labelled, and
+        // waits for what it runs.
+        if let Ok(wanted) = std::env::var("NEO_LSP_LENS") {
+            let found = h.app().active_tab().and_then(|t| {
+                let lens = t.lenses.iter().find(|l| runner::label(&l.title) == wanted)?;
+                Some((lens.line, t.lenses.iter().filter(|l| l.line == lens.line).position(|l| l == lens)?))
+            });
+            let (line, index) = found.expect("a lens with that label");
+            h.app_mut().runs_commands = true;
+            h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(line, 0), select: false }));
+            h.app_mut().update(Msg::Lens(line, index));
+            let until = std::time::Instant::now() + Duration::from_secs(240);
+            while std::time::Instant::now() < until && h.app().run.as_ref().is_some_and(|r| r.status == runner::Status::Running) {
+                std::thread::sleep(Duration::from_millis(200));
+                h.advance(Duration::from_millis(200));
+            }
+            match &h.app().run {
+                Some(run) => println!("ran: {}\n{}\n-> {}", run.spec.line(), run.output.text(), run.summary()),
+                None => println!("nothing ran; message: {:?}", h.app().toast),
             }
         }
         // `NEO_LSP_HOVER=line:col` (from zero) rests the mouse there first.

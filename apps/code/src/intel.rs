@@ -157,6 +157,7 @@ impl NeoCode {
         t.synced = t.doc.revision();
         client.did_open(&disk, language, t.version, &t.doc.text());
         client.tokens(&disk);
+        client.lenses(&disk);
     }
 
     fn client_of(&mut self, i: usize) -> Option<(&mut Tab, &mut Client)> {
@@ -175,6 +176,7 @@ impl NeoCode {
             t.synced = t.doc.revision();
             client.did_change(disk, t.version, &t.doc.text());
             client.tokens(disk);
+            client.lenses(disk);
         }
     }
 
@@ -244,7 +246,23 @@ impl NeoCode {
         match event {
             // Now it is known whether the server can colour: ask for the
             // files already open.
-            Event::Ready => self.lsp_event(name, Event::RefreshTokens),
+            Event::Ready => {
+                self.lsp_event(name, Event::RefreshTokens);
+                self.lsp_event(name, Event::RefreshLenses);
+            }
+            Event::Lenses { path, lenses } => {
+                if let Some(i) = tab_at(&self.tabs, &path) {
+                    self.tabs[i].lenses = lenses;
+                }
+            }
+            Event::RefreshLenses => {
+                let Self { tabs, servers, .. } = self;
+                if let Some((_, client)) = servers.clients.get_mut(name) {
+                    for disk in tabs.iter().filter(|t| t.server == Some(name)).filter_map(|t| t.disk.as_deref()) {
+                        client.lenses(disk);
+                    }
+                }
+            }
             Event::Diagnostics { path, items } => {
                 if let Some(i) = tab_at(&self.tabs, &path) {
                     self.tabs[i].diagnostics = items;
@@ -417,6 +435,70 @@ impl NeoCode {
                 }
             }
         }
+    }
+
+    /// The things the server offers to do, as rows of labels over lines.
+    pub(crate) fn editor_lenses(&self, t: &Tab) -> Vec<EditorLens> {
+        let mut rows: Vec<EditorLens> = vec![];
+        for lens in &t.lenses {
+            match rows.iter_mut().find(|r| r.line == lens.line) {
+                Some(row) => row.labels.push(crate::runner::label(&lens.title)),
+                None => rows.push(EditorLens { line: lens.line, labels: vec![crate::runner::label(&lens.title)] }),
+            }
+        }
+        rows
+    }
+
+    /// A lens was clicked: the one on `line`, and which of its labels.
+    pub(crate) fn lens_chosen(&mut self, line: usize, index: usize) {
+        use crate::runner::LensAction;
+        let Some(i) = self.active else { return };
+        let Some(lens) = self.tabs.get(i).and_then(|t| t.lenses.iter().filter(|l| l.line == line).nth(index)).cloned() else { return };
+        let root = self.root.clone().unwrap_or_default();
+        let client = self.tabs[i].server.and_then(|s| self.servers.clients.get_mut(s)).map(|(_, c)| c);
+        let (commands, program) = client.as_ref().map(|c| (c.commands.clone(), c.program.clone())).unwrap_or_default();
+        match crate::runner::lens_action(&lens, &commands, program.as_deref(), &root) {
+            LensAction::Run(spec) => {
+                // It is built from what is on disk, so that has to be current.
+                if self.tabs[i].dirty() {
+                    self.update(Msg::Save);
+                }
+                self.start_run(spec);
+            }
+            LensAction::AskServer => {
+                if let Some(client) = client {
+                    client.execute(&lens.command, &lens.arguments);
+                }
+            }
+            LensAction::Debug => self.toast = Some("NeoCode has no debugger yet, so Debug can't start one.".into()),
+            LensAction::Unknown => self.toast = Some(format!("NeoCode doesn't know how to do \"{}\" yet ({}).", crate::runner::label(&lens.title), lens.command)),
+        }
+    }
+
+    /// Runs a command, showing what it prints under the editor in place
+    /// of whatever was run before.
+    pub(crate) fn start_run(&mut self, spec: crate::runner::RunSpec) {
+        if let Some(mut old) = self.run.take() {
+            old.stop();
+        }
+        self.runs += 1;
+        let id = self.runs;
+        let mut run = crate::runner::Run::new(id, spec);
+        // With no event loop to report back to nothing is run, and tests
+        // run nothing unless they ask to.
+        if let Some(proxy) = self.servers.proxy.clone().filter(|_| self.runs_commands) {
+            let ended = proxy.clone();
+            run.start(
+                self.servers.dirs.as_deref().unwrap_or_default(),
+                move |line| {
+                    proxy.send(Msg::RunSaid(id, line));
+                },
+                move |code| {
+                    ended.send(Msg::RunEnded(id, code));
+                },
+            );
+        }
+        self.run = Some(run);
     }
 
     /// How long the mouse rests on a word before it is asked about.
