@@ -359,6 +359,7 @@ impl NeoCode {
         let Some(i) = self.active else { return };
         self.lsp_sync(i);
         let problem = self.tabs.get(i).and_then(|t| t.server).and_then(|s| self.servers.problems.get(s).cloned());
+        let tab_size = self.settings.tab_size;
         let Some((t, client)) = self.client_of(i) else {
             self.toast = Some(problem.map_or("This file has no language server.".into(), |p| format!("{p}.")));
             return;
@@ -370,7 +371,7 @@ impl NeoCode {
             Ask::Hover => client.hover(&disk, place),
             Ask::Definition => client.definition(&disk, place),
             Ask::Complete => client.completion(&disk, place),
-            Ask::Format if client.can_format => client.format(&disk, INDENT),
+            Ask::Format if client.can_format => client.format(&disk, tab_size),
             Ask::Format => self.toast = Some("This language server cannot format.".into()),
         }
     }
@@ -440,7 +441,7 @@ impl NeoCode {
     /// The things the server offers to do, as rows of labels over lines.
     pub(crate) fn editor_lenses(&self, t: &Tab) -> Vec<EditorLens> {
         let mut rows: Vec<EditorLens> = vec![];
-        for lens in &t.lenses {
+        for lens in t.lenses.iter().filter(|_| self.settings.code_lens) {
             match rows.iter_mut().find(|r| r.line == lens.line) {
                 Some(row) => row.labels.push(crate::runner::label(&lens.title)),
                 None => rows.push(EditorLens { line: lens.line, labels: vec![crate::runner::label(&lens.title)] }),
@@ -502,10 +503,13 @@ impl NeoCode {
     }
 
     /// How long the mouse rests on a word before it is asked about.
+    #[cfg(test)]
     pub(crate) const REST: std::time::Duration = std::time::Duration::from_millis(350);
 
     /// The mouse came to rest on a word, or left it.
     pub(crate) fn point(&mut self, word: Option<Pos>) {
+        // Turned off, the mouse is over nothing as far as hover goes.
+        let word = word.filter(|_| self.settings.hover);
         let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) else { return };
         t.pointed = word.map(|p| (p, std::time::Instant::now(), false));
         // What was said about the last word goes when the mouse does.
@@ -525,7 +529,7 @@ impl NeoCode {
         let Some(i) = self.active else { return };
         let Some((at, since, false)) = self.tabs.get(i).and_then(|t| t.pointed) else { return };
         // Not over a list of completions, which the keyboard is working.
-        if since.elapsed() < Self::REST || matches!(self.tabs[i].popup, Some(Popup::Complete { .. })) {
+        if since.elapsed() < std::time::Duration::from_millis(self.settings.hover_delay) || matches!(self.tabs[i].popup, Some(Popup::Complete { .. })) {
             return;
         }
         self.lsp_sync(i);

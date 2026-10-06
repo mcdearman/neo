@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 mod intel;
 mod lsp;
 mod runner;
+mod settings;
 
 use neo::prelude::*;
 use neo::{Color, Key, KeyEvent, Proxy, Size};
@@ -224,6 +225,12 @@ struct NeoCode {
     runs: u64,
     /// Whether choosing a lens really starts its command.
     runs_commands: bool,
+    settings: settings::Settings,
+    /// NeoCode's own folder, where settings and what was open are kept.
+    /// Tests keep nothing unless they say where.
+    config: Option<PathBuf>,
+    /// The folders opened lately, for the File menu.
+    recent: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +263,9 @@ enum Msg {
     Point(Option<Pos>),
     /// A word was clicked with Command held: go to where it is defined.
     Jump,
+    /// Open `settings.json` to edit.
+    OpenSettings,
+    OpenRecent(PathBuf),
     /// The lens on this line, and which of its labels, was clicked.
     Lens(usize, usize),
     /// A line printed by what is running, and how it ended.
@@ -286,7 +296,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test) };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![] };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -327,7 +337,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test) }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![] }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -406,6 +416,18 @@ impl NeoCode {
         self.root = Some(dir);
         // The servers were started for the old folder.
         self.servers.reset();
+        if let Some(mut run) = self.run.take() {
+            run.stop();
+        }
+        self.load_settings();
+        self.restore_workspace();
+        // They may have been found already; the files just reopened are
+        // waiting for them.
+        if self.servers.dirs.is_some() {
+            for i in 0..self.tabs.len() {
+                self.lsp_open(i);
+            }
+        }
     }
 
     /// Opens what was dropped on the window: a folder as the project, or a
@@ -466,89 +488,8 @@ impl NeoCode {
     }
 }
 
-impl App for NeoCode {
-    type Message = Msg;
-
-    fn title(&self) -> String {
-        match self.active_tab() {
-            Some(t) => format!("{}{} · {}", if t.dirty() { "• " } else { "" }, t.name, self.project),
-            None => format!("NeoCode · {}", self.project),
-        }
-    }
-
-    fn window(&self) -> WindowSettings {
-        WindowSettings { size: Size::new(1280.0, 820.0), app_id: Some("org.neo.Code".into()), ..Default::default() }
-    }
-
-    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
-        self.desktop.app_menu(Msg::Desktop)
-    }
-
-    fn theme(&self, system: Scheme) -> Theme {
-        let mut theme = self.desktop.theme(system);
-        // The sun and moon button overrides the desktop's scheme for this window.
-        match self.dark {
-            Some(true) => theme.scheme = Scheme::Dark,
-            Some(false) => theme.scheme = Scheme::Light,
-            None => {}
-        }
-        theme
-    }
-
-    fn start(&mut self, proxy: Proxy<Msg>) {
-        self.find_servers(proxy);
-    }
-
-    fn subscriptions(&self) -> Vec<Subscription<Msg>> {
-        let mut subs = vec![Desktop::subscription(Msg::Poll)];
-        if self.toast.is_some() {
-            subs.push(Subscription::every(Duration::from_secs(3), Msg::ClearToast));
-        }
-        // Only while the mouse is resting on a word not yet asked about.
-        if self.hover_waiting() {
-            subs.push(Subscription::every(Duration::from_millis(60), Msg::HoverTick));
-        }
-        subs
-    }
-
-    fn menus(&self) -> Vec<Menu<Msg>> {
-        let file_open = self.active_tab().is_some();
-        // Whether a language server is looking after the file in front.
-        let served = self.active_tab().and_then(|t| t.server).is_some_and(|s| self.servers.clients.contains_key(s));
-        let keys = KEYMAPS.iter().enumerate().map(|(i, (k, name))| MenuEntry::new(format!("{}{name} Keys", if *k == self.keymap { "✓ " } else { "" }), Msg::Keys(i)));
-        vec![
-            Menu::new("File")
-                .push(MenuEntry::new("Open Folder…", Msg::OpenFolder).shortcut(Shortcut::command("o")))
-                .separator()
-                .push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(file_open))
-                .push(MenuEntry::new("Close Tab", Msg::Close(self.active.unwrap_or(0))).shortcut(Shortcut::command("w")).enabled(file_open)),
-            Menu::new("Edit")
-                .push(MenuEntry::new("Undo", Msg::Edit(Action::Undo)).shortcut(Shortcut::command("z")).enabled(file_open))
-                .push(MenuEntry::new("Redo", Msg::Edit(Action::Redo)).shortcut(Shortcut::command("z").shift()).enabled(file_open))
-                .separator()
-                .push(MenuEntry::new("Select All", Msg::Edit(Action::SelectAll)).shortcut(Shortcut::command("a")).enabled(file_open))
-                .separator()
-                .push(MenuEntry::new("Format Document", Msg::Ask(intel::Ask::Format)).shortcut(Shortcut::command("l").shift()).enabled(served)),
-            Menu::new("Go")
-                .push(MenuEntry::new("Show Hover", Msg::Ask(intel::Ask::Hover)).shortcut(Shortcut::command("i")).enabled(served))
-                .push(MenuEntry::new("Go to Definition", Msg::Ask(intel::Ask::Definition)).shortcut(Shortcut::command("g")).enabled(served))
-                .push(MenuEntry::new("Complete", Msg::Ask(intel::Ask::Complete)).shortcut(Shortcut::command(".")).enabled(served)),
-            keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
-        ]
-    }
-
-    fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
-        if !k.modifiers.command() {
-            return None;
-        }
-        // Save, close and open are menu entries; their shortcuts live there.
-        match &k.key {
-            Key::Character(c) => c.parse::<usize>().ok().filter(|n| (1..=self.tabs.len()).contains(n)).map(|n| Msg::Select(n - 1)),
-            _ => None,
-        }
-    }
-
-    fn update(&mut self, m: Msg) {
+impl NeoCode {
+    fn apply(&mut self, m: Msg) {
         match m {
             Msg::Open(i) => {
                 let node = self.nodes[i].clone();
@@ -686,7 +627,10 @@ impl App for NeoCode {
                 for t in &mut self.tabs {
                     t.doc.set_keymap(self.keymap);
                 }
+                self.keep(settings::KEYMAP, settings::keymap_name(self.keymap).into());
             }
+            Msg::OpenSettings => self.open_settings(),
+            Msg::OpenRecent(dir) => self.open_folder(&dir),
             Msg::Save => {
                 let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) else { return };
                 let result = match &t.disk {
@@ -696,7 +640,13 @@ impl App for NeoCode {
                 match result {
                     Ok(msg) => {
                         t.saved = t.doc.revision();
+                        let settings = t.name == "settings.json";
                         self.toast = Some(msg);
+                        // Saving the settings is how they are changed.
+                        if settings {
+                            self.load_settings();
+                        }
+                        self.save_workspace();
                         if let Some(i) = self.active {
                             self.lsp_saved(i);
                         }
@@ -706,6 +656,7 @@ impl App for NeoCode {
             }
             Msg::ToggleScheme => {
                 self.dark = Some(!self.is_dark());
+                self.keep(settings::THEME, if self.is_dark() { "dark" } else { "light" }.into());
             }
             Msg::ClearToast => self.toast = None,
             Msg::Desktop(m) => {
@@ -714,6 +665,106 @@ impl App for NeoCode {
             Msg::Poll => {
                 self.desktop.poll();
             }
+        }
+    }
+}
+
+impl App for NeoCode {
+    type Message = Msg;
+
+    fn title(&self) -> String {
+        match self.active_tab() {
+            Some(t) => format!("{}{} · {}", if t.dirty() { "• " } else { "" }, t.name, self.project),
+            None => format!("NeoCode · {}", self.project),
+        }
+    }
+
+    fn window(&self) -> WindowSettings {
+        WindowSettings { size: Size::new(1280.0, 820.0), app_id: Some("org.neo.Code".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
+    }
+
+    fn theme(&self, system: Scheme) -> Theme {
+        let mut theme = self.desktop.theme(system);
+        // The sun and moon button overrides the desktop's scheme for this window.
+        match self.dark {
+            Some(true) => theme.scheme = Scheme::Dark,
+            Some(false) => theme.scheme = Scheme::Light,
+            None => {}
+        }
+        theme
+    }
+
+    fn start(&mut self, proxy: Proxy<Msg>) {
+        self.find_servers(proxy);
+    }
+
+    fn subscriptions(&self) -> Vec<Subscription<Msg>> {
+        let mut subs = vec![Desktop::subscription(Msg::Poll)];
+        if self.toast.is_some() {
+            subs.push(Subscription::every(Duration::from_secs(3), Msg::ClearToast));
+        }
+        // Only while the mouse is resting on a word not yet asked about.
+        if self.hover_waiting() {
+            subs.push(Subscription::every(Duration::from_millis(60), Msg::HoverTick));
+        }
+        subs
+    }
+
+    fn menus(&self) -> Vec<Menu<Msg>> {
+        let file_open = self.active_tab().is_some();
+        // Whether a language server is looking after the file in front.
+        let served = self.active_tab().and_then(|t| t.server).is_some_and(|s| self.servers.clients.contains_key(s));
+        let keys = KEYMAPS.iter().enumerate().map(|(i, (k, name))| MenuEntry::new(format!("{}{name} Keys", if *k == self.keymap { "✓ " } else { "" }), Msg::Keys(i)));
+        vec![
+            {
+                let mut file = Menu::new("File").push(MenuEntry::new("Open Folder…", Msg::OpenFolder).shortcut(Shortcut::command("o")));
+                // The folders opened lately, other than this one.
+                for dir in self.recent.iter().filter(|d| Some(*d) != self.root.as_ref()).take(5) {
+                    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string());
+                    file = file.push(MenuEntry::new(format!("Reopen {name}"), Msg::OpenRecent(dir.clone())));
+                }
+                file.separator()
+                    .push(MenuEntry::new("Open Settings (JSON)", Msg::OpenSettings))
+                    .separator()
+                    .push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(file_open))
+                    .push(MenuEntry::new("Close Tab", Msg::Close(self.active.unwrap_or(0))).shortcut(Shortcut::command("w")).enabled(file_open))
+            },
+            Menu::new("Edit")
+                .push(MenuEntry::new("Undo", Msg::Edit(Action::Undo)).shortcut(Shortcut::command("z")).enabled(file_open))
+                .push(MenuEntry::new("Redo", Msg::Edit(Action::Redo)).shortcut(Shortcut::command("z").shift()).enabled(file_open))
+                .separator()
+                .push(MenuEntry::new("Select All", Msg::Edit(Action::SelectAll)).shortcut(Shortcut::command("a")).enabled(file_open))
+                .separator()
+                .push(MenuEntry::new("Format Document", Msg::Ask(intel::Ask::Format)).shortcut(Shortcut::command("l").shift()).enabled(served)),
+            Menu::new("Go")
+                .push(MenuEntry::new("Show Hover", Msg::Ask(intel::Ask::Hover)).shortcut(Shortcut::command("i")).enabled(served))
+                .push(MenuEntry::new("Go to Definition", Msg::Ask(intel::Ask::Definition)).shortcut(Shortcut::command("g")).enabled(served))
+                .push(MenuEntry::new("Complete", Msg::Ask(intel::Ask::Complete)).shortcut(Shortcut::command(".")).enabled(served)),
+            keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
+        ]
+    }
+
+    fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
+        if !k.modifiers.command() {
+            return None;
+        }
+        // Save, close and open are menu entries; their shortcuts live there.
+        match &k.key {
+            Key::Character(c) => c.parse::<usize>().ok().filter(|n| (1..=self.tabs.len()).contains(n)).map(|n| Msg::Select(n - 1)),
+            _ => None,
+        }
+    }
+
+    fn update(&mut self, m: Msg) {
+        let before = self.shape();
+        self.apply(m);
+        // What is open changed: remember it for next time.
+        if self.shape() != before {
+            self.save_workspace();
         }
     }
 
@@ -795,7 +846,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).lenses(self.editor_lenses(t), Msg::Lens).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).font_size(self.settings.font_size).lenses(self.editor_lenses(t), Msg::Lens).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -847,6 +898,121 @@ impl NeoCode {
             .push(container(head).padding([10.0, 4.0]).width(Length::Fill))
             .push(container(text_editor(&run.output).language(Language::Plain).into_element_keyed("run-output")).background(Background::Color(surface)).width(Length::Fill).height(Length::Fill))
             .into()
+    }
+
+    /// What is open and showing, to tell when that has changed.
+    fn shape(&self) -> (Vec<String>, Option<usize>, Option<PathBuf>) {
+        (self.tabs.iter().map(|t| t.path.clone()).collect(), self.active, self.root.clone())
+    }
+
+    /// Whether a tab is a file of the open folder, to come back to.
+    fn in_folder(&self, t: &Tab) -> bool {
+        matches!((&t.disk, &self.root), (Some(disk), Some(root)) if disk.starts_with(root))
+    }
+
+    /// Writes down which files are open in this folder, and where the
+    /// caret is in each.
+    fn save_workspace(&self) {
+        let (Some(dir), Some(root)) = (&self.config, &self.root) else { return };
+        let open = self.tabs.iter().filter(|t| self.in_folder(t)).map(|t| (t.path.clone(), t.doc.cursor().line, t.doc.cursor().col)).collect();
+        let active = self.active_tab().filter(|t| self.in_folder(t)).map(|t| t.path.clone());
+        let _ = settings::save_workspace(dir, root, &settings::Workspace { open, active });
+    }
+
+    /// Opens the files that were open in this folder last time, those of
+    /// them that are still there.
+    fn restore_workspace(&mut self) {
+        let (Some(dir), Some(root)) = (self.config.clone(), self.root.clone()) else { return };
+        let _ = settings::add_recent(&dir, &root);
+        self.recent = settings::recent(&dir);
+        if !self.settings.restore {
+            return;
+        }
+        let Some(ws) = settings::load_workspace(&dir, &root) else { return };
+        for (path, line, col) in &ws.open {
+            let Some(i) = self.nodes.iter().position(|n| !n.dir && n.path == *path) else { continue };
+            self.apply(Msg::Open(i));
+            // Only if it opened: a file can have stopped being text.
+            if let Some(t) = self.tabs.last_mut().filter(|t| t.path == *path) {
+                let line = (*line).min(t.doc.line_count().saturating_sub(1));
+                let col = (*col).min(t.doc.lines()[line].len());
+                if t.doc.lines()[line].is_char_boundary(col) {
+                    t.doc.apply(Action::Click { pos: Pos::new(line, col), select: false });
+                }
+            }
+            // Show where it is in the tree.
+            let mut depth = self.nodes[i].depth;
+            for j in (0..i).rev() {
+                if self.nodes[j].dir && self.nodes[j].depth < depth {
+                    self.nodes[j].expanded = true;
+                    depth = self.nodes[j].depth;
+                }
+            }
+        }
+        if let Some(active) = ws.active.and_then(|a| self.tabs.iter().position(|t| t.path == a)) {
+            self.active = Some(active);
+        }
+        self.toast = None;
+    }
+
+    /// Reads the settings again and puts them into effect.
+    fn load_settings(&mut self) {
+        let (found, problems) = settings::load(self.config.as_deref(), self.root.as_deref());
+        self.keymap = found.keymap;
+        for t in &mut self.tabs {
+            t.doc.set_keymap(self.keymap);
+        }
+        self.dark = found.dark;
+        self.settings = found;
+        if let Some(first) = problems.into_iter().next() {
+            self.toast = Some(first);
+        }
+    }
+
+    /// Writes one setting to the user's file, as when it is changed from
+    /// a menu, so that it is still so next time.
+    fn keep(&mut self, key: &str, value: serde_json::Value) {
+        let Some(dir) = &self.config else { return };
+        if let Err(why) = settings::set(&settings::user_file(dir), key, value) {
+            self.toast = Some(why);
+        }
+    }
+
+    /// Opens the user's `settings.json` in a tab, making it first if
+    /// there is none. Saving it puts the changes into effect.
+    fn open_settings(&mut self) {
+        let Some(dir) = self.config.clone() else {
+            self.toast = Some("There is no settings file to open here.".into());
+            return;
+        };
+        let file = settings::user_file(&dir);
+        if let Err(e) = settings::ensure(&file) {
+            self.toast = Some(format!("Couldn't make {}: {e}", file.display()));
+            return;
+        }
+        self.open_file(&file);
+    }
+
+    /// Opens a file that is not part of the folder's tree, in a tab of
+    /// its own, named by its whole path.
+    fn open_file(&mut self, file: &Path) {
+        let key = file.to_string_lossy().into_owned();
+        if let Some(t) = self.tabs.iter().position(|t| t.path == key) {
+            self.active = Some(t);
+            return;
+        }
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) => {
+                self.toast = Some(format!("Couldn't open {}: {e}", file.display()));
+                return;
+            }
+        };
+        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut doc = Document::new(text.trim_end_matches('\n'));
+        doc.set_keymap(self.keymap);
+        self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&name), name, path: key, disk: Some(file.to_path_buf()), server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None, lenses: vec![], pointed: None, hover_for: None });
+        self.active = Some(self.tabs.len() - 1);
     }
 
     /// Code's own rows for the settings panel.
@@ -905,7 +1071,7 @@ impl NeoCode {
             }
             left = left
                 .push(text(t.language.name()).role(TextRole::Caption).tone(Tone::Muted))
-                .push(text(format!("Spaces: {INDENT}")).role(TextRole::Caption).tone(Tone::Muted))
+                .push(text(format!("Spaces: {}", self.settings.tab_size)).role(TextRole::Caption).tone(Tone::Muted))
                 .push(text("UTF-8").role(TextRole::Caption).tone(Tone::Muted))
                 .push(text(format!("{} lines", t.doc.line_count())).role(TextRole::Caption).tone(Tone::Muted));
         }
@@ -948,7 +1114,7 @@ fn main() {
         snapshots(PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "target/snapshots".into())));
         return;
     }
-    let app = match args.first() {
+    let mut app = match args.first() {
         Some(path) => {
             let p = PathBuf::from(path);
             if !p.exists() {
@@ -964,6 +1130,17 @@ fn main() {
         // Back to the folder from last time; the sample is for a first look.
         None => NeoCode::last_folder().map_or_else(NeoCode::sample, |dir| NeoCode::folder(&dir)),
     };
+    // Settings, and for a folder the files that were open in it. A file
+    // named on the command line is what was asked for, and stays showing.
+    app.config = Some(neo_desktop::config_dir().join("neo-code"));
+    app.load_settings();
+    let asked = app.active_tab().map(|t| t.path.clone());
+    if app.root.is_some() {
+        app.restore_workspace();
+    }
+    if let Some(i) = asked.and_then(|a| app.tabs.iter().position(|t| t.path == a)) {
+        app.active = Some(i);
+    }
     if let Err(e) = neo::run(app) {
         eprintln!("neo-code: {e}");
         std::process::exit(1);
@@ -1184,9 +1361,10 @@ mod tests {
         let tabs = h.app().tabs.len();
         h.key(Key::Character("w".into()), cmd);
         assert_eq!(h.app().tabs.len(), tabs - 1);
-        // And by choosing the entry: File, then the fourth row down.
+        // And by choosing the entry: File, then the last row, under Open
+        // Folder, the settings and Save, with a rule after each of the first two.
         h.click(Point::new(24.0, 23.0));
-        h.click(Point::new(60.0, 44.0 + 32.0 + 9.0 + 32.0 + 16.0));
+        h.click(Point::new(60.0, 44.0 + 32.0 + 9.0 + 32.0 + 9.0 + 32.0 + 16.0));
         assert_eq!(h.app().tabs.len(), tabs - 2);
     }
 
@@ -1508,6 +1686,110 @@ mod tests {
         let uri = s.uri();
         s.says(json!({ "id": ask["id"], "result": { "uri": uri, "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 10 } } } }));
         assert_eq!(s.tab().doc.cursor(), Pos::new(0, 7), "the caret is at the definition");
+    }
+
+    #[test]
+    fn a_folder_comes_back_with_the_files_that_were_open_in_it() {
+        let dir = project("workspace");
+        std::fs::write(dir.join("src/lib.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "# Notes\n").unwrap();
+        let config = dir.parent().unwrap().join(format!("{}-config", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&config);
+        let open = |app: &mut NeoCode, name: &str| {
+            let i = app.nodes.iter().position(|n| n.name == name).unwrap();
+            app.update(Msg::Open(i));
+        };
+        let mut first = NeoCode::folder(&dir);
+        first.config = Some(config.clone());
+        first.restore_workspace();
+        assert!(first.tabs.is_empty(), "nothing to come back to yet");
+        open(&mut first, "notes.md");
+        open(&mut first, "lib.rs");
+        first.update(Msg::Edit(Action::Click { pos: Pos::new(1, 7), select: false }));
+        open(&mut first, "notes.md");
+        first.update(Msg::Save);
+        let root = first.root.clone().unwrap();
+
+        // Another run: the same tabs in the same order, the same one
+        // showing, and the caret where it was.
+        let mut second = NeoCode::folder(&dir);
+        second.config = Some(config.clone());
+        second.load_settings();
+        second.restore_workspace();
+        assert_eq!(second.tabs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes.md", "lib.rs"]);
+        assert_eq!(second.active_tab().map(|t| t.name.as_str()), Some("notes.md"));
+        assert_eq!(second.tabs[1].doc.cursor(), Pos::new(1, 7));
+        assert!(second.nodes.iter().any(|n| n.name == "src" && n.expanded), "its folder is open in the tree");
+        assert_eq!(second.recent, std::slice::from_ref(&root));
+        // Closing a tab is remembered; a file that has gone is passed over.
+        second.update(Msg::Close(0));
+        std::fs::write(dir.join("extra.txt"), "x\n").unwrap();
+        let mut third = NeoCode::folder(&dir);
+        third.config = Some(config.clone());
+        third.restore_workspace();
+        assert_eq!(third.tabs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["lib.rs"]);
+        open(&mut third, "extra.txt");
+        std::fs::remove_file(dir.join("extra.txt")).unwrap();
+        let mut fourth = NeoCode::folder(&dir);
+        fourth.config = Some(config.clone());
+        fourth.restore_workspace();
+        assert_eq!(fourth.tabs.len(), 1);
+        // Told not to, it starts with nothing open.
+        std::fs::write(settings::user_file(&config), "{ \"window.restoreWorkspace\": false }").unwrap();
+        let mut fifth = NeoCode::folder(&dir);
+        fifth.config = Some(config.clone());
+        fifth.load_settings();
+        fifth.restore_workspace();
+        assert!(fifth.tabs.is_empty());
+        std::fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn settings_json_is_read_edited_in_a_tab_and_kept_up_by_the_menus() {
+        let dir = project("settings-json");
+        let config = dir.parent().unwrap().join(format!("{}-config", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&config);
+        let mut app = NeoCode::folder(&dir);
+        // With nowhere to keep them, as in other tests, nothing is written.
+        app.update(Msg::Keys(2));
+        app.update(Msg::OpenSettings);
+        assert!(app.tabs.is_empty() && !config.exists());
+        app.config = Some(config.clone());
+        app.load_settings();
+        assert_eq!(app.settings, settings::Settings::default());
+        // Opening the settings makes the file, with every setting in it.
+        app.toast = None;
+        app.update(Msg::OpenSettings);
+        let tab = app.active_tab().expect("the settings in a tab");
+        assert_eq!((tab.name.as_str(), tab.language), ("settings.json", Language::Json));
+        assert!(tab.doc.text().contains("\"editor.tabSize\": 4"));
+        app.update(Msg::OpenSettings);
+        assert_eq!(app.tabs.len(), 1, "not twice");
+        // Edit and save: the changes are in force at once.
+        std::fs::write(settings::user_file(&config), "{\n  // two spaces here\n  \"editor.tabSize\": 2,\n  \"editor.keymap\": \"helix\",\n  \"workbench.colorTheme\": \"dark\",\n  \"editor.codeLens\": false\n}\n").unwrap();
+        app.update(Msg::Close(0));
+        app.update(Msg::OpenSettings);
+        app.update(Msg::Save);
+        assert_eq!((app.settings.tab_size, app.keymap, app.is_dark(), app.settings.code_lens), (2, Keymap::Helix, true, false));
+        assert_eq!(app.active_tab().unwrap().doc.keymap(), Keymap::Helix, "open files follow");
+        // Changing the keys from the menu writes it down, keeping the rest.
+        app.update(Msg::Keys(0));
+        app.update(Msg::ToggleScheme);
+        let kept = settings::read(&settings::user_file(&config)).unwrap();
+        assert_eq!(kept[settings::KEYMAP], json!(settings::keymap_name(KEYMAPS[0].0)));
+        assert_eq!((kept[settings::THEME].clone(), kept["editor.tabSize"].clone()), (json!("light"), json!(2)));
+        // A mistake in the file is reported, and what was in force stays.
+        std::fs::write(settings::user_file(&config), "{ nonsense").unwrap();
+        app.toast = None;
+        app.load_settings();
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("mistake")), "{:?}", app.toast);
+        // The project's own settings win for the project.
+        std::fs::write(settings::user_file(&config), "{ \"editor.tabSize\": 8 }").unwrap();
+        std::fs::create_dir_all(dir.join(".neocode")).unwrap();
+        std::fs::write(settings::folder_file(app.root.as_ref().unwrap()), "{ \"editor.tabSize\": 3 }").unwrap();
+        app.load_settings();
+        assert_eq!(app.settings.tab_size, 3);
+        std::fs::remove_dir_all(config).unwrap();
     }
 
     #[test]
