@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NeoDisk
+GenericName=Disk Usage and Drives
+Comment=See what is using the space on your disks, and mount or format drives
+Exec=neo-disk %f
+Icon=org.neo.Disk
+Terminal=false
+Categories=System;Filesystem;Utility;
+Keywords=disk;space;usage;storage;treemap;drive;mount;format;usb;
+StartupNotify=true
+StartupWMClass=org.neo.Disk

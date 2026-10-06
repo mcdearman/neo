@@ -1646,6 +1646,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "neo-disk"
+version = "0.1.0"
+dependencies = [
+ "neo",
+ "neo-desktop",
+ "rfd",
+ "sysinfo",
+]
+
+[[package]]
 name = "neo-files"
 version = "0.1.0"
 dependencies = [

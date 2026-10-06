@@ -1,0 +1,12 @@
+[package]
+name = "neo-disk"
+description = "NeoDisk: disks, how full they are, and what is using the space"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+sysinfo = { version = "0.37", default-features = false, features = ["disk"] }
+rfd = "0.17.2"
