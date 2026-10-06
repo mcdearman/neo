@@ -93,6 +93,7 @@ Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framewo
 | `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |
 | `neo` | The Neo toolkit: themed controls (buttons, inputs, toggles, sliders, menus, the code editor), the Neo title bar, and the `App` trait the apps implement, built on `armature`. |
 | `neo-desktop` | What the apps share: the appearance file and live reload, file helpers (standard folders, sizes, dates, Trash, open with the default app) and common layout pieces such as the sidebar and settings rows. |
+| `neo-term` | A terminal to put in an app: a shell in a pty, its screen, and the widget that shows it. NeoTerm and NeoCode's Ctrl+Tab panel are both this. |
 | `apps/*` | The desktop apps above, one binary each. |
 
 ### Widgets
