@@ -23,6 +23,7 @@ pub enum Language {
     Koka,
     Kotlin,
     Lua,
+    Meadow,
     OCaml,
     Php,
     Python,
@@ -54,6 +55,7 @@ impl Language {
             "kk" => Language::Koka,
             "kt" | "kts" => Language::Kotlin,
             "lua" => Language::Lua,
+            "mw" => Language::Meadow,
             "ml" | "mli" => Language::OCaml,
             "php" => Language::Php,
             "py" | "pyi" => Language::Python,
@@ -85,6 +87,7 @@ impl Language {
             Language::Koka => "Koka",
             Language::Kotlin => "Kotlin",
             Language::Lua => "Lua",
+            Language::Meadow => "Meadow",
             Language::OCaml => "OCaml",
             Language::Php => "PHP",
             Language::Python => "Python",
@@ -113,6 +116,7 @@ impl Language {
             Language::Koka => Some(&KOKA),
             Language::Kotlin => Some(&KOTLIN),
             Language::Lua => Some(&LUA),
+            Language::Meadow => Some(&MEADOW),
             Language::OCaml => Some(&OCAML),
             Language::Php => Some(&PHP),
             Language::Python => Some(&PYTHON),
@@ -216,6 +220,17 @@ const KOTLIN: Grammar = Grammar {
     types: &[],
     at: true,
     ..C_LIKE
+};
+// A quote can end a name (`x'`), so only double quotes open a string.
+const MEADOW: Grammar = Grammar {
+    keywords: &["and", "as", "class", "data", "def", "effect", "else", "end", "fun", "handle", "if", "in", "let", "match", "mod", "not", "or", "rec", "record", "then", "type", "use", "with", "True", "False"],
+    types: &[],
+    line: &["--"],
+    block: None,
+    quotes: b"\"",
+    calls: true,
+    at: true,
+    hash: false,
 };
 const LUA: Grammar = Grammar {
     keywords: &["and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"],
@@ -767,6 +782,7 @@ mod tests {
             ("widget.hpp", Language::Cpp, "C++"),
             ("main.go", Language::Go, "Go"),
             ("lib/std/core.kk", Language::Koka, "Koka"),
+            ("src/Main.mw", Language::Meadow, "Meadow"),
             ("Program.cs", Language::CSharp, "C#"),
             ("build.zig", Language::Zig, "Zig"),
             ("deploy.sh", Language::Shell, "Shell"),
@@ -834,6 +850,14 @@ mod tests {
         assert_eq!(kind(Language::Koka, line, "console"), Kind::Type);
         assert_eq!(kind(Language::Koka, line, "hi"), Kind::String);
         assert_eq!(kind(Language::Koka, line, "greet"), Kind::Comment);
+        // Meadow: comments start with two dashes, and a quote can end a name.
+        let line = "fun area(x') = if True then Circle \"big\" else x' -- the shape";
+        assert_eq!(kind(Language::Meadow, line, "fun"), Kind::Keyword);
+        assert_eq!(kind(Language::Meadow, line, "area"), Kind::Function);
+        assert_eq!(kind(Language::Meadow, line, "Circle"), Kind::Type);
+        assert_eq!(kind(Language::Meadow, line, "big"), Kind::String);
+        assert_eq!(kind(Language::Meadow, line, "else"), Kind::Keyword, "the quote after x did not open a string");
+        assert_eq!(kind(Language::Meadow, line, "shape"), Kind::Comment);
 
         let mut open = false;
         highlight(Language::Lua, "--[[ long", &mut open);
@@ -868,7 +892,7 @@ mod tests {
     #[test]
     fn every_language_covers_every_line_whole() {
         let lines = ["", "   ", "let s = \"naïve — ünïcödé\"; // café", "x = 'unclosed string with é", "/* open ☃", "#!/usr/bin/env thing", "@weird @ 12.5e3 f(x)[1] {- -} (* *) --[[ ]] `tick`", "\"ends with a backslash\\", "'é"];
-        for lang in [Language::C, Language::Cpp, Language::CSharp, Language::Css, Language::Go, Language::Haskell, Language::Java, Language::JavaScript, Language::Json, Language::Koka, Language::Kotlin, Language::Lua, Language::OCaml, Language::Php, Language::Python, Language::Ruby, Language::Shell, Language::Swift, Language::TypeScript, Language::Yaml, Language::Zig, Language::Rust, Language::Toml, Language::Markdown, Language::Plain] {
+        for lang in [Language::C, Language::Cpp, Language::CSharp, Language::Css, Language::Go, Language::Haskell, Language::Java, Language::JavaScript, Language::Json, Language::Koka, Language::Kotlin, Language::Lua, Language::Meadow, Language::OCaml, Language::Php, Language::Python, Language::Ruby, Language::Shell, Language::Swift, Language::TypeScript, Language::Yaml, Language::Zig, Language::Rust, Language::Toml, Language::Markdown, Language::Plain] {
             let mut open = false;
             for line in lines {
                 let parts = highlight(lang, line, &mut open);

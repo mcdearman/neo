@@ -43,6 +43,7 @@ pub const SERVERS: &[ServerSpec] = &[
     ServerSpec { name: "bash-language-server", language: "shell scripts", extensions: &[("sh", "shellscript"), ("bash", "shellscript"), ("zsh", "shellscript")], commands: &[("bash-language-server", &["start"])] },
     ServerSpec { name: "haskell-language-server", language: "Haskell", extensions: &[("hs", "haskell"), ("lhs", "haskell"), ("cabal", "cabal")], commands: &[("haskell-language-server-wrapper", &["--lsp"]), ("haskell-language-server", &["--lsp"])] },
     ServerSpec { name: "koka", language: "Koka", extensions: &[("kk", "koka")], commands: &[("koka", &["--language-server", "--lsstdio"])] },
+    ServerSpec { name: "meadow", language: "Meadow", extensions: &[("mw", "meadow")], commands: &[("meadow", &["lsp"])] },
     ServerSpec { name: "ocamllsp", language: "OCaml", extensions: &[("ml", "ocaml"), ("mli", "ocaml.interface")], commands: &[("ocamllsp", &[])] },
     ServerSpec { name: "sourcekit-lsp", language: "Swift", extensions: &[("swift", "swift")], commands: &[("sourcekit-lsp", &[])] },
     ServerSpec { name: "Ruby", language: "Ruby", extensions: &[("rb", "ruby"), ("rake", "ruby"), ("gemspec", "ruby")], commands: &[("ruby-lsp", &[]), ("solargraph", &["stdio"])] },
@@ -131,7 +132,7 @@ pub struct Found {
 /// `PATH`. An app started from the Dock or a launcher gets a bare `PATH`
 /// that leaves most of these out.
 fn usual_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = [".cargo/bin", ".local/bin", "go/bin", ".ghcup/bin", ".cabal/bin", ".opam/default/bin", ".dotnet/tools", ".mix/escripts", ".pub-cache/bin", ".npm-global/bin", ".bun/bin", ".deno/bin", ".volta/bin", ".nix-profile/bin", ".local/share/mise/shims", ".asdf/shims", ".local/share/nvim/mason/bin"]
+    let mut dirs: Vec<PathBuf> = [".cargo/bin", ".local/bin", "go/bin", ".ghcup/bin", ".cabal/bin", ".meadow/bin", ".opam/default/bin", ".dotnet/tools", ".mix/escripts", ".pub-cache/bin", ".npm-global/bin", ".bun/bin", ".deno/bin", ".volta/bin", ".nix-profile/bin", ".local/share/mise/shims", ".asdf/shims", ".local/share/nvim/mason/bin"]
         .iter()
         .map(|d| home.join(d))
         .collect();
@@ -163,6 +164,8 @@ pub fn search_dirs() -> Vec<PathBuf> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     dirs.extend(usual_dirs(&home));
+    // Where a language's own installer was told to put it.
+    dirs.extend(std::env::var_os("MEADOW_HOME").map(|h| PathBuf::from(h).join("bin")));
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
     dirs
@@ -246,6 +249,12 @@ mod tests {
     fn haskell_and_koka_files_have_servers() {
         assert_eq!(spec_for(Path::new("src/Main.hs")).map(|(s, id)| (s.name, id, s.commands[0])), Some(("haskell-language-server", "haskell", ("haskell-language-server-wrapper", &["--lsp"][..]))));
         assert_eq!(spec_for(Path::new("lib/std/core.kk")).map(|(s, id)| (s.name, id, s.commands[0].1)), Some(("koka", "koka", &["--language-server", "--lsstdio"][..])));
+    }
+
+    #[test]
+    fn meadow_files_have_a_server_found_where_its_installer_puts_it() {
+        assert_eq!(spec_for(Path::new("src/Main.mw")).map(|(s, id)| (s.name, id, s.commands[0])), Some(("meadow", "meadow", ("meadow", &["lsp"][..]))));
+        assert!(usual_dirs(Path::new("/home/sam")).contains(&PathBuf::from("/home/sam/.meadow/bin")));
     }
 
     #[test]

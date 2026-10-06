@@ -306,7 +306,7 @@ impl NeoCode {
     /// like a project, or failing that the one it is in.
     fn project_of(file: &Path) -> PathBuf {
         let parent = file.parent().unwrap_or(file);
-        const MARKERS: [&str; 7] = [".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml", "build.zig", "compile_commands.json"];
+        const MARKERS: [&str; 8] = [".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml", "build.zig", "compile_commands.json", "Meadow.toml"];
         // Stop short of the home folder and the root, which are not projects.
         let home = std::env::var_os("HOME").map(PathBuf::from);
         parent.ancestors().take_while(|d| Some(*d) != home.as_deref() && d.parent().is_some()).find(|d| MARKERS.iter().any(|m| d.join(m).exists())).unwrap_or(parent).to_path_buf()
