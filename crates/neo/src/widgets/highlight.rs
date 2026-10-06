@@ -531,7 +531,9 @@ impl SyntaxColors {
         let hex = Color::hex;
         // magenta, cyan, blue, bright yellow, bright blue, yellow, green
         let [keyword, ty_cyan, constructor, function, variable, number, string] = match scheme {
-            Scheme::Dark => [hex(0xAB9DF2), hex(0x78DCE8), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
+            // The keyword's magenta is taken a little further from blue than
+            // the terminal's, to stand apart from the names beside it.
+            Scheme::Dark => [hex(0xB88EF5), hex(0x78DCE8), hex(0x889FEC), hex(0xFFE08A), hex(0xA5B7F2), hex(0xFFD866), hex(0xA9DC76)],
             Scheme::Light => [hex(0x8A3FB5), hex(0x16706A), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
         };
         // Types are whichever candidate is being tried, in place of the
