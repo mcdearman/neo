@@ -540,8 +540,9 @@ impl SyntaxColors {
         };
         let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };
         // Attributes and lifetimes sit beside types (`&'static str`), so
-        // they are rose: near the types' peach, and plainly not it.
-        let attribute = hex(if scheme == Scheme::Dark { 0xFF8FA8 } else { 0xB8355A });
+        // they are sand: warm like the types' peach, but paler and
+        // yellower, enough to tell the two apart.
+        let attribute = hex(if scheme == Scheme::Dark { 0xDDC596 } else { 0x8A6A2A });
         Self { keyword, ty, function, string, number, comment, macro_: function, attribute, punct: p.text, heading: keyword, variable: Some(variable), constructor, module }
     }
 
