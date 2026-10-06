@@ -34,8 +34,9 @@ impl Language {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+/// What a stretch of code is, which decides its colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
     Plain,
     Keyword,
     Type,
@@ -127,6 +128,37 @@ const RUST_PRIMITIVES: &[&str] = &[
 
 /// Splits `line` into highlighted byte ranges. `in_comment` carries Rust
 /// block-comment state across lines.
+/// Lays `tokens` over the highlighter's own `parts` for one line: where a
+/// token covers the text its kind wins, and elsewhere the highlighter's
+/// stays. Both are byte ranges; tokens are clipped to the line and to whole
+/// characters.
+pub(crate) fn overlay(line: &str, parts: Vec<(usize, usize, Kind)>, tokens: &[(usize, usize, Kind)]) -> Vec<(usize, usize, Kind)> {
+    let snap = |mut i: usize| {
+        i = i.min(line.len());
+        while !line.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let tokens: Vec<(usize, usize, Kind)> = tokens.iter().map(|(a, b, k)| (snap(*a), snap(*b), *k)).filter(|(a, b, _)| a < b).collect();
+    if tokens.is_empty() {
+        return parts;
+    }
+    let mut cuts: Vec<usize> = parts.iter().chain(&tokens).flat_map(|(a, b, _)| [*a, *b]).chain([0, line.len()]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let at = |list: &[(usize, usize, Kind)], i: usize| list.iter().find(|(a, b, _)| *a <= i && i < *b).map(|(_, _, k)| *k);
+    let mut out: Vec<(usize, usize, Kind)> = Vec::with_capacity(cuts.len());
+    for pair in cuts.windows(2) {
+        let kind = at(&tokens, pair[0]).or_else(|| at(&parts, pair[0])).unwrap_or(Kind::Plain);
+        match out.last_mut() {
+            Some(last) if last.2 == kind && last.1 == pair[0] => last.1 = pair[1],
+            _ => out.push((pair[0], pair[1], kind)),
+        }
+    }
+    out
+}
+
 pub(crate) fn highlight(lang: Language, line: &str, in_comment: &mut bool) -> Vec<(usize, usize, Kind)> {
     match lang {
         Language::Plain => vec![(0, line.len(), Kind::Plain)],
@@ -353,6 +385,23 @@ fn markdown(line: &str) -> Vec<(usize, usize, Kind)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_win_over_the_highlighter_where_they_reach() {
+        let line = "let héllo = Vec::new();";
+        let parts = vec![(0, 3, Kind::Keyword), (3, line.len(), Kind::Plain)];
+        // No tokens: unchanged.
+        assert_eq!(overlay(line, parts.clone(), &[]), parts);
+        let vec = line.find("Vec").unwrap();
+        let new = line.find("new").unwrap();
+        let got = overlay(line, parts.clone(), &[(vec, vec + 3, Kind::Type), (new, new + 3, Kind::Function), (500, 600, Kind::String)]);
+        assert_eq!(got, [(0, 3, Kind::Keyword), (3, vec, Kind::Plain), (vec, vec + 3, Kind::Type), (vec + 3, new, Kind::Plain), (new, new + 3, Kind::Function), (new + 3, line.len(), Kind::Plain)]);
+        // The whole line is still covered, in order, with nothing overlapping.
+        assert_eq!(got.iter().map(|(a, b, _)| &line[*a..*b]).collect::<String>(), line);
+        // A token that would cut a character in two is pulled back to its start.
+        let cut = overlay(line, parts, &[(4, 6, Kind::Type)]);
+        assert!(cut.iter().all(|(a, b, _)| line.is_char_boundary(*a) && line.is_char_boundary(*b)));
+    }
 
     fn kinds(line: &str) -> Vec<(&str, Kind)> {
         let mut c = false;

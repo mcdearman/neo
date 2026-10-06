@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
 
 use armature_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
-use neo_theme::Color;
+use neo_theme::{Color, Surface};
 
 use armature::document::{text_between, Action, ClipboardNeed, Document, ExtraSelection, Motion, Pos, Scroll, VimView};
-use super::highlight::{highlight, Language, SyntaxColors};
+use super::highlight::{highlight, overlay, Kind, Language, SyntaxColors};
+use super::style::Tone;
 use crate::{FocusRing, ThemeCx};
 use crate::core::{Cx, CursorIcon, DrawCx, EventCx, Length, Limits, Widget};
 use crate::event::{Event, Key, PointerButton, Status};
@@ -33,6 +34,14 @@ pub struct TextEditor<M> {
     /// Selections besides the main one, which Helix keys can make.
     extras: Vec<ExtraSelection>,
     block_caret: bool,
+    marks: Vec<EditorMark>,
+    /// Sorted by line.
+    tokens: std::rc::Rc<[EditorToken]>,
+    popup: Option<EditorPopup>,
+    on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
+    /// The popup's rows as laid out, and the first list item among them.
+    popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
+    popup_first: usize,
     vim: Option<VimView>,
     revision: u64,
     /// First visible line and number of whole visible lines, for Vim.
@@ -60,6 +69,12 @@ impl<M> TextEditor<M> {
             selection: doc.display_selection(),
             extras: doc.extra_selections(),
             block_caret: doc.block_caret(),
+            marks: vec![],
+            tokens: std::rc::Rc::from([]),
+            popup: None,
+            on_popup_key: None,
+            popup_rows: vec![],
+            popup_first: 0,
             vim: doc.vim_view(),
             revision: doc.revision(),
             viewport: (0, 0),
@@ -86,6 +101,33 @@ impl<M> TextEditor<M> {
     /// Called for every edit and cursor change. Without it the editor is read-only.
     pub fn on_action(mut self, f: impl Fn(Action) -> M + 'static) -> Self {
         self.on_action = Some(Box::new(f));
+        self
+    }
+
+    /// Underlines stretches of the text.
+    pub fn marks(mut self, marks: Vec<EditorMark>) -> Self {
+        self.marks = marks;
+        self
+    }
+
+    /// Colours the text by these, which must be sorted by line, wherever
+    /// they reach; the built-in highlighter colours the rest.
+    pub fn tokens(mut self, tokens: std::rc::Rc<[EditorToken]>) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    /// Shows a popup at the caret.
+    pub fn popup(mut self, popup: Option<EditorPopup>) -> Self {
+        self.popup = popup;
+        self
+    }
+
+    /// Called with the keys that work the popup while one is showing:
+    /// Escape for any popup, and the arrows, Enter and Tab for a list.
+    /// Without it, those keys edit as usual.
+    pub fn on_popup_key(mut self, f: impl Fn(PopupKey) -> M + 'static) -> Self {
+        self.on_popup_key = Some(Box::new(f));
         self
     }
 
@@ -122,6 +164,51 @@ impl<M> TextEditor<M> {
         line.checked_sub(self.first).and_then(|i| self.rows.get(i))
     }
 }
+
+/// A stretch of text to underline, such as a problem a language server found.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorMark {
+    pub from: Pos,
+    pub to: Pos,
+    pub tone: Tone,
+}
+
+/// A stretch of one line and what it is, from a source that understands
+/// the code better than the built-in highlighter, such as a language
+/// server. `from` and `to` are byte offsets into the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditorToken {
+    pub line: usize,
+    pub from: usize,
+    pub to: usize,
+    pub kind: Kind,
+}
+
+/// Something to show at the caret.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditorPopup {
+    /// A note about what is under the caret.
+    Text(String),
+    /// Choices, each with an optional detail in a quieter colour, and which
+    /// one is picked.
+    List { items: Vec<(String, Option<String>)>, selected: usize },
+}
+
+/// A key the editor hands over while a popup is showing, instead of
+/// editing with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupKey {
+    Up,
+    Down,
+    /// Enter or Tab on a list.
+    Accept,
+    /// Escape.
+    Dismiss,
+}
+
+/// Rows of a list popup shown at once, and lines of a text one.
+const POPUP_ROWS: usize = 8;
+const POPUP_LINES: usize = 16;
 
 /// Ctrl keys that the modal keymaps (Vim and Helix) handle; the rest go to
 /// the application.
@@ -197,6 +284,25 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let l = limits.constrain(self.width, self.height);
         let size = l.resolve(Size::new(if l.max.w.is_finite() { l.max.w } else { 600.0 }, if l.max.h.is_finite() { l.max.h } else { 400.0 }));
         let style = self.style(cx);
+        self.popup_rows.clear();
+        self.popup_first = 0;
+        match &self.popup {
+            Some(EditorPopup::Text(text)) => {
+                for line in text.lines().take(POPUP_LINES) {
+                    let line: String = line.chars().take(100).collect();
+                    self.popup_rows.push((cx.text().layout(&line, &style, None), None));
+                }
+            }
+            Some(EditorPopup::List { items, selected }) => {
+                // The rows shown slide to keep the picked one in view.
+                self.popup_first = selected.saturating_sub(POPUP_ROWS - 1).min(items.len().saturating_sub(POPUP_ROWS));
+                for (label, detail) in items.iter().skip(self.popup_first).take(POPUP_ROWS) {
+                    let detail = detail.as_ref().map(|d| cx.text().layout(&d.chars().take(60).collect::<String>(), &style, None));
+                    self.popup_rows.push((cx.text().layout(label, &style, None), detail));
+                }
+            }
+            None => {}
+        }
         let digit = cx.text().layout("0", &style, None);
         self.char_w = digit.size().w.max(1.0);
         self.line_h = digit.size().h.max(1.0);
@@ -288,7 +394,10 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let num_style = TextStyle { size: style.size * 0.92, ..style };
         for i in self.first..last {
             let line = &self.lines[i];
-            let spans: Vec<(&str, Option<Color>)> = highlight(self.language, line, &mut in_comment).into_iter().map(|(a, b, k)| (&line[a..b], colors.color(k))).collect();
+            let own = highlight(self.language, line, &mut in_comment);
+            let start = self.tokens.partition_point(|t| t.line < i);
+            let theirs: Vec<(usize, usize, Kind)> = self.tokens[start..].iter().take_while(|t| t.line == i).map(|t| (t.from, t.to, t.kind)).collect();
+            let spans: Vec<(&str, Option<Color>)> = overlay(line, own, &theirs).into_iter().map(|(a, b, k)| (&line[a..b], colors.color(k))).collect();
             let layout = if spans.len() <= 1 && spans.first().is_none_or(|s| s.1.is_none()) {
                 cx.text().layout(line, &style, None)
             } else {
@@ -361,6 +470,20 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 if to > from {
                     cx.scene.fill(Rect::new(tx + from, y, to - from, self.line_h), 3.0, sel_color, None);
                 }
+            }
+        }
+        // Underlines, such as problems a language server reported.
+        let last_row = self.first + self.rows.len().saturating_sub(1);
+        for m in &self.marks {
+            let (s, e) = (m.from.min(m.to), m.from.max(m.to));
+            if e.line >= self.lines.len() {
+                continue;
+            }
+            for line in s.line.max(self.first)..=e.line.min(last_row) {
+                let from = if line == s.line { self.caret_x(line, s.col.min(self.lines[line].len())) } else { 0.0 };
+                let to = if line == e.line { self.caret_x(line, e.col.min(self.lines[line].len())) } else { self.caret_x(line, self.lines[line].len()) };
+                let y = self.line_y(b, scroll, line) + self.line_h - 3.0;
+                cx.scene.fill(Rect::new(tx + from, y, (to - from).max(self.char_w), 2.0), 1.0, m.tone.resolve(p.text, &p), None);
             }
         }
         let default = p.text;
@@ -439,6 +562,40 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let x = text_area.x + (text_area.w - w) * (scroll.x / (content_w - text_w).max(1.0));
             cx.scene.fill(Rect::new(x, b.bottom() - 9.0, w, 6.0), 3.0, p.faint.with_alpha(0.4), None);
         }
+        // A popup at the caret: under its line, or over it near the bottom.
+        if !self.popup_rows.is_empty() {
+            let row_h = self.line_h + 4.0;
+            let wide = self.popup_rows.iter().map(|(l, d)| l.size().w + d.as_ref().map_or(0.0, |d| d.size().w + 18.0)).fold(0.0, f32::max);
+            let size = Size::new((wide + 20.0).min(b.w - 16.0), self.popup_rows.len() as f32 * row_h + 8.0);
+            let line_top = self.line_y(b, scroll, self.cursor.line);
+            let below = line_top + self.line_h + 2.0;
+            let y = if below + size.h > b.bottom() - 4.0 && line_top - size.h - 2.0 > b.y { line_top - size.h - 2.0 } else { below };
+            let x = (self.text_x(b, scroll) + self.caret_x(self.cursor.line, self.cursor.col)).min(b.right() - size.w - 8.0).max(b.x + 8.0);
+            let rect = Rect::new(x.round(), y.round(), size.w, size.h);
+            let picked = match &self.popup {
+                Some(EditorPopup::List { selected, .. }) => selected.checked_sub(self.popup_first),
+                _ => None,
+            };
+            cx.scene.push_layer();
+            let radius = theme.small_radius() + 2.0;
+            cx.scene.shadow(rect, radius, &neo_theme::Shadow { offset: (0.0, 6.0), blur: 20.0, spread: 0.0, color: Color::BLACK.with_alpha(0.22), inset: false });
+            cx.scene.fill(rect, radius, p.surface, Some((1.0, p.line)));
+            cx.scene.push_clip(rect);
+            for (i, (label, detail)) in self.popup_rows.iter().enumerate() {
+                let top = rect.y + 4.0 + i as f32 * row_h;
+                if picked == Some(i) {
+                    let mut paint = theme.paint(Surface::Pressed);
+                    paint.shadows.clear();
+                    cx.scene.paint(Rect::new(rect.x + 4.0, top, rect.w - 8.0, row_h), theme.small_radius(), &paint);
+                }
+                let text_y = (top + (row_h - label.size().h) * 0.5).round();
+                cx.scene.text(label, Point::new(rect.x + 10.0, text_y), p.text);
+                if let Some(d) = detail {
+                    cx.scene.text(d, Point::new(rect.x + 10.0 + label.size().w + 18.0, text_y), p.muted);
+                }
+            }
+            cx.scene.pop_clip();
+        }
         cx.scene.pop_clip();
         cx.focus_ring(b, theme.control_radius());
     }
@@ -451,6 +608,24 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             cx.state::<EditorState>().blink_origin = Some(Instant::now());
             cx.emit(f(a));
         };
+        // While a popup shows, the keys that work it go to it.
+        if let (Some(popup), Some(on_key), Event::Key(k)) = (&self.popup, &self.on_popup_key, event)
+            && k.pressed
+            && cx.is_focused()
+        {
+            let list = matches!(popup, EditorPopup::List { .. });
+            let key = match &k.key {
+                Key::Escape => Some(PopupKey::Dismiss),
+                Key::Up if list => Some(PopupKey::Up),
+                Key::Down if list => Some(PopupKey::Down),
+                Key::Enter | Key::Tab if list => Some(PopupKey::Accept),
+                _ => None,
+            };
+            if let Some(key) = key {
+                cx.emit(on_key(key));
+                return Status::Captured;
+            }
+        }
         match event {
             Event::Wheel { pos, delta } if b.contains(*pos) => {
                 let st = cx.state::<EditorState>();

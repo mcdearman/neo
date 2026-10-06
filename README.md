@@ -126,6 +126,30 @@ A document can be driven by standard, Vim or Helix keys: `Document::set_keymap(K
 
 The application carries out `:w` and `:q` from either keymap through `Document::take_vim_requests`.
 
+### Language servers in NeoCode
+
+NeoCode looks for a language server for each file it opens and starts it for the folder that is open. There is nothing to configure: it searches your `PATH`, the `PATH` your login shell sets up (an app started from a dock or launcher gets a bare one), and the usual install folders such as `~/.cargo/bin`, `~/.local/bin`, Homebrew and Mason. If a copy will not start, such as a rustup proxy without the component behind it, it tries the next. **Settings…** lists what was found.
+
+| Files | Server looked for |
+|---|---|
+| Rust | `rust-analyzer` |
+| C, C++, Objective-C | `clangd` |
+| Go | `gopls` |
+| Python | `basedpyright-langserver`, `pyright-langserver`, `pylsp`, `ruff server` |
+| TypeScript, JavaScript | `typescript-language-server`, `vtsls`, `deno lsp` |
+| TOML, Markdown, JSON, YAML, HTML, CSS | `taplo`, `marksman`, and the `vscode-*-language-server` and `yaml-language-server` programs |
+| Lua, Zig, shell scripts | `lua-language-server`, `zls`, `bash-language-server` |
+
+With a server running:
+
+- **Problems** are underlined as you type, counted in the status bar, and described there for the line the caret is on.
+- **Colours** come from the server (semantic tokens) on top of the built-in highlighter, so languages Neo does not colour itself are coloured too.
+- **Completions** appear as you type a word or one of the server's trigger characters: Up and Down choose, Enter or Tab accepts, Escape dismisses. **Go ▸ Complete** (Cmd/Ctrl+.) asks for them.
+- **Go ▸ Show Hover** (Cmd/Ctrl+I) shows what is under the caret, and **Go ▸ Go to Definition** (Cmd/Ctrl+G) jumps to where it is defined, when that is in the open folder.
+- **Edit ▸ Format Document** (Shift+Cmd/Ctrl+L) formats the file as one undo step.
+
+The text editor widget does the drawing through `TextEditor::marks`, `tokens` and `popup`; the protocol client and the search live in `apps/code/src/lsp`.
+
 ### How it works
 
 - **Surfaces, not colours.** Widgets ask the theme to paint a role such as card, raised, pressed, well, inset or accent. How each role looks is decided in one place, in `Theme::paint`.

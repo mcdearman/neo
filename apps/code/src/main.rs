@@ -11,8 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod intel;
+mod lsp;
+
 use neo::prelude::*;
-use neo::{Key, KeyEvent, Size};
+use neo::{Key, KeyEvent, Proxy, Size};
 use neo_desktop::Desktop;
 
 // ---------------------------------------------------------------------------
@@ -176,6 +179,17 @@ struct Tab {
     saved: u64,
     language: Language,
     disk: Option<PathBuf>,
+    /// The language server looking after this file, by name.
+    server: Option<&'static str>,
+    /// How many versions of the text the server has been sent, and the
+    /// document revision of the last.
+    version: i64,
+    synced: u64,
+    /// The problems the server has found.
+    diagnostics: Vec<lsp::Diagnostic>,
+    /// What the server says each stretch of the text is, for colouring.
+    tokens: std::rc::Rc<[EditorToken]>,
+    popup: Option<intel::Popup>,
 }
 
 impl Tab {
@@ -195,6 +209,7 @@ struct NeoCode {
     /// The folder that is open, when the project is on disk.
     root: Option<PathBuf>,
     desktop: Desktop,
+    servers: intel::Servers,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +232,13 @@ enum Msg {
     Folder(PathBuf),
     /// Files or folders dropped on the window.
     Dropped(Vec<PathBuf>),
+    /// The folders to look for language servers in have been worked out.
+    LspDirs(Vec<PathBuf>),
+    /// Word from a language server: its name, which launch of it, and what.
+    Lsp(&'static str, u64, lsp::Incoming),
+    /// Ask the language server about the caret's position.
+    Ask(intel::Ask),
+    PopupKey(PopupKey),
 }
 
 impl NeoCode {
@@ -236,7 +258,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -277,7 +299,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load() }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default() }
     }
 
     /// Replaces the project with the folder at `dir`. Refused while files
@@ -299,6 +321,8 @@ impl NeoCode {
         self.tabs.clear();
         self.active = None;
         self.root = Some(dir);
+        // The servers were started for the old folder.
+        self.servers.reset();
     }
 
     /// Opens what was dropped on the window: a folder as the project, or a
@@ -387,6 +411,10 @@ impl App for NeoCode {
         theme
     }
 
+    fn start(&mut self, proxy: Proxy<Msg>) {
+        self.find_servers(proxy);
+    }
+
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
         let mut subs = vec![Desktop::subscription(Msg::Poll)];
         if self.toast.is_some() {
@@ -397,6 +425,8 @@ impl App for NeoCode {
 
     fn menus(&self) -> Vec<Menu<Msg>> {
         let file_open = self.active_tab().is_some();
+        // Whether a language server is looking after the file in front.
+        let served = self.active_tab().and_then(|t| t.server).is_some_and(|s| self.servers.clients.contains_key(s));
         let keys = KEYMAPS.iter().enumerate().map(|(i, (k, name))| MenuEntry::new(format!("{}{name} Keys", if *k == self.keymap { "✓ " } else { "" }), Msg::Keys(i)));
         vec![
             Menu::new("File")
@@ -408,7 +438,13 @@ impl App for NeoCode {
                 .push(MenuEntry::new("Undo", Msg::Edit(Action::Undo)).shortcut(Shortcut::command("z")).enabled(file_open))
                 .push(MenuEntry::new("Redo", Msg::Edit(Action::Redo)).shortcut(Shortcut::command("z").shift()).enabled(file_open))
                 .separator()
-                .push(MenuEntry::new("Select All", Msg::Edit(Action::SelectAll)).shortcut(Shortcut::command("a")).enabled(file_open)),
+                .push(MenuEntry::new("Select All", Msg::Edit(Action::SelectAll)).shortcut(Shortcut::command("a")).enabled(file_open))
+                .separator()
+                .push(MenuEntry::new("Format Document", Msg::Ask(intel::Ask::Format)).shortcut(Shortcut::command("l").shift()).enabled(served)),
+            Menu::new("Go")
+                .push(MenuEntry::new("Show Hover", Msg::Ask(intel::Ask::Hover)).shortcut(Shortcut::command("i")).enabled(served))
+                .push(MenuEntry::new("Go to Definition", Msg::Ask(intel::Ask::Definition)).shortcut(Shortcut::command("g")).enabled(served))
+                .push(MenuEntry::new("Complete", Msg::Ask(intel::Ask::Complete)).shortcut(Shortcut::command(".")).enabled(served)),
             keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
         ]
     }
@@ -453,8 +489,9 @@ impl App for NeoCode {
                 };
                 let mut doc = Document::new(&text);
                 doc.set_keymap(self.keymap);
-                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk });
+                self.tabs.push(Tab { saved: doc.revision(), doc, language: Language::from_path(&node.name), name: node.name, path: node.path, disk, server: None, version: 0, synced: 0, diagnostics: vec![], tokens: std::rc::Rc::from([]), popup: None });
                 self.active = Some(self.tabs.len() - 1);
+                self.lsp_open(self.tabs.len() - 1);
             }
             Msg::ToggleDir(i) => self.nodes[i].expanded = !self.nodes[i].expanded,
             Msg::Select(i) => {
@@ -464,6 +501,7 @@ impl App for NeoCode {
             }
             Msg::Close(i) => {
                 if i < self.tabs.len() {
+                    self.lsp_closing(i);
                     self.tabs.remove(i);
                     self.active = if self.tabs.is_empty() {
                         None
@@ -475,7 +513,22 @@ impl App for NeoCode {
             Msg::Edit(a) => {
                 let Some(i) = self.active else { return };
                 let Some(t) = self.tabs.get_mut(i) else { return };
+                // Text added on the caret's line is typing, which is when
+                // completions are wanted.
+                let shape = |t: &Tab| (t.doc.line_count(), t.doc.cursor().line, t.doc.lines()[t.doc.cursor().line].len());
+                let (before, revision) = (shape(t), t.doc.revision());
                 t.doc.apply(a);
+                let after = shape(t);
+                let typed = t.doc.revision() != revision && (before.0, before.1) == (after.0, after.1) && after.2 > before.2;
+                if t.doc.revision() != revision && !t.tokens.is_empty() {
+                    // The server's colours for the changed line are stale, and
+                    // if lines came or went so are those below. The built-in
+                    // highlighter covers for them until fresh ones arrive.
+                    let (from, lines_moved) = (before.1.min(after.1), before.0 != after.0);
+                    t.tokens = t.tokens.iter().filter(|k| k.line < from || (!lines_moved && k.line > from)).copied().collect();
+                }
+                self.after_edit(i, typed);
+                let Some(t) = self.tabs.get_mut(i) else { return };
                 for r in t.doc.take_vim_requests() {
                     match r {
                         VimRequest::Write => self.update(Msg::Save),
@@ -506,6 +559,10 @@ impl App for NeoCode {
                     self.open_dropped(first);
                 }
             }
+            Msg::LspDirs(dirs) => self.servers_found(dirs),
+            Msg::Lsp(name, launch, incoming) => self.lsp_incoming(name, launch, incoming),
+            Msg::Ask(what) => self.ask(what),
+            Msg::PopupKey(key) => self.popup_key(key),
             Msg::Keys(i) => {
                 self.keymap = KEYMAPS.get(i).map_or(Keymap::Plain, |(k, _)| *k);
                 for t in &mut self.tabs {
@@ -522,6 +579,9 @@ impl App for NeoCode {
                     Ok(msg) => {
                         t.saved = t.doc.revision();
                         self.toast = Some(msg);
+                        if let Some(i) = self.active {
+                            self.lsp_saved(i);
+                        }
                     }
                     Err(e) => self.toast = Some(format!("Couldn't save {}: {e}", t.name)),
                 }
@@ -617,7 +677,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -643,7 +703,10 @@ impl NeoCode {
     /// Code's own rows for the settings panel.
     fn settings_rows(&self) -> Vec<Element<Msg>> {
         let keys = segmented(KEYMAPS.map(|(_, name)| name), KEYMAPS.iter().position(|(k, _)| *k == self.keymap), Msg::Keys);
-        vec![neo_desktop::ui::setting("Keys", "Standard editing, or Vim or Helix modal keys.", keys)]
+        vec![
+            neo_desktop::ui::setting("Keys", "Standard editing, or Vim or Helix modal keys.", keys),
+            neo_desktop::ui::setting("Language servers", &self.servers_summary(), Space::new(0.0, 0.0)),
+        ]
     }
 
     fn status_bar(&self) -> Element<Msg> {
@@ -680,6 +743,17 @@ impl NeoCode {
                 let n = selected.chars().filter(|c| *c != '\n').count();
                 left = left.push(text(format!("{n} selected")).mono().role(TextRole::Caption).tone(Tone::Muted));
             }
+            let count = |s: lsp::Severity| t.diagnostics.iter().filter(|d| d.severity == s).count();
+            for (n, glyph, tone) in [(count(lsp::Severity::Error), icons::CIRCLE_X, Tone::Bad), (count(lsp::Severity::Warning), icons::TRIANGLE_ALERT, Tone::Warn)] {
+                if n > 0 {
+                    left = left.push(row().spacing(4.0).align(Align::Center).push(icon(glyph).size(13.0).tone(tone)).push(text(n.to_string()).mono().role(TextRole::Caption).tone(tone)));
+                }
+            }
+            if let Some(d) = self.problem_here(t) {
+                let first = d.message.lines().next().unwrap_or_default();
+                let tone = if d.severity == lsp::Severity::Error { Tone::Bad } else { Tone::Warn };
+                left = left.push(text(first.chars().take(90).collect::<String>()).role(TextRole::Caption).tone(tone).no_wrap());
+            }
             left = left
                 .push(text(t.language.name()).role(TextRole::Caption).tone(Tone::Muted))
                 .push(text(format!("Spaces: {INDENT}")).role(TextRole::Caption).tone(Tone::Muted))
@@ -691,12 +765,17 @@ impl NeoCode {
         }
         let dark = self.is_dark();
         let keys = KEYMAPS.iter().position(|(k, _)| *k == self.keymap).unwrap_or(0);
+        let server = self.active_tab().and_then(|t| self.server_status(t));
         let bar = row()
             .width(Length::Fill)
             .align(Align::Center)
             .spacing(12.0)
             .push(left)
             .push(Space::fill_x())
+            .push_if(server.is_some(), || {
+                let (label, tone) = server.clone().unwrap_or_default();
+                text(label).role(TextRole::Caption).tone(tone).no_wrap().into()
+            })
             // Click to go on to the next set of keys.
             .push(Button::new(text(format!("{} keys", KEYMAPS[keys].1)).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([8.0, 3.0]).radius(5.0).on_press(Msg::Keys((keys + 1) % KEYMAPS.len())))
             .push(icon_button(if dark { icons::SUN } else { icons::MOON }, 24.0).kind(ButtonKind::Ghost).on_press(Msg::ToggleScheme));
@@ -924,11 +1003,11 @@ mod tests {
         let key = KeyEvent { key: Key::Character("o".into()), pressed: true, repeat: false, modifiers: cmd, text: None };
         let menus = app.menus();
         let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, ["File", "Edit", "View"]);
+        assert_eq!(titles, ["File", "Edit", "Go", "View"]);
         let open = &menus[0].entries[0];
         assert!(matches!(open.message, Some(Msg::OpenFolder)) && open.shortcut.as_ref().unwrap().matches(&key));
         // The current keys are ticked in the View menu.
-        assert!(menus[2].entries.iter().any(|e| e.label == "✓ Vim Keys"));
+        assert!(menus[3].entries.iter().any(|e| e.label == "✓ Vim Keys"));
 
         // Save and Close need a file; they grey out without one.
         let labelled = |app: &NeoCode, label: &str| app.menus()[0].entries.iter().find(|e| e.label == label).unwrap().message.is_some();
@@ -1001,6 +1080,315 @@ mod tests {
         assert_eq!(alpha(&mut h), 255, "solid once this app opts out");
         assert!(!h.theme().glass.enabled);
         assert!(h.app().desktop.appearance.glass.enabled, "and only this app changed");
+    }
+
+    use crate::lsp::testing::Sink;
+    use crate::lsp::{Client, Incoming};
+    use serde_json::{json, Value};
+
+    /// A project on disk with `src/lib.rs` open, looked after by a stand-in
+    /// for rust-analyzer whose side of the conversation the test plays.
+    struct Served {
+        h: Harness<NeoCode>,
+        sink: Sink,
+        file: PathBuf,
+    }
+
+    impl Served {
+        fn new(name: &str, source: &str) -> Self {
+            let dir = project(name);
+            std::fs::write(dir.join("src/lib.rs"), source).unwrap();
+            let mut app = NeoCode::folder(&dir);
+            app.update(Msg::Keys(0));
+            let root = app.root.clone().unwrap();
+            let sink = Sink::default();
+            app.servers.clients.insert("rust-analyzer", (1, Client::new(Box::new(sink.clone()), &root)));
+            let h = Harness::new(app, Size::new(1280.0, 820.0)).unwrap();
+            let mut s = Self { h, sink, file: root.join("src/lib.rs") };
+            // The handshake: answer `initialize`.
+            let hello = s.sink.take();
+            let caps = json!({ "positionEncoding": "utf-8", "documentFormattingProvider": true, "completionProvider": { "triggerCharacters": ["."] }, "semanticTokensProvider": { "legend": { "tokenTypes": ["function", "keyword", "type"] }, "full": true } });
+            s.says(json!({ "id": hello[0]["id"], "result": { "capabilities": caps } }));
+            let lib = s.h.app().nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+            s.h.app_mut().update(Msg::Open(lib));
+            s.h.click(Point::new(700.0, 300.0));
+            s
+        }
+
+        /// The server sends a message.
+        fn says(&mut self, message: Value) {
+            self.h.app_mut().update(Msg::Lsp("rust-analyzer", 1, Incoming::Message(message)));
+        }
+
+        /// What the app has sent the server since the last call, by method.
+        fn sent(&self) -> Vec<Value> {
+            self.sink.take()
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.sent().iter().map(|m| m["method"].as_str().unwrap_or("reply").to_owned()).collect()
+        }
+
+        fn uri(&self) -> String {
+            crate::lsp::client::uri(&self.file)
+        }
+
+        fn tab(&self) -> &Tab {
+            self.h.app().active_tab().unwrap()
+        }
+
+        /// The request with this method among what was just sent.
+        fn request(&self, method: &str) -> Value {
+            self.sent().into_iter().rfind(|m| m["method"] == method).unwrap_or_else(|| panic!("no {method} was sent"))
+        }
+    }
+
+    #[test]
+    fn opening_and_editing_a_file_keeps_its_server_up_to_date() {
+        let mut s = Served::new("lsp-sync", "pub fn one() {}\n");
+        let opened = s.sent();
+        let open = opened.iter().find(|m| m["method"] == "textDocument/didOpen").expect("the file is opened with the server");
+        assert_eq!(open["params"]["textDocument"], json!({ "uri": s.uri(), "languageId": "rust", "version": 1, "text": "pub fn one() {}\n" }));
+        assert!(opened.iter().any(|m| m["method"] == "textDocument/semanticTokens/full"), "and its colours are asked for");
+
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(0, 0), select: false }));
+        assert!(s.sent().is_empty(), "moving the caret changes nothing for the server");
+        s.h.type_text("x");
+        let sent = s.sent();
+        let change = sent.iter().find(|m| m["method"] == "textDocument/didChange").unwrap();
+        assert_eq!(change["params"]["textDocument"]["version"], 2);
+        assert_eq!(change["params"]["contentChanges"][0]["text"], "xpub fn one() {}\n");
+        assert!(sent.iter().any(|m| m["method"] == "textDocument/completion"), "typing a word asks for completions");
+
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        s.h.key(Key::Character("s".into()), cmd);
+        assert!(s.methods().contains(&"textDocument/didSave".to_owned()));
+        s.h.key(Key::Character("w".into()), cmd);
+        assert_eq!(s.methods(), ["textDocument/didClose"]);
+    }
+
+    #[test]
+    fn problems_are_underlined_counted_and_described() {
+        let mut s = Served::new("lsp-problems", "fn one() -> u32 {\n    \"x\"\n}\n");
+        let clean = s.h.render(1.0);
+        let uri = s.uri();
+        s.says(json!({ "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [
+            { "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 7 } }, "severity": 1, "message": "mismatched types\nexpected u32" },
+            { "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }, "severity": 2, "message": "unused" },
+        ] } }));
+        assert_eq!(s.tab().diagnostics.len(), 2);
+        let marks = s.h.app().editor_marks(s.tab());
+        assert_eq!((marks[0].from, marks[0].to, marks[0].tone), (Pos::new(1, 4), Pos::new(1, 7), Tone::Bad));
+        assert_eq!(marks[1].tone, Tone::Warn);
+        assert!(s.h.render(1.0) != clean, "they show in the window");
+        // The status bar describes the one on the caret's line.
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(1, 5), select: false }));
+        assert_eq!(s.h.app().problem_here(s.tab()).unwrap().message, "mismatched types\nexpected u32");
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(2, 0), select: false }));
+        assert!(s.h.app().problem_here(s.tab()).is_none());
+        // An empty list clears them.
+        s.says(json!({ "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [] } }));
+        assert!(s.tab().diagnostics.is_empty());
+    }
+
+    #[test]
+    fn completions_narrow_as_you_type_and_replace_the_word() {
+        let mut s = Served::new("lsp-complete", "fn f() {\n    \n}\n");
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(1, 4), select: false }));
+        s.sent();
+        s.h.type_text("pr");
+        let ask = s.request("textDocument/completion");
+        assert_eq!(ask["params"]["position"], json!({ "line": 1, "character": 6 }));
+        s.says(json!({ "id": ask["id"], "result": [{ "label": "println!", "detail": "macro" }, { "label": "print!" }, { "label": "eprintln!" }, { "label": "format!" }] }));
+        let Some(EditorPopup::List { items, selected }) = s.h.app().editor_popup(s.tab()) else { panic!("a list of completions") };
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!((labels, selected), (vec!["print!", "println!", "eprintln!"], 0), "those starting with what was typed, in the server's order, then those containing it");
+        assert_eq!(items[1].1.as_deref(), Some("macro"));
+
+        // Down, then Enter: the arrow goes to the list, not the text.
+        s.h.key(Key::Down, Modifiers::default());
+        s.h.key(Key::Enter, Modifiers::default());
+        assert_eq!(s.tab().doc.lines()[1], "    println!", "the word typed so far is replaced by the choice");
+        assert!(s.h.app().editor_popup(s.tab()).is_none());
+
+        // Escape dismisses without changing the text.
+        s.h.type_text("f");
+        let ask = s.request("textDocument/completion");
+        s.says(json!({ "id": ask["id"], "result": [{ "label": "format!" }] }));
+        assert!(s.h.app().editor_popup(s.tab()).is_some());
+        s.h.key(Key::Escape, Modifiers::default());
+        assert!(s.h.app().editor_popup(s.tab()).is_none());
+        assert_eq!(s.tab().doc.lines()[1], "    println!f");
+    }
+
+    #[test]
+    fn hover_shows_at_the_caret_until_the_next_key() {
+        let mut s = Served::new("lsp-hover", "pub fn one() {}\n");
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(0, 8), select: false }));
+        s.sent();
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        s.h.key(Key::Character("i".into()), cmd);
+        let ask = s.request("textDocument/hover");
+        assert_eq!(ask["params"]["position"], json!({ "line": 0, "character": 8 }));
+        let plain = s.h.render(1.0);
+        s.says(json!({ "id": ask["id"], "result": { "contents": { "kind": "markdown", "value": "fn one()" } } }));
+        assert_eq!(s.h.app().editor_popup(s.tab()), Some(EditorPopup::Text("fn one()".into())));
+        assert!(s.h.render(1.0) != plain);
+        s.h.key(Key::Right, Modifiers::default());
+        assert!(s.h.app().editor_popup(s.tab()).is_none(), "moving on dismisses it");
+    }
+
+    #[test]
+    fn go_to_definition_opens_the_file_and_moves_the_caret() {
+        let mut s = Served::new("lsp-definition", "pub fn one() {}\n");
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+        let ask = s.request("textDocument/definition");
+        let notes = crate::lsp::client::uri(&s.file.parent().unwrap().parent().unwrap().join("notes.md"));
+        s.says(json!({ "id": ask["id"], "result": [{ "uri": notes, "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 7 } } }] }));
+        assert_eq!((s.tab().name.as_str(), s.tab().doc.cursor()), ("notes.md", Pos::new(0, 2)));
+        // Nothing found, and somewhere outside the folder, both say so.
+        s.h.app_mut().update(Msg::Select(0));
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+        let ask = s.request("textDocument/definition");
+        s.says(json!({ "id": ask["id"], "result": null }));
+        assert_eq!(s.h.app().toast.as_deref(), Some("No definition found."));
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Definition));
+        let ask = s.request("textDocument/definition");
+        s.says(json!({ "id": ask["id"], "result": { "uri": "file:///elsewhere/std.rs", "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } } } }));
+        assert!(s.h.app().toast.as_deref().unwrap().starts_with("That is defined outside this folder"));
+    }
+
+    #[test]
+    fn formatting_is_one_step_to_undo() {
+        let mut s = Served::new("lsp-format", "fn  one( ){}\n");
+        s.h.app_mut().update(Msg::Keys(1));
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Format));
+        let ask = s.request("textDocument/formatting");
+        let edit = |l0: u32, c0: u32, c1: u32, text: &str| json!({ "range": { "start": { "line": l0, "character": c0 }, "end": { "line": l0, "character": c1 } }, "newText": text });
+        s.says(json!({ "id": ask["id"], "result": [edit(0, 2, 4, " "), edit(0, 8, 9, ""), edit(0, 10, 10, " ")] }));
+        assert_eq!(s.tab().doc.text(), "fn one() {}\n");
+        assert_eq!(s.tab().doc.keymap(), Keymap::Vim, "whatever keys were in use still are");
+        assert!(s.methods().contains(&"textDocument/didChange".to_owned()), "and the server hears the result");
+        s.h.app_mut().update(Msg::Edit(Action::Undo));
+        assert_eq!(s.tab().doc.text(), "fn  one( ){}\n");
+        // Nothing to change is said, not done.
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Format));
+        let ask = s.request("textDocument/formatting");
+        s.says(json!({ "id": ask["id"], "result": [] }));
+        assert_eq!(s.h.app().toast.as_deref(), Some("Already formatted."));
+    }
+
+    #[test]
+    fn the_servers_colours_reach_the_editor_and_stale_ones_are_dropped() {
+        let mut s = Served::new("lsp-colours", "pub fn one() {}\nfn two() {}\n");
+        let before = s.h.render(1.0);
+        let ask = s.request("textDocument/semanticTokens/full");
+        // The server calls `one` a type, which the built-in highlighter would
+        // not, and `two` a function; a kind it never named is skipped.
+        s.says(json!({ "id": ask["id"], "result": { "data": [0, 7, 3, 2, 0, 1, 3, 3, 0, 0, 0, 4, 2, 9, 0] } }));
+        let tokens: Vec<EditorToken> = s.tab().tokens.to_vec();
+        assert_eq!(tokens, [EditorToken { line: 0, from: 7, to: 10, kind: SyntaxKind::Type }, EditorToken { line: 1, from: 3, to: 6, kind: SyntaxKind::Function }]);
+        assert!(s.h.render(1.0) != before, "the names are coloured");
+        // Typing on the first line drops its colours until new ones come,
+        // and asks for them; the second line keeps its own.
+        s.h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(0, 15), select: false }));
+        s.h.type_text(" ");
+        assert_eq!(s.tab().tokens.to_vec(), [tokens[1]]);
+        assert!(s.methods().contains(&"textDocument/semanticTokens/full".to_owned()));
+        // A new line moves everything below, so those go too.
+        s.h.key(Key::Enter, Modifiers::default());
+        assert!(s.tab().tokens.is_empty());
+        // The server asking for a refresh gets a new request.
+        s.sent();
+        s.says(json!({ "id": 9, "method": "workspace/semanticTokens/refresh" }));
+        assert_eq!(s.methods(), ["reply", "textDocument/semanticTokens/full"]);
+    }
+
+    #[test]
+    fn a_server_that_stops_is_reported_and_stale_word_is_ignored() {
+        let mut s = Served::new("lsp-stopped", "pub fn one() {}\n");
+        let uri = s.uri();
+        let problem = json!({ "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "message": "x" }] } });
+        // From an earlier launch of the server: not ours to act on.
+        s.h.app_mut().update(Msg::Lsp("rust-analyzer", 0, Incoming::Message(problem.clone())));
+        assert!(s.tab().diagnostics.is_empty());
+        s.says(problem);
+        assert_eq!(s.tab().diagnostics.len(), 1);
+        assert_eq!(s.h.app().server_status(s.tab()), Some(("rust-analyzer".into(), Tone::Muted)));
+        s.h.app_mut().update(Msg::Lsp("rust-analyzer", 1, Incoming::Closed));
+        assert!(s.tab().diagnostics.is_empty(), "its problems go with it");
+        assert_eq!(s.h.app().server_status(s.tab()), Some(("rust-analyzer stopped".into(), Tone::Warn)));
+        s.h.app_mut().update(Msg::Ask(intel::Ask::Hover));
+        assert_eq!(s.h.app().toast.as_deref(), Some("rust-analyzer stopped."));
+    }
+
+    /// The whole app against a real rust-analyzer, if one is installed:
+    /// it is found, started, and its problems, colours and hover show.
+    /// Slow and machine-dependent, so it runs only when asked for:
+    /// `cargo test -p neo-code -- --ignored whole_app`. Set `NEO_SNAPSHOT_DIR`
+    /// to keep pictures of the result.
+    #[test]
+    #[ignore]
+    fn whole_app_with_a_real_server() {
+        let dir = project("lsp-real");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::remove_file(dir.join("src/lib.rs")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "struct Point {\n    x: u32,\n}\n\nfn answer() -> u32 {\n    \"forty-two\"\n}\n\nfn main() {\n    let p = Point { x: answer() };\n    println!(\"{}\", p.x);\n}\n").unwrap();
+        let mut app = NeoCode::folder(&dir);
+        app.update(Msg::Keys(0));
+        let mut h = Harness::new(app, Size::new(1100.0, 560.0)).unwrap();
+        // The search the app does at startup, which tests otherwise skip.
+        h.app_mut().update(Msg::LspDirs(lsp::search_dirs()));
+        assert!(h.app().servers_summary().contains("rust-analyzer"), "{}", h.app().servers_summary());
+        let main = h.app().nodes.iter().position(|n| n.name == "main.rs").unwrap();
+        h.app_mut().update(Msg::Open(main));
+        h.click(Point::new(700.0, 300.0));
+        let wait = |h: &mut Harness<NeoCode>, what: &str, done: &dyn Fn(&NeoCode) -> bool| {
+            let until = std::time::Instant::now() + Duration::from_secs(180);
+            while !done(h.app()) {
+                assert!(std::time::Instant::now() < until, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(100));
+                h.advance(Duration::from_millis(100));
+            }
+        };
+        wait(&mut h, "an error and colours", &|a| a.active_tab().is_some_and(|t| t.diagnostics.iter().any(|d| d.severity == lsp::Severity::Error) && !t.tokens.is_empty()));
+        let tab = h.app().active_tab().unwrap();
+        assert_eq!(h.app().server_status(tab), Some(("rust-analyzer".into(), Tone::Muted)));
+        assert!(tab.diagnostics.iter().any(|d| d.from.0 == 5), "the mismatched string is on line 6: {:?}", tab.diagnostics);
+        assert!(tab.tokens.iter().any(|k| k.line == 0 && k.kind == SyntaxKind::Type), "`Point` is known to be a type");
+        // Hover over `answer` where it is called. Ask again while the server is still loading.
+        h.app_mut().update(Msg::Edit(Action::Click { pos: Pos::new(9, 25), select: false }));
+        for _ in 0..40 {
+            h.app_mut().toast = None;
+            h.app_mut().update(Msg::Ask(intel::Ask::Hover));
+            wait(&mut h, "an answer to hover", &|a| a.toast.is_some() || a.active_tab().is_some_and(|t| t.popup.is_some()));
+            if h.app().active_tab().unwrap().popup.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let Some(EditorPopup::Text(text)) = h.app().editor_popup(h.app().active_tab().unwrap()) else { panic!("no hover") };
+        assert!(text.contains("answer") && text.contains("u32"), "{text}");
+        if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
+            h.save_png(PathBuf::from(out).join("code-lsp.png"), 1.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_server_installed_says_so() {
+        let dir = project("lsp-none");
+        let mut h = Harness::new(NeoCode::folder(&dir), Size::new(1280.0, 820.0)).unwrap();
+        let lib = h.app().nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+        h.app_mut().update(Msg::Open(lib));
+        let status = h.app().server_status(h.app().active_tab().unwrap());
+        assert_eq!(status, Some(("No language server for Rust was found".into(), Tone::Warn)));
+        assert!(h.app().servers_summary().starts_with("None found. NeoCode looks for: rust-analyzer, clangd"));
+        // A plain text file has no server to look for, and says nothing.
+        std::fs::write(dir.join("plain.txt"), "hello\n").unwrap();
+        h.app_mut().update(Msg::Folder(dir));
+        let txt = h.app().nodes.iter().position(|n| n.name == "plain.txt").unwrap();
+        h.app_mut().update(Msg::Open(txt));
+        assert_eq!(h.app().server_status(h.app().active_tab().unwrap()), None);
     }
 
     #[test]
