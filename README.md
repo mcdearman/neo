@@ -128,7 +128,7 @@ The application carries out `:w` and `:q` from either keymap through `Document::
 
 ### Language servers in NeoCode
 
-NeoCode looks for a language server for each file it opens and starts it for the folder that is open. There is nothing to configure: it searches your `PATH`, the `PATH` your login shell sets up (an app started from a dock or launcher gets a bare one), and the usual install folders such as `~/.cargo/bin`, `~/.local/bin`, Homebrew and Mason. If a copy will not start, such as a rustup proxy without the component behind it, it tries the next. **Settings…** lists what was found.
+NeoCode looks for a language server for each file it opens and starts it for the folder that is open. Servers work on files on disk, so the built-in sample project has none, and the status bar says so. NeoCode reopens the folder from last time, and `neo-code path/to/file` opens a file with its project around it. There is nothing to configure: it searches your `PATH`, the `PATH` your login shell sets up (an app started from a dock or launcher gets a bare one), and the usual install folders such as `~/.cargo/bin`, `~/.local/bin`, Homebrew and Mason. If a copy will not start, such as a rustup proxy without the component behind it, it tries the next. **Settings…** lists what was found.
 
 | Files | Server looked for |
 |---|---|

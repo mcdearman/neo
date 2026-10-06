@@ -128,7 +128,7 @@ impl NeoCode {
         while let Some(found) = spares.pop() {
             self.servers.launches += 1;
             let (launch, name, proxy) = (self.servers.launches, spec.name, proxy.clone());
-            if let Ok(client) = Client::spawn(&found, root, move |m| {
+            if let Ok(client) = Client::spawn(&found, root, dirs, move |m| {
                 proxy.send(Msg::Lsp(name, launch, m));
             }) {
                 self.servers.clients.insert(name, (launch, client));
@@ -431,6 +431,10 @@ impl NeoCode {
 
     /// How the file's language server is doing, for the status bar.
     pub(crate) fn server_status(&self, t: &Tab) -> Option<(String, Tone)> {
+        // The sample project is not on disk, where a server could read it.
+        if t.disk.is_none() && lsp::spec_for(Path::new(&t.path)).is_some() {
+            return Some(("Sample project: open a folder to use language servers".into(), Tone::Muted));
+        }
         let name = t.server?;
         Some(match (self.servers.clients.get(name), self.servers.problems.get(name)) {
             (Some((_, c)), _) if c.ready() => (name.to_owned(), Tone::Muted),

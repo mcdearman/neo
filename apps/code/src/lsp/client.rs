@@ -335,9 +335,17 @@ impl Client {
 
     /// Starts a server program and reads what it says on another thread,
     /// which hands each message to `on_message`.
-    pub fn spawn(found: &Found, root: &Path, on_message: impl Fn(Incoming) + Send + 'static) -> std::io::Result<Self> {
+    ///
+    /// `dirs` becomes the server's `PATH`. Servers lean on other tools,
+    /// such as Node, Cargo or Go, and an app started from a dock has a
+    /// bare `PATH` that would hide them.
+    pub fn spawn(found: &Found, root: &Path, dirs: &[PathBuf], on_message: impl Fn(Incoming) + Send + 'static) -> std::io::Result<Self> {
         use std::process::Stdio;
-        let mut child = std::process::Command::new(&found.program).args(&found.args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        let mut command = std::process::Command::new(&found.program);
+        if let Ok(path) = std::env::join_paths(dirs) {
+            command.env("PATH", path);
+        }
+        let mut child = command.args(&found.args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no pipe to the server"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no pipe from the server"))?;
         std::thread::spawn(move || {
@@ -892,7 +900,8 @@ mod tests {
     fn real_server_reports_a_type_error_and_answers_hover() {
         use crate::lsp::{find_in, search_dirs, SERVERS};
         let spec = SERVERS.iter().find(|s| s.name == "rust-analyzer").unwrap();
-        let found = find_in(&search_dirs(), spec);
+        let dirs = search_dirs();
+        let found = find_in(&dirs, spec);
         assert!(!found.is_empty(), "rust-analyzer is not installed");
         let root = std::env::temp_dir().join(format!("neo-code-ra-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -910,7 +919,7 @@ mod tests {
         let mut outcome = None;
         for candidate in &found {
             let (tx, rx) = std::sync::mpsc::channel();
-            let Ok(mut client) = Client::spawn(candidate, &root, move |m| {
+            let Ok(mut client) = Client::spawn(candidate, &root, &dirs, move |m| {
                 let _ = tx.send(m);
             }) else { continue };
             client.did_open(&file, "rust", 1, source);

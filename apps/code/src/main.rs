@@ -302,6 +302,60 @@ impl NeoCode {
         Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default() }
     }
 
+    /// The folder a file belongs to: the nearest one above it that looks
+    /// like a project, or failing that the one it is in.
+    fn project_of(file: &Path) -> PathBuf {
+        let parent = file.parent().unwrap_or(file);
+        const MARKERS: [&str; 7] = [".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml", "build.zig", "compile_commands.json"];
+        // Stop short of the home folder and the root, which are not projects.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        parent.ancestors().take_while(|d| Some(*d) != home.as_deref() && d.parent().is_some()).find(|d| MARKERS.iter().any(|m| d.join(m).exists())).unwrap_or(parent).to_path_buf()
+    }
+
+    /// Starts on a folder, or on a file with its project open around it.
+    fn at(path: &Path) -> Self {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if path.is_dir() {
+            return Self::folder(&path);
+        }
+        let mut app = Self::folder(&Self::project_of(&path));
+        if let Some(i) = app.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if *p == path)) {
+            // Show where it is in the tree, then open it.
+            let mut depth = app.nodes[i].depth;
+            for j in (0..i).rev() {
+                if app.nodes[j].dir && app.nodes[j].depth < depth {
+                    app.nodes[j].expanded = true;
+                    depth = app.nodes[j].depth;
+                }
+            }
+            app.update(Msg::Open(i));
+        }
+        app
+    }
+
+    /// Where the folder last opened is noted, to come back to on the next launch.
+    fn last_folder_file() -> PathBuf {
+        neo_desktop::config_dir().join("apps").join("neo-code-folder")
+    }
+
+    fn remember(dir: &Path) {
+        // Tests open folders too, and must not change what the app comes back to.
+        if cfg!(test) {
+            return;
+        }
+        let file = Self::last_folder_file();
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(file, dir.to_string_lossy().as_bytes());
+    }
+
+    /// The folder open when NeoCode was last used, if it is still there.
+    fn last_folder() -> Option<PathBuf> {
+        let dir = PathBuf::from(std::fs::read_to_string(Self::last_folder_file()).ok()?.trim());
+        dir.is_dir().then_some(dir)
+    }
+
     /// Replaces the project with the folder at `dir`. Refused while files
     /// have unsaved changes, which would otherwise be lost.
     fn open_folder(&mut self, dir: &Path) {
@@ -320,6 +374,7 @@ impl NeoCode {
         self.nodes = nodes;
         self.tabs.clear();
         self.active = None;
+        Self::remember(&dir);
         self.root = Some(dir);
         // The servers were started for the old folder.
         self.servers.reset();
@@ -333,10 +388,8 @@ impl NeoCode {
             return self.open_folder(&path);
         }
         let node = |app: &Self| app.nodes.iter().position(|n| matches!(&n.source, Some(Source::Disk(p)) if *p == path));
-        if node(self).is_none()
-            && let Some(parent) = path.parent()
-        {
-            self.open_folder(parent);
+        if node(self).is_none() {
+            self.open_folder(&Self::project_of(&path));
         }
         if let Some(i) = node(self) {
             self.update(Msg::Open(i));
@@ -688,7 +741,7 @@ impl NeoCode {
                     .align(Align::Center)
                     .push(icon(icons::FILE_CODE).size(40.0).tone(Tone::Faint))
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
-                    .push(text("File ▸ Open Folder… opens a folder, or drop one on the window").role(TextRole::Caption).tone(Tone::Faint))
+                    .push(text("File ▸ Open Folder… opens a folder, or drop one on the window. Language servers start for files in a folder.").role(TextRole::Caption).tone(Tone::Faint))
                     .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work with Vim and Helix keys").role(TextRole::Caption).tone(Tone::Faint)),
             )
             .background(Background::Color(surface))
@@ -800,15 +853,20 @@ fn main() {
         return;
     }
     let app = match args.first() {
-        Some(dir) => {
-            let p = PathBuf::from(dir);
-            if !p.is_dir() {
-                eprintln!("neo-code: {dir} is not a folder");
+        Some(path) => {
+            let p = PathBuf::from(path);
+            if !p.exists() {
+                eprintln!("neo-code: {path} does not exist");
                 std::process::exit(2);
             }
-            NeoCode::folder(&p)
+            let app = NeoCode::at(&p);
+            if let Some(root) = &app.root {
+                NeoCode::remember(root);
+            }
+            app
         }
-        None => NeoCode::sample(),
+        // Back to the folder from last time; the sample is for a first look.
+        None => NeoCode::last_folder().map_or_else(NeoCode::sample, |dir| NeoCode::folder(&dir)),
     };
     if let Err(e) = neo::run(app) {
         eprintln!("neo-code: {e}");
@@ -1372,6 +1430,28 @@ mod tests {
         if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
             h.save_png(PathBuf::from(out).join("code-lsp.png"), 1.0).unwrap();
         }
+    }
+
+    #[test]
+    fn the_sample_project_says_why_it_has_no_language_server() {
+        let app = NeoCode::sample();
+        let tab = app.active_tab().unwrap();
+        assert!(tab.name.ends_with(".rs") && tab.disk.is_none());
+        assert_eq!(app.server_status(tab), Some(("Sample project: open a folder to use language servers".into(), Tone::Muted)));
+    }
+
+    #[test]
+    fn starting_on_a_file_opens_its_project_around_it() {
+        let dir = project("start-on-file");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let app = NeoCode::at(&dir.join("src/lib.rs"));
+        assert_eq!(app.project, "start-on-file", "the folder with Cargo.toml, not src");
+        assert_eq!(app.active_tab().unwrap().name, "lib.rs");
+        assert!(app.nodes.iter().find(|n| n.name == "src").unwrap().expanded, "and the file shows in the tree");
+        // A folder opens as itself, and a loose file brings just its folder.
+        assert_eq!(NeoCode::at(&dir.join("src")).project, "src");
+        let loose = project("loose-file");
+        assert_eq!(NeoCode::at(&loose.join("notes.md")).project, "loose-file");
     }
 
     #[test]
