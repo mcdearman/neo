@@ -51,7 +51,7 @@ pub enum Ask {
 }
 
 fn spec_named(name: &str) -> Option<&'static lsp::ServerSpec> {
-    lsp::SERVERS.iter().find(|s| s.name == name)
+    lsp::all().iter().find(|s| s.name == name)
 }
 
 /// How NeoCode colours a kind of token a server names. `None` leaves the
@@ -214,18 +214,25 @@ impl NeoCode {
     /// A server stopped. If it never got going, another copy may; if it
     /// was working, say that it is gone.
     fn server_gone(&mut self, name: &'static str) {
-        let was_ready = self.servers.clients.remove(name).is_some_and(|(_, c)| c.ready());
+        // Give its last words a moment to arrive before reading them.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let gone = self.servers.clients.remove(name);
+        let said = gone.as_ref().and_then(|(_, c)| c.last_error());
+        let was_ready = gone.is_some_and(|(_, c)| c.ready());
         let mine: Vec<usize> = (0..self.tabs.len()).filter(|i| self.tabs[*i].server == Some(name)).collect();
         for i in &mine {
             self.tabs[*i].diagnostics.clear();
         }
         if was_ready {
             self.servers.problems.insert(name, format!("{name} stopped"));
-        } else if let (Some(spec), Some(root)) = (spec_named(name), self.root.clone())
-            && self.launch(spec, &root)
-        {
-            for i in mine {
-                self.lsp_open(i);
+        } else if let (Some(spec), Some(root)) = (spec_named(name), self.root.clone()) {
+            if self.launch(spec, &root) {
+                for i in mine {
+                    self.lsp_open(i);
+                }
+            } else if let Some(said) = said {
+                // No copy would start: pass on what the last one said.
+                self.servers.problems.insert(name, format!("{name} would not start: {said}"));
             }
         }
     }
@@ -234,7 +241,9 @@ impl NeoCode {
         let utf8 = self.servers.clients.get(name).is_some_and(|(_, c)| c.utf8);
         let tab_at = |tabs: &[Tab], path: &Path| tabs.iter().position(|t| t.disk.as_deref() == Some(path));
         match event {
-            Event::Ready => {}
+            // Now it is known whether the server can colour: ask for the
+            // files already open.
+            Event::Ready => self.lsp_event(name, Event::RefreshTokens),
             Event::Diagnostics { path, items } => {
                 if let Some(i) = tab_at(&self.tabs, &path) {
                     self.tabs[i].diagnostics = items;
@@ -448,12 +457,13 @@ impl NeoCode {
     /// Which servers are installed here, for the settings panel.
     pub(crate) fn servers_summary(&self) -> String {
         let Some(dirs) = &self.servers.dirs else { return "Looking for language servers…".into() };
-        let (found, missing): (Vec<_>, Vec<_>) = lsp::SERVERS.iter().partition(|s| !lsp::find_in(dirs, s).is_empty());
+        let (found, missing): (Vec<_>, Vec<_>) = lsp::all().iter().partition(|s| !lsp::find_in(dirs, s).is_empty());
         let names = |list: &[&lsp::ServerSpec]| list.iter().map(|s| s.name).collect::<Vec<_>>().join(", ");
-        match (found.is_empty(), missing.is_empty()) {
+        let summary = match (found.is_empty(), missing.is_empty()) {
             (true, _) => format!("None found. NeoCode looks for: {}.", names(&missing)),
             (false, true) => format!("Found: {}.", names(&found)),
             (false, false) => format!("Found: {}. Not installed: {}.", names(&found), names(&missing)),
-        }
+        };
+        format!("{summary} Add your own in {}.", lsp::user_servers_file().display())
     }
 }

@@ -41,12 +41,83 @@ pub const SERVERS: &[ServerSpec] = &[
     ServerSpec { name: "lua-language-server", language: "Lua", extensions: &[("lua", "lua")], commands: &[("lua-language-server", &[])] },
     ServerSpec { name: "zls", language: "Zig", extensions: &[("zig", "zig")], commands: &[("zls", &[])] },
     ServerSpec { name: "bash-language-server", language: "shell scripts", extensions: &[("sh", "shellscript"), ("bash", "shellscript"), ("zsh", "shellscript")], commands: &[("bash-language-server", &["start"])] },
+    ServerSpec { name: "haskell-language-server", language: "Haskell", extensions: &[("hs", "haskell"), ("lhs", "haskell"), ("cabal", "cabal")], commands: &[("haskell-language-server-wrapper", &["--lsp"]), ("haskell-language-server", &["--lsp"])] },
+    ServerSpec { name: "koka", language: "Koka", extensions: &[("kk", "koka")], commands: &[("koka", &["--language-server", "--lsstdio"])] },
+    ServerSpec { name: "ocamllsp", language: "OCaml", extensions: &[("ml", "ocaml"), ("mli", "ocaml.interface")], commands: &[("ocamllsp", &[])] },
+    ServerSpec { name: "sourcekit-lsp", language: "Swift", extensions: &[("swift", "swift")], commands: &[("sourcekit-lsp", &[])] },
+    ServerSpec { name: "Ruby", language: "Ruby", extensions: &[("rb", "ruby"), ("rake", "ruby"), ("gemspec", "ruby")], commands: &[("ruby-lsp", &[]), ("solargraph", &["stdio"])] },
+    ServerSpec { name: "Elixir", language: "Elixir", extensions: &[("ex", "elixir"), ("exs", "elixir")], commands: &[("elixir-ls", &[]), ("expert", &["--stdio"])] },
+    ServerSpec { name: "jdtls", language: "Java", extensions: &[("java", "java")], commands: &[("jdtls", &[])] },
+    ServerSpec { name: "kotlin-language-server", language: "Kotlin", extensions: &[("kt", "kotlin"), ("kts", "kotlin")], commands: &[("kotlin-language-server", &[]), ("kotlin-lsp", &["--stdio"])] },
+    ServerSpec { name: "Nix", language: "Nix", extensions: &[("nix", "nix")], commands: &[("nixd", &[]), ("nil", &[])] },
+    ServerSpec { name: "dart", language: "Dart", extensions: &[("dart", "dart")], commands: &[("dart", &["language-server"])] },
+    ServerSpec { name: "C#", language: "C#", extensions: &[("cs", "csharp")], commands: &[("csharp-ls", &[]), ("OmniSharp", &["-lsp"])] },
+    ServerSpec { name: "PHP", language: "PHP", extensions: &[("php", "php")], commands: &[("intelephense", &["--stdio"]), ("phpactor", &["language-server"])] },
 ];
+
+/// Where a user lists servers of their own: `apps/neo-code-servers.conf`
+/// in Neo's settings folder. Each line gives the file extensions a server
+/// handles and the command that starts it, speaking over its standard
+/// input and output:
+///
+/// ```text
+/// # extensions = command
+/// hs lhs = haskell-language-server-wrapper --lsp
+/// vue:vue = vue-language-server --stdio
+/// ```
+///
+/// An extension is also used as the language ID unless one follows it
+/// after a colon. These come before the built-in servers, so a line here
+/// can replace one of them.
+pub fn user_servers_file() -> PathBuf {
+    neo_desktop::config_dir().join("apps").join("neo-code-servers.conf")
+}
+
+/// Reads a user's server list. Lines that make no sense are skipped.
+pub fn parse_user_servers(src: &str) -> Vec<ServerSpec> {
+    // These live as long as the app, like the built-in list.
+    fn keep(s: &str) -> &'static str {
+        Box::leak(s.to_owned().into_boxed_str())
+    }
+    src.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let (extensions, command) = line.split_once('=')?;
+            let mut words = command.split_whitespace();
+            let program = words.next()?;
+            let extensions: Vec<(&'static str, &'static str)> = extensions
+                .split_whitespace()
+                .map(|e| {
+                    let (ext, id) = e.split_once(':').unwrap_or((e, e));
+                    (keep(&ext.trim_start_matches('.').to_ascii_lowercase()), keep(id))
+                })
+                .collect();
+            if extensions.is_empty() {
+                return None;
+            }
+            let args: Vec<&'static str> = words.map(keep).collect();
+            let name = keep(Path::new(program).file_name()?.to_str()?);
+            let commands: &'static [(&'static str, &'static [&'static str])] = Box::leak(vec![(keep(program), &*Box::leak(args.into_boxed_slice()))].into_boxed_slice());
+            Some(ServerSpec { name, language: name, extensions: Box::leak(extensions.into_boxed_slice()), commands })
+        })
+        .collect()
+}
+
+/// Every server NeoCode knows: the user's own first, then the built-in ones.
+pub fn all() -> &'static [ServerSpec] {
+    static ALL: std::sync::OnceLock<Vec<ServerSpec>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        // Tests see the built-in list only, whatever this computer has set up.
+        let mut list = if cfg!(test) { vec![] } else { std::fs::read_to_string(user_servers_file()).map(|s| parse_user_servers(&s)).unwrap_or_default() };
+        list.extend(SERVERS.iter().map(|s| ServerSpec { name: s.name, language: s.language, extensions: s.extensions, commands: s.commands }));
+        list
+    })
+}
 
 /// The server for a file, and the language ID to open the file with.
 pub fn spec_for(path: &Path) -> Option<(&'static ServerSpec, &'static str)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    SERVERS.iter().find_map(|s| s.extensions.iter().find(|(e, _)| *e == ext).map(|(_, id)| (s, *id)))
+    all().iter().find_map(|s| s.extensions.iter().find(|(e, _)| *e == ext).map(|(_, id)| (s, *id)))
 }
 
 /// A server program found on this computer.
@@ -60,7 +131,7 @@ pub struct Found {
 /// `PATH`. An app started from the Dock or a launcher gets a bare `PATH`
 /// that leaves most of these out.
 fn usual_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = [".cargo/bin", ".local/bin", "go/bin", ".npm-global/bin", ".bun/bin", ".deno/bin", ".volta/bin", ".nix-profile/bin", ".local/share/mise/shims", ".asdf/shims", ".local/share/nvim/mason/bin"]
+    let mut dirs: Vec<PathBuf> = [".cargo/bin", ".local/bin", "go/bin", ".ghcup/bin", ".cabal/bin", ".opam/default/bin", ".dotnet/tools", ".mix/escripts", ".pub-cache/bin", ".npm-global/bin", ".bun/bin", ".deno/bin", ".volta/bin", ".nix-profile/bin", ".local/share/mise/shims", ".asdf/shims", ".local/share/nvim/mason/bin"]
         .iter()
         .map(|d| home.join(d))
         .collect();
@@ -159,6 +230,22 @@ mod tests {
         assert_eq!(spec_for(Path::new("Cargo.toml")).map(|(s, _)| s.name), Some("taplo"));
         assert!(spec_for(Path::new("notes.txt")).is_none());
         assert!(spec_for(Path::new("Makefile")).is_none());
+    }
+
+    #[test]
+    fn a_user_can_list_servers_of_their_own() {
+        let list = parse_user_servers("# my servers\nhs .LHS = /opt/hls/bin/hls-wrapper --lsp --debug  # with flags\nvue:vue-html = vue-language-server --stdio\nnonsense line\n = nothing\nkk =\n");
+        assert_eq!(list.len(), 2, "lines without extensions or a command are skipped");
+        assert_eq!((list[0].name, list[0].extensions), ("hls-wrapper", &[("hs", "hs"), ("lhs", ".LHS")][..]), "named for the program; extensions lose their dot and case");
+        assert_eq!(list[0].commands, &[("/opt/hls/bin/hls-wrapper", &["--lsp", "--debug"][..])][..]);
+        assert_eq!(list[1].extensions, &[("vue", "vue-html")][..], "a language ID can follow the extension");
+        assert!(parse_user_servers("").is_empty());
+    }
+
+    #[test]
+    fn haskell_and_koka_files_have_servers() {
+        assert_eq!(spec_for(Path::new("src/Main.hs")).map(|(s, id)| (s.name, id, s.commands[0])), Some(("haskell-language-server", "haskell", ("haskell-language-server-wrapper", &["--lsp"][..]))));
+        assert_eq!(spec_for(Path::new("lib/std/core.kk")).map(|(s, id)| (s.name, id, s.commands[0].1)), Some(("koka", "koka", &["--language-server", "--lsstdio"][..])));
     }
 
     #[test]

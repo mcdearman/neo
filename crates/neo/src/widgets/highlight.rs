@@ -11,15 +11,58 @@ pub enum Language {
     Rust,
     Toml,
     Markdown,
+    C,
+    Cpp,
+    CSharp,
+    Css,
+    Go,
+    Haskell,
+    Java,
+    JavaScript,
+    Json,
+    Koka,
+    Kotlin,
+    Lua,
+    OCaml,
+    Php,
+    Python,
+    Ruby,
+    Shell,
+    Swift,
+    TypeScript,
+    Yaml,
+    Zig,
 }
 
 impl Language {
     /// Guesses from a file name.
     pub fn from_path(path: &str) -> Self {
-        match path.rsplit('.').next().unwrap_or("") {
+        let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
             "rs" => Language::Rust,
             "toml" => Language::Toml,
             "md" | "markdown" => Language::Markdown,
+            "c" | "h" => Language::C,
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" | "mm" | "m" => Language::Cpp,
+            "cs" => Language::CSharp,
+            "css" | "scss" | "less" => Language::Css,
+            "go" => Language::Go,
+            "hs" | "lhs" => Language::Haskell,
+            "java" => Language::Java,
+            "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
+            "json" | "jsonc" => Language::Json,
+            "kk" => Language::Koka,
+            "kt" | "kts" => Language::Kotlin,
+            "lua" => Language::Lua,
+            "ml" | "mli" => Language::OCaml,
+            "php" => Language::Php,
+            "py" | "pyi" => Language::Python,
+            "rb" | "rake" | "gemspec" => Language::Ruby,
+            "sh" | "bash" | "zsh" | "fish" => Language::Shell,
+            "swift" => Language::Swift,
+            "ts" | "tsx" => Language::TypeScript,
+            "yaml" | "yml" => Language::Yaml,
+            "zig" => Language::Zig,
             _ => Language::Plain,
         }
     }
@@ -30,8 +73,324 @@ impl Language {
             Language::Rust => "Rust",
             Language::Toml => "TOML",
             Language::Markdown => "Markdown",
+            Language::C => "C",
+            Language::Cpp => "C++",
+            Language::CSharp => "C#",
+            Language::Css => "CSS",
+            Language::Go => "Go",
+            Language::Haskell => "Haskell",
+            Language::Java => "Java",
+            Language::JavaScript => "JavaScript",
+            Language::Json => "JSON",
+            Language::Koka => "Koka",
+            Language::Kotlin => "Kotlin",
+            Language::Lua => "Lua",
+            Language::OCaml => "OCaml",
+            Language::Php => "PHP",
+            Language::Python => "Python",
+            Language::Ruby => "Ruby",
+            Language::Shell => "Shell",
+            Language::Swift => "Swift",
+            Language::TypeScript => "TypeScript",
+            Language::Yaml => "YAML",
+            Language::Zig => "Zig",
         }
     }
+
+    /// How to read the languages that share the general-purpose reader.
+    fn grammar(self) -> Option<&'static Grammar> {
+        match self {
+            Language::Plain | Language::Rust | Language::Toml | Language::Markdown => None,
+            Language::C => Some(&C),
+            Language::Cpp => Some(&CPP),
+            Language::CSharp => Some(&CSHARP),
+            Language::Css => Some(&CSS),
+            Language::Go => Some(&GO),
+            Language::Haskell => Some(&HASKELL),
+            Language::Java => Some(&JAVA),
+            Language::JavaScript => Some(&JAVASCRIPT),
+            Language::Json => Some(&JSON),
+            Language::Koka => Some(&KOKA),
+            Language::Kotlin => Some(&KOTLIN),
+            Language::Lua => Some(&LUA),
+            Language::OCaml => Some(&OCAML),
+            Language::Php => Some(&PHP),
+            Language::Python => Some(&PYTHON),
+            Language::Ruby => Some(&RUBY),
+            Language::Shell => Some(&SHELL),
+            Language::Swift => Some(&SWIFT),
+            Language::TypeScript => Some(&TYPESCRIPT),
+            Language::Yaml => Some(&YAML),
+            Language::Zig => Some(&ZIG),
+        }
+    }
+
+    /// Whether a comment can run over several lines, so that colouring a
+    /// line means knowing whether the lines above it left one open.
+    pub(crate) fn has_block_comments(self) -> bool {
+        self == Language::Rust || self.grammar().is_some_and(|g| g.block.is_some())
+    }
+}
+
+/// What the general-purpose reader needs to know about a language. It
+/// reads a line at a time and knows comments, strings, numbers, keywords
+/// and names; it is a good guess at the language, not a parser of it.
+struct Grammar {
+    keywords: &'static [&'static str],
+    /// Built-in type names. Capitalised names count as types as well.
+    types: &'static [&'static str],
+    /// What starts a comment that runs to the end of the line.
+    line: &'static [&'static str],
+    /// What opens and closes a comment that can span lines.
+    block: Option<(&'static str, &'static str)>,
+    /// The characters that quote a string.
+    quotes: &'static [u8],
+    /// A name followed by `(` is a function.
+    calls: bool,
+    /// `@name` is an attribute or decorator.
+    at: bool,
+    /// A line starting with `#` is a directive, as in C.
+    hash: bool,
+}
+
+const C_LIKE: Grammar = Grammar { keywords: &[], types: &[], line: &["//"], block: Some(("/*", "*/")), quotes: b"\"'", calls: true, at: false, hash: false };
+
+const C: Grammar = Grammar {
+    keywords: &["auto", "break", "case", "const", "continue", "default", "do", "else", "enum", "extern", "for", "goto", "if", "inline", "register", "restrict", "return", "sizeof", "static", "struct", "switch", "typedef", "union", "volatile", "while", "NULL"],
+    types: &["void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "bool", "size_t", "ssize_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "uintptr_t", "intptr_t"],
+    hash: true,
+    ..C_LIKE
+};
+const CPP: Grammar = Grammar {
+    keywords: &["alignas", "alignof", "auto", "break", "case", "catch", "class", "concept", "const", "consteval", "constexpr", "constinit", "continue", "co_await", "co_return", "co_yield", "decltype", "default", "delete", "do", "else", "enum", "explicit", "export", "extern", "false", "final", "for", "friend", "goto", "if", "import", "inline", "module", "mutable", "namespace", "new", "noexcept", "nullptr", "operator", "override", "private", "protected", "public", "requires", "return", "sizeof", "static", "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast", "struct", "switch", "template", "this", "throw", "true", "try", "typedef", "typeid", "typename", "union", "using", "virtual", "volatile", "while"],
+    types: C.types,
+    hash: true,
+    ..C_LIKE
+};
+const CSHARP: Grammar = Grammar {
+    keywords: &["abstract", "as", "async", "await", "base", "break", "case", "catch", "checked", "class", "const", "continue", "default", "delegate", "do", "else", "enum", "event", "explicit", "extern", "false", "finally", "fixed", "for", "foreach", "get", "goto", "if", "implicit", "in", "interface", "internal", "is", "lock", "namespace", "new", "null", "operator", "out", "override", "params", "private", "protected", "public", "readonly", "record", "ref", "return", "sealed", "set", "sizeof", "static", "struct", "switch", "this", "throw", "true", "try", "typeof", "unsafe", "using", "var", "virtual", "volatile", "when", "where", "while", "yield"],
+    types: &["bool", "byte", "char", "decimal", "double", "float", "int", "long", "object", "sbyte", "short", "string", "uint", "ulong", "ushort", "void", "dynamic"],
+    at: true,
+    ..C_LIKE
+};
+const CSS: Grammar = Grammar { keywords: &["important", "from", "to"], types: &[], line: &[], block: Some(("/*", "*/")), quotes: b"\"'", calls: true, at: true, hash: false };
+const GO: Grammar = Grammar {
+    keywords: &["break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select", "struct", "switch", "type", "var", "nil", "true", "false", "iota"],
+    types: &["bool", "byte", "complex64", "complex128", "error", "float32", "float64", "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "any"],
+    quotes: b"\"'`",
+    ..C_LIKE
+};
+const HASKELL: Grammar = Grammar {
+    keywords: &["case", "class", "data", "default", "deriving", "do", "else", "family", "forall", "foreign", "hiding", "if", "import", "in", "infix", "infixl", "infixr", "instance", "let", "module", "newtype", "of", "qualified", "then", "type", "where", "as", "pattern"],
+    types: &[],
+    line: &["--"],
+    block: Some(("{-", "-}")),
+    quotes: b"\"",
+    calls: false,
+    at: false,
+    hash: false,
+};
+const JAVA: Grammar = Grammar {
+    keywords: &["abstract", "assert", "break", "case", "catch", "class", "const", "continue", "default", "do", "else", "enum", "extends", "false", "final", "finally", "for", "goto", "if", "implements", "import", "instanceof", "interface", "native", "new", "null", "package", "permits", "private", "protected", "public", "record", "return", "sealed", "static", "strictfp", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try", "var", "volatile", "while", "yield"],
+    types: &["boolean", "byte", "char", "double", "float", "int", "long", "short", "void"],
+    at: true,
+    ..C_LIKE
+};
+const JS_KEYWORDS: &[&str] = &["async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "export", "extends", "false", "finally", "for", "from", "function", "get", "if", "import", "in", "instanceof", "let", "new", "null", "of", "return", "set", "static", "super", "switch", "this", "throw", "true", "try", "typeof", "undefined", "var", "void", "while", "with", "yield"];
+const JAVASCRIPT: Grammar = Grammar { keywords: JS_KEYWORDS, types: &[], quotes: b"\"'`", at: true, ..C_LIKE };
+const TYPESCRIPT: Grammar = Grammar {
+    keywords: &["abstract", "any", "as", "asserts", "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "declare", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "from", "function", "get", "if", "implements", "import", "in", "infer", "instanceof", "interface", "is", "keyof", "let", "module", "namespace", "new", "null", "of", "override", "private", "protected", "public", "readonly", "return", "satisfies", "set", "static", "super", "switch", "this", "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while", "with", "yield"],
+    types: &["boolean", "number", "string", "symbol", "bigint", "object", "unknown", "never"],
+    quotes: b"\"'`",
+    at: true,
+    ..C_LIKE
+};
+const JSON: Grammar = Grammar { keywords: &["true", "false", "null"], types: &[], line: &["//"], block: Some(("/*", "*/")), quotes: b"\"", calls: false, at: false, hash: false };
+const KOKA: Grammar = Grammar {
+    keywords: &["abstract", "alias", "as", "behind", "break", "co", "con", "continue", "ctl", "effect", "elif", "else", "exists", "extend", "extern", "final", "fn", "forall", "fun", "handle", "handler", "if", "import", "in", "infix", "infixl", "infixr", "inline", "linear", "mask", "match", "module", "named", "noinline", "override", "pub", "raw", "rec", "ref", "return", "scoped", "some", "struct", "then", "type", "val", "value", "var", "with", "True", "False"],
+    types: &["int", "float64", "bool", "char", "string", "list", "maybe", "either", "total", "div", "exn", "io", "console", "ndet", "pure"],
+    ..C_LIKE
+};
+const KOTLIN: Grammar = Grammar {
+    keywords: &["abstract", "as", "break", "by", "catch", "class", "companion", "const", "continue", "data", "do", "else", "enum", "false", "final", "finally", "for", "fun", "if", "import", "in", "init", "inline", "interface", "internal", "is", "lateinit", "null", "object", "open", "override", "package", "private", "protected", "public", "return", "sealed", "super", "suspend", "this", "throw", "true", "try", "typealias", "val", "var", "when", "where", "while"],
+    types: &[],
+    at: true,
+    ..C_LIKE
+};
+const LUA: Grammar = Grammar {
+    keywords: &["and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"],
+    types: &[],
+    line: &["--"],
+    block: Some(("--[[", "]]")),
+    quotes: b"\"'",
+    calls: true,
+    at: false,
+    hash: false,
+};
+const OCAML: Grammar = Grammar {
+    keywords: &["and", "as", "assert", "begin", "class", "constraint", "do", "done", "downto", "else", "end", "exception", "external", "false", "for", "fun", "function", "functor", "if", "in", "include", "inherit", "initializer", "lazy", "let", "match", "method", "module", "mutable", "new", "nonrec", "object", "of", "open", "or", "private", "rec", "sig", "struct", "then", "to", "true", "try", "type", "val", "virtual", "when", "while", "with"],
+    types: &["int", "float", "bool", "char", "string", "unit", "list", "option", "array"],
+    line: &[],
+    block: Some(("(*", "*)")),
+    quotes: b"\"",
+    calls: false,
+    at: false,
+    hash: false,
+};
+const PHP: Grammar = Grammar {
+    keywords: &["abstract", "and", "array", "as", "break", "case", "catch", "class", "clone", "const", "continue", "declare", "default", "do", "echo", "else", "elseif", "empty", "enum", "extends", "false", "final", "finally", "fn", "for", "foreach", "function", "global", "if", "implements", "include", "instanceof", "interface", "isset", "match", "namespace", "new", "null", "or", "private", "protected", "public", "readonly", "require", "return", "static", "switch", "throw", "trait", "true", "try", "use", "var", "while", "yield"],
+    types: &["int", "float", "bool", "string", "void", "mixed", "never", "object"],
+    line: &["//", "#"],
+    ..C_LIKE
+};
+const PYTHON: Grammar = Grammar {
+    keywords: &["and", "as", "assert", "async", "await", "break", "case", "class", "continue", "def", "del", "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "match", "None", "nonlocal", "not", "or", "pass", "raise", "return", "self", "True", "try", "while", "with", "yield"],
+    types: &["int", "float", "str", "bool", "bytes", "list", "dict", "set", "tuple", "object"],
+    line: &["#"],
+    block: None,
+    quotes: b"\"'",
+    calls: true,
+    at: true,
+    hash: false,
+};
+const RUBY: Grammar = Grammar {
+    keywords: &["alias", "and", "begin", "break", "case", "class", "def", "defined?", "do", "else", "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not", "or", "private", "protected", "public", "redo", "require", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless", "until", "when", "while", "yield", "attr_accessor", "attr_reader", "attr_writer"],
+    types: &[],
+    line: &["#"],
+    block: None,
+    quotes: b"\"'`",
+    calls: true,
+    at: false,
+    hash: false,
+};
+const SHELL: Grammar = Grammar {
+    keywords: &["case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in", "local", "readonly", "return", "select", "set", "shift", "then", "time", "unset", "until", "while", "echo", "exit", "source"],
+    types: &[],
+    line: &["#"],
+    block: None,
+    quotes: b"\"'`",
+    calls: false,
+    at: false,
+    hash: false,
+};
+const SWIFT: Grammar = Grammar {
+    keywords: &["actor", "any", "as", "associatedtype", "async", "await", "break", "case", "catch", "class", "continue", "default", "defer", "deinit", "do", "else", "enum", "extension", "fallthrough", "false", "fileprivate", "final", "for", "func", "guard", "if", "import", "in", "init", "inout", "internal", "is", "lazy", "let", "mutating", "nil", "open", "operator", "override", "private", "protocol", "public", "repeat", "return", "self", "some", "static", "struct", "subscript", "super", "switch", "throw", "throws", "true", "try", "typealias", "var", "weak", "where", "while"],
+    types: &[],
+    at: true,
+    ..C_LIKE
+};
+const YAML: Grammar = Grammar { keywords: &["true", "false", "null", "yes", "no", "on", "off"], types: &[], line: &["#"], block: None, quotes: b"\"'", calls: false, at: false, hash: false };
+const ZIG: Grammar = Grammar {
+    keywords: &["addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "break", "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer", "error", "export", "extern", "false", "fn", "for", "if", "inline", "noalias", "nosuspend", "null", "opaque", "or", "orelse", "packed", "pub", "resume", "return", "struct", "suspend", "switch", "test", "threadlocal", "true", "try", "undefined", "union", "unreachable", "usingnamespace", "var", "volatile", "while"],
+    types: &["bool", "void", "noreturn", "type", "anyerror", "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f16", "f32", "f64", "f128", "comptime_int", "comptime_float"],
+    line: &["//"],
+    block: None,
+    at: true,
+    ..C_LIKE
+};
+
+/// Reads one line of a language described by a [`Grammar`].
+fn general(line: &str, g: &Grammar, in_comment: &mut bool) -> Vec<(usize, usize, Kind)> {
+    let s = line.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < s.len() {
+        if *in_comment {
+            let close = g.block.map_or("", |b| b.1);
+            match line[i..].find(close).filter(|_| !close.is_empty()) {
+                Some(e) => {
+                    push(&mut out, i, i + e + close.len(), Kind::Comment);
+                    i += e + close.len();
+                    *in_comment = false;
+                }
+                None => {
+                    push(&mut out, i, s.len(), Kind::Comment);
+                    i = s.len();
+                }
+            }
+            continue;
+        }
+        let c = s[i];
+        let rest = &line[i..];
+        if let Some((open, _)) = g.block
+            && rest.starts_with(open)
+        {
+            *in_comment = true;
+            push(&mut out, i, i + open.len(), Kind::Comment);
+            i += open.len();
+            continue;
+        }
+        // A `#` comment must stand apart, or `$#` and `a#b` would start one.
+        let apart = i == 0 || s[i - 1].is_ascii_whitespace();
+        if g.line.iter().any(|m| rest.starts_with(m) && (*m != "#" || apart)) {
+            push(&mut out, i, s.len(), Kind::Comment);
+            break;
+        }
+        if g.hash && c == b'#' && line[..i].trim().is_empty() {
+            push(&mut out, i, s.len(), Kind::Attribute);
+            break;
+        }
+        if g.at && c == b'@' && s.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || *n == b'_') {
+            let end = ident_end(s, i + 1);
+            push(&mut out, i, end, Kind::Attribute);
+            i = end;
+            continue;
+        }
+        if g.quotes.contains(&c) {
+            let mut j = i + 1;
+            while j < s.len() && s[j] != c {
+                j += if s[j] == b'\\' { 2 } else { 1 };
+            }
+            let mut end = (j + 1).min(s.len());
+            while !line.is_char_boundary(end) {
+                end += 1;
+            }
+            push(&mut out, i, end, Kind::String);
+            i = end;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut j = i;
+            while j < s.len() && (s[j].is_ascii_alphanumeric() || s[j] == b'_' || (s[j] == b'.' && j + 1 < s.len() && s[j + 1].is_ascii_digit())) {
+                j += 1;
+            }
+            push(&mut out, i, j, Kind::Number);
+            i = j;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+            let end = ident_end(s, i);
+            let word = &line[i..end];
+            let next = line[end..].trim_start().as_bytes().first().copied();
+            let shouting = word.len() > 1 && word.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') && word.bytes().any(|b| b.is_ascii_uppercase());
+            let kind = if g.keywords.contains(&word) {
+                Kind::Keyword
+            } else if g.types.contains(&word) {
+                Kind::Type
+            } else if shouting {
+                // A constant, by the convention nearly every language shares.
+                Kind::Number
+            } else if g.calls && next == Some(b'(') {
+                Kind::Function
+            } else if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                Kind::Type
+            } else {
+                Kind::Plain
+            };
+            push(&mut out, i, end, kind);
+            i = end;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            push(&mut out, i, i + 1, Kind::Plain);
+            i += 1;
+            continue;
+        }
+        let len = line[i..].chars().next().map_or(1, char::len_utf8);
+        push(&mut out, i, i + len, Kind::Punct);
+        i += len;
+    }
+    out
 }
 
 /// What a stretch of code is, which decides its colour.
@@ -165,6 +524,10 @@ pub(crate) fn highlight(lang: Language, line: &str, in_comment: &mut bool) -> Ve
         Language::Rust => rust(line, in_comment),
         Language::Toml => toml(line),
         Language::Markdown => markdown(line),
+        other => match other.grammar() {
+            Some(g) => general(line, g, in_comment),
+            None => vec![(0, line.len(), Kind::Plain)],
+        },
     }
 }
 
@@ -385,6 +748,135 @@ fn markdown(line: &str) -> Vec<(usize, usize, Kind)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kind given to `word` where it first appears in `line`.
+    fn kind(lang: Language, line: &str, word: &str) -> Kind {
+        let at = line.find(word).unwrap_or_else(|| panic!("{word:?} is not in {line:?}"));
+        let parts = highlight(lang, line, &mut false);
+        parts.iter().find(|(a, b, _)| *a <= at && at < *b).map(|p| p.2).unwrap()
+    }
+
+    #[test]
+    fn files_are_recognised_by_extension() {
+        for (path, lang, name) in [
+            ("src/Main.hs", Language::Haskell, "Haskell"),
+            ("app.TSX", Language::TypeScript, "TypeScript"),
+            ("index.mjs", Language::JavaScript, "JavaScript"),
+            ("tool.py", Language::Python, "Python"),
+            ("kernel.c", Language::C, "C"),
+            ("widget.hpp", Language::Cpp, "C++"),
+            ("main.go", Language::Go, "Go"),
+            ("lib/std/core.kk", Language::Koka, "Koka"),
+            ("Program.cs", Language::CSharp, "C#"),
+            ("build.zig", Language::Zig, "Zig"),
+            ("deploy.sh", Language::Shell, "Shell"),
+            ("config.yml", Language::Yaml, "YAML"),
+            ("lib.rs", Language::Rust, "Rust"),
+            ("notes.txt", Language::Plain, "Plain Text"),
+        ] {
+            assert_eq!(Language::from_path(path), lang, "{path}");
+            assert_eq!(lang.name(), name);
+        }
+    }
+
+    #[test]
+    fn python_is_read_by_the_general_reader() {
+        let line = "def greet(name: str) -> None:  # say hello";
+        assert_eq!(kind(Language::Python, line, "def"), Kind::Keyword);
+        assert_eq!(kind(Language::Python, line, "greet"), Kind::Function);
+        assert_eq!(kind(Language::Python, line, "str"), Kind::Type);
+        assert_eq!(kind(Language::Python, line, "None"), Kind::Keyword);
+        assert_eq!(kind(Language::Python, line, "# say"), Kind::Comment);
+        assert_eq!(kind(Language::Python, line, "hello"), Kind::Comment);
+        assert_eq!(kind(Language::Python, "@dataclass", "dataclass"), Kind::Attribute);
+        assert_eq!(kind(Language::Python, "MAX_SIZE = 0x10", "MAX_SIZE"), Kind::Number, "a constant by convention");
+        assert_eq!(kind(Language::Python, "MAX_SIZE = 0x10", "0x10"), Kind::Number);
+        assert_eq!(kind(Language::Python, "x = 'it''s # not a comment'", "# not"), Kind::String);
+        assert_eq!(kind(Language::Python, "class Point:", "Point"), Kind::Type);
+    }
+
+    #[test]
+    fn c_has_directives_and_comments_that_span_lines() {
+        assert_eq!(kind(Language::C, "#include <stdio.h>", "include"), Kind::Attribute);
+        let line = "static int main(void) { return 0; } // done";
+        assert_eq!(kind(Language::C, line, "static"), Kind::Keyword);
+        assert_eq!(kind(Language::C, line, "int"), Kind::Type);
+        assert_eq!(kind(Language::C, line, "main"), Kind::Function);
+        assert_eq!(kind(Language::C, line, "0"), Kind::Number);
+        assert_eq!(kind(Language::C, line, "done"), Kind::Comment);
+        // A block comment left open carries to the next line, and ends there.
+        let mut open = false;
+        highlight(Language::C, "int a; /* starts", &mut open);
+        assert!(open);
+        let next = highlight(Language::C, "still */ int b;", &mut open);
+        assert!(!open);
+        assert_eq!(next[0], (0, 8, Kind::Comment));
+        assert_eq!(next.iter().find(|p| p.0 == 9).map(|p| p.2), Some(Kind::Type));
+        assert!(Language::C.has_block_comments() && !Language::Python.has_block_comments());
+    }
+
+    #[test]
+    fn haskell_koka_and_lua_have_their_own_comments() {
+        let line = "module Main where -- the entry point";
+        assert_eq!(kind(Language::Haskell, line, "module"), Kind::Keyword);
+        assert_eq!(kind(Language::Haskell, line, "Main"), Kind::Type);
+        assert_eq!(kind(Language::Haskell, line, "entry"), Kind::Comment);
+        assert_eq!(kind(Language::Haskell, "render x = show (x + 1)", "show"), Kind::Plain, "application needs no brackets, so brackets do not make a function");
+        let mut open = false;
+        highlight(Language::Haskell, "{- a note", &mut open);
+        assert!(open);
+        highlight(Language::Haskell, "ends -} x", &mut open);
+        assert!(!open);
+
+        let line = "pub fun main() : console () { println(\"hi\") } // greet";
+        assert_eq!(kind(Language::Koka, line, "fun"), Kind::Keyword);
+        assert_eq!(kind(Language::Koka, line, "main"), Kind::Function);
+        assert_eq!(kind(Language::Koka, line, "console"), Kind::Type);
+        assert_eq!(kind(Language::Koka, line, "hi"), Kind::String);
+        assert_eq!(kind(Language::Koka, line, "greet"), Kind::Comment);
+
+        let mut open = false;
+        highlight(Language::Lua, "--[[ long", &mut open);
+        assert!(open, "the long comment is tried before the short one");
+        assert_eq!(kind(Language::Lua, "local x = 1 -- one", "one"), Kind::Comment);
+    }
+
+    #[test]
+    fn other_languages_get_their_strings_keywords_and_types() {
+        assert_eq!(kind(Language::Go, "s := `raw \"text\"`", "text"), Kind::String);
+        assert_eq!(kind(Language::Go, "func Add(a int) int {", "func"), Kind::Keyword);
+        assert_eq!(kind(Language::Go, "func Add(a int) int {", "int"), Kind::Type);
+        assert_eq!(kind(Language::JavaScript, "const s = `a ${b}`;", "const"), Kind::Keyword);
+        assert_eq!(kind(Language::JavaScript, "const s = `a ${b}`;", "${b}"), Kind::String);
+        assert_eq!(kind(Language::TypeScript, "interface Shape { area(): number }", "interface"), Kind::Keyword);
+        assert_eq!(kind(Language::TypeScript, "interface Shape { area(): number }", "Shape"), Kind::Type);
+        assert_eq!(kind(Language::TypeScript, "interface Shape { area(): number }", "number"), Kind::Type);
+        assert_eq!(kind(Language::TypeScript, "interface Shape { area(): number }", "area"), Kind::Function);
+        assert_eq!(kind(Language::Json, "{\"on\": true, \"n\": 12}", "true"), Kind::Keyword);
+        assert_eq!(kind(Language::Json, "{\"on\": true, \"n\": 12}", "12"), Kind::Number);
+        assert_eq!(kind(Language::Java, "@Override public void run() {}", "Override"), Kind::Attribute);
+        assert_eq!(kind(Language::Cpp, "std::vector<int> v = nullptr;", "nullptr"), Kind::Keyword);
+        assert_eq!(kind(Language::Zig, "const x: u32 = 1; // one", "u32"), Kind::Type);
+        assert_eq!(kind(Language::Ruby, "def area; end # size", "size"), Kind::Comment);
+        // `$#` is not a comment in a shell script, but ` # ...` is.
+        let line = "echo $# # how many";
+        assert_eq!(kind(Language::Shell, line, "echo"), Kind::Keyword);
+        assert_ne!(kind(Language::Shell, line, "$#"), Kind::Comment);
+        assert_eq!(kind(Language::Shell, line, "how"), Kind::Comment);
+    }
+
+    #[test]
+    fn every_language_covers_every_line_whole() {
+        let lines = ["", "   ", "let s = \"naïve — ünïcödé\"; // café", "x = 'unclosed string with é", "/* open ☃", "#!/usr/bin/env thing", "@weird @ 12.5e3 f(x)[1] {- -} (* *) --[[ ]] `tick`", "\"ends with a backslash\\", "'é"];
+        for lang in [Language::C, Language::Cpp, Language::CSharp, Language::Css, Language::Go, Language::Haskell, Language::Java, Language::JavaScript, Language::Json, Language::Koka, Language::Kotlin, Language::Lua, Language::OCaml, Language::Php, Language::Python, Language::Ruby, Language::Shell, Language::Swift, Language::TypeScript, Language::Yaml, Language::Zig, Language::Rust, Language::Toml, Language::Markdown, Language::Plain] {
+            let mut open = false;
+            for line in lines {
+                let parts = highlight(lang, line, &mut open);
+                assert_eq!(parts.iter().map(|(a, b, _)| &line[*a..*b]).collect::<String>(), line, "{lang:?} on {line:?}");
+                assert!(parts.windows(2).all(|w| w[0].1 == w[1].0), "{lang:?} on {line:?}: {parts:?}");
+            }
+        }
+    }
 
     #[test]
     fn tokens_win_over_the_highlighter_where_they_reach() {

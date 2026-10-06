@@ -4,7 +4,7 @@ pub mod client;
 pub mod servers;
 
 pub use client::{apply_edits, to_place, to_pos, Client, Completion, Diagnostic, Event, Incoming, Severity};
-pub use servers::{find_in, search_dirs, spec_for, Found, ServerSpec, SERVERS};
+pub use servers::{all, find_in, search_dirs, spec_for, user_servers_file, Found, ServerSpec};
 
 #[cfg(test)]
 pub mod testing {

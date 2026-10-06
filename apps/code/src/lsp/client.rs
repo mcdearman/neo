@@ -219,6 +219,9 @@ pub struct Client {
     pub can_colour: bool,
     /// The server's names for token kinds, by the numbers it sends.
     legend: Vec<String>,
+    /// The last lines the server wrote to its error output, which is where
+    /// it says why when it gives up.
+    errors: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 fn place(v: &Value) -> Place {
@@ -307,7 +310,7 @@ impl Client {
     /// A client writing to `out`. It starts the handshake at once; other
     /// messages wait until the server answers it.
     pub fn new(out: Box<dyn Write + Send>, root: &Path) -> Self {
-        let mut client = Self { out, child: None, next_id: 1, pending: HashMap::new(), ready: false, queued: vec![], utf8: false, triggers: vec![], can_format: false, can_colour: false, legend: vec![] };
+        let mut client = Self { out, child: None, next_id: 1, pending: HashMap::new(), ready: false, queued: vec![], utf8: false, triggers: vec![], can_format: false, can_colour: false, legend: vec![], errors: Default::default() };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let params = json!({
             "processId": std::process::id(),
@@ -345,7 +348,7 @@ impl Client {
         if let Ok(path) = std::env::join_paths(dirs) {
             command.env("PATH", path);
         }
-        let mut child = command.args(&found.args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        let mut child = command.args(&found.args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no pipe to the server"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no pipe from the server"))?;
         std::thread::spawn(move || {
@@ -356,12 +359,36 @@ impl Client {
             on_message(Incoming::Closed);
         });
         let mut client = Self::new(Box::new(stdin), root);
+        if let Some(stderr) = child.stderr.take() {
+            let errors = client.errors.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut kept = errors.lock().unwrap_or_else(|e| e.into_inner());
+                    if kept.len() == 40 {
+                        kept.pop_front();
+                    }
+                    kept.push_back(line);
+                }
+            });
+        }
         client.child = Some(child);
         Ok(client)
     }
 
     pub fn ready(&self) -> bool {
         self.ready
+    }
+
+    /// The server's own account of what went wrong, if it gave one: the
+    /// line of its error output that reads most like a reason.
+    pub fn last_error(&self) -> Option<String> {
+        let kept = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        let said = |l: &&String| !l.trim().is_empty();
+        let reason = |l: &&String| {
+            let l = l.to_lowercase();
+            ["error", "fatal", "cannot", "could not", "couldn't", "no such", "not found", "failed", "unable", "missing"].iter().any(|w| l.contains(w))
+        };
+        kept.iter().rev().filter(said).find(reason).or_else(|| kept.iter().rev().find(said)).map(|l| l.trim().chars().take(160).collect())
     }
 
     fn take_id(&mut self, what: Pending) -> u64 {
@@ -437,7 +464,9 @@ impl Client {
     /// Asks what each stretch of the file is. Only the answer about the
     /// file's latest text is wanted, so earlier requests are dropped.
     pub fn tokens(&mut self, path: &Path) {
-        if self.ready && !self.can_colour {
+        // Not before the handshake says whether the server can: one that
+        // cannot may complain about being asked.
+        if !self.can_colour {
             return;
         }
         self.pending.retain(|_, p| !matches!(p, Pending::Tokens(other) if other == path));
@@ -870,10 +899,16 @@ mod tests {
         // When the server's view changes it says so, and gets its answer.
         assert_eq!(c.handle(&json!({ "id": 5, "method": "workspace/semanticTokens/refresh" })), [Event::RefreshTokens]);
         assert_eq!(sink.take()[0]["id"], 5);
-        // A server that cannot do this is not asked.
+        // A server that cannot do this is not asked, and nor is one that has
+        // not yet said whether it can.
         let (mut plain, sink) = ready(json!({}));
         plain.tokens(path);
         assert!(sink.take().is_empty());
+        let (mut early, sink) = client();
+        let hello = sink.take();
+        early.tokens(path);
+        early.handle(&json!({ "id": hello[0]["id"], "result": { "capabilities": {} } }));
+        assert!(sink.take().iter().all(|m| m["method"] != "textDocument/semanticTokens/full"));
     }
 
     #[test]
@@ -898,8 +933,8 @@ mod tests {
     #[test]
     #[ignore]
     fn real_server_reports_a_type_error_and_answers_hover() {
-        use crate::lsp::{find_in, search_dirs, SERVERS};
-        let spec = SERVERS.iter().find(|s| s.name == "rust-analyzer").unwrap();
+        use crate::lsp::{all, find_in, search_dirs};
+        let spec = all().iter().find(|s| s.name == "rust-analyzer").unwrap();
         let dirs = search_dirs();
         let found = find_in(&dirs, spec);
         assert!(!found.is_empty(), "rust-analyzer is not installed");

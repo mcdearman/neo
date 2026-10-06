@@ -320,7 +320,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         // Keep the cursor in view when it moved since the last layout.
         let cursor_line_layout = {
             let mut in_comment = false;
-            if self.language == Language::Rust {
+            if self.language.has_block_comments() {
                 for l in &self.lines[..self.cursor.line] {
                     highlight(self.language, l, &mut in_comment);
                 }
@@ -384,7 +384,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         let last = (self.first + count).min(self.lines.len());
         self.first = self.first.min(last);
         let mut in_comment = false;
-        if self.language == Language::Rust {
+        if self.language.has_block_comments() {
             for l in &self.lines[..self.first] {
                 highlight(self.language, l, &mut in_comment);
             }

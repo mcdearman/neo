@@ -100,7 +100,7 @@ An app's menu bar comes from `App::menus`: a list of `Menu`s holding `MenuEntry`
 
 Every Neo app has **Settings…** there (Cmd/Ctrl+,), opening a panel with that app's own settings. One of them is in every app: **Glass window**, which makes that one app's window solid while the rest of the desktop stays glass. `neo_desktop::Desktop` supplies the entry, the panel and the setting; an app adds its own rows.
 
-TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
+TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting. Rust, TOML and Markdown have readers of their own; a general-purpose one covers C, C++, C#, CSS, Go, Haskell, Java, JavaScript, JSON, Koka, Kotlin, Lua, OCaml, PHP, Python, Ruby, shell scripts, Swift, TypeScript, YAML and Zig, knowing each one's comments, strings, keywords and built-in types. It is a good guess, not a parser; a language server's colours go over it where there is one.
 
 A document can be driven by standard, Vim or Helix keys: `Document::set_keymap(Keymap::Vim)`, and `Document::mode_status` gives a status bar the mode, pending keys and messages for either.
 
@@ -137,8 +137,22 @@ NeoCode looks for a language server for each file it opens and starts it for the
 | Go | `gopls` |
 | Python | `basedpyright-langserver`, `pyright-langserver`, `pylsp`, `ruff server` |
 | TypeScript, JavaScript | `typescript-language-server`, `vtsls`, `deno lsp` |
-| TOML, Markdown, JSON, YAML, HTML, CSS | `taplo`, `marksman`, and the `vscode-*-language-server` and `yaml-language-server` programs |
-| Lua, Zig, shell scripts | `lua-language-server`, `zls`, `bash-language-server` |
+| Haskell | `haskell-language-server-wrapper`, `haskell-language-server` |
+| Koka | `koka --language-server` |
+| Java, Kotlin, C#, Swift | `jdtls`, `kotlin-language-server`, `csharp-ls` or `OmniSharp`, `sourcekit-lsp` |
+| Ruby, PHP, Elixir, Dart | `ruby-lsp` or `solargraph`, `intelephense` or `phpactor`, `elixir-ls` or `expert`, `dart language-server` |
+| OCaml, Zig, Lua, Nix | `ocamllsp`, `zls`, `lua-language-server`, `nixd` or `nil` |
+| TOML, Markdown, JSON, YAML, HTML, CSS, shell | `taplo`, `marksman`, the `vscode-*-language-server` programs, `yaml-language-server`, `bash-language-server` |
+
+To use a server that is not listed, or a different one for a listed language, add a line to `apps/neo-code-servers.conf` in Neo's settings folder, giving the file extensions and the command:
+
+```text
+# extensions = command
+hs lhs = haskell-language-server-wrapper --lsp
+vue:vue = vue-language-server --stdio
+```
+
+If a server will not start, the status bar passes on what it said, such as a compiler version it has no build for.
 
 With a server running:
 

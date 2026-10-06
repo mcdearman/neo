@@ -425,6 +425,9 @@ fn file_icon(name: &str) -> neo::theme::Icon {
         Language::Toml => icons::FILE_COG,
         Language::Markdown => icons::FILE_TEXT,
         Language::Plain => icons::FILE,
+        Language::Json | Language::Yaml => icons::FILE_COG,
+        // Every other language Neo can colour is code.
+        _ => icons::FILE_CODE,
     }
 }
 
@@ -1452,6 +1455,41 @@ mod tests {
         assert_eq!(NeoCode::at(&dir.join("src")).project, "src");
         let loose = project("loose-file");
         assert_eq!(NeoCode::at(&loose.join("notes.md")).project, "loose-file");
+    }
+
+    /// Opens a real file with whatever server this computer has for it and
+    /// reports how that went, for trying a project by hand:
+    /// `NEO_LSP_FILE=/path/to/file cargo test -p neo-code -- --ignored --nocapture probe_a_real_file`.
+    /// `NEO_LSP_WAIT` is how many seconds to give the server (default 60).
+    #[test]
+    #[ignore]
+    fn probe_a_real_file() {
+        let file = PathBuf::from(std::env::var("NEO_LSP_FILE").expect("set NEO_LSP_FILE"));
+        let secs: u64 = std::env::var("NEO_LSP_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        // Start empty, so the search is known before the file opens.
+        let mut h = Harness::new(NeoCode::sample(), Size::new(1100.0, 560.0)).unwrap();
+        h.app_mut().update(Msg::LspDirs(lsp::search_dirs()));
+        h.app_mut().update(Msg::Dropped(vec![file.clone()]));
+        println!("project: {}", h.app().root.as_ref().unwrap().display());
+        let until = std::time::Instant::now() + Duration::from_secs(secs);
+        let mut last = None;
+        while std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(200));
+            h.advance(Duration::from_millis(200));
+            let Some(t) = h.app().active_tab() else { break };
+            let now = (h.app().server_status(t), t.diagnostics.len(), t.tokens.len());
+            if last.as_ref() != Some(&now) {
+                println!("{:>5.1}s  status: {:?}  problems: {}  coloured stretches: {}", (secs as f32) - until.saturating_duration_since(std::time::Instant::now()).as_secs_f32(), now.0.as_ref().map(|s| s.0.as_str()), now.1, now.2);
+                last = Some(now);
+            }
+            if h.app().toast.is_some() {
+                println!("        message: {}", h.app_mut().toast.take().unwrap());
+            }
+        }
+        if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
+            h.app_mut().toast = None;
+            h.save_png(PathBuf::from(out).join("code-probe.png"), 1.0).unwrap();
+        }
     }
 
     #[test]
