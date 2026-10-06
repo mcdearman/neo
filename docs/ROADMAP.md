@@ -15,7 +15,7 @@ Each stage ships something usable on its own, and each builds on the last withou
 
 Done:
 
-- **Toolkit:** `neo-theme`, `neo-render` and `neo`.
+- **Toolkit:** `neo-theme`, `armature-render` and `neo`.
   - Widgets, layout, focus, animation, glass windows and a headless test harness.
   - Background-thread messages (`Proxy`) and layout-time messages (`Cx::defer`).
 - **Apps:** Files, Terminal, Settings, System Monitor, Calculator and Neo Code.
@@ -40,7 +40,7 @@ In rough priority order:
 
 1. **Overlays:** menus, context menus, popovers, tooltips and modal dialogs. These unblock right-click in Files, a tab menu in Terminal and confirmation dialogs.
 2. **Virtualised lists:** build only the visible rows. Files currently caps a folder at 800 rows and System Monitor at 150 processes.
-3. **Images:** a textured-quad primitive in `neo-render`, with decoding off the main thread. This unblocks thumbnails, an image viewer, album art and wallpapers.
+3. **Images:** a textured-quad primitive in `armature-render`, with decoding off the main thread. This unblocks thumbnails, an image viewer, album art and wallpapers.
 4. **Keyboard:**
    - Missing keys: F1 to F12, Insert and the numeric keypad.
    - IME pre-edit, beyond commit-only text.
@@ -96,7 +96,7 @@ The goal is a "Neo" entry at the login screen that starts a complete desktop. Tw
 winit cannot create panels, docks or lock screens. These need the `wlr-layer-shell` and `ext-session-lock` protocols.
 
 - Add a second backend to `neo` built on `smithay-client-toolkit`, used only for these surfaces.
-- `neo-render` already draws to any raw window handle, so only the shell's event and window plumbing is new.
+- `armature-render` already draws to any raw window handle, so only the shell's event and window plumbing is new.
 - Apps don't change.
 
 ### 2.2 Shell components
@@ -144,7 +144,7 @@ Stage 2 is done when someone can log into Neo on a fresh install, use it for a n
 
 `neo-compositor` is built on Smithay, the Rust compositor library behind niri and COSMIC.
 
-- **Rendering:** composite with `neo-render`.
+- **Rendering:** composite with `armature-render`.
   - Blur behind every translucent window, reusing the dual-Kawase pass the toolkit already has.
   - Rounded corners and soft shadows for every window, not just Neo apps.
   - Open, close, minimise and workspace animations that follow the reduced-motion setting.
