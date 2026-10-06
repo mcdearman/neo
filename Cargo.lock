@@ -139,6 +139,7 @@ dependencies = [
  "arboard",
  "armature-render",
  "cc",
+ "muda",
  "objc2 0.6.4",
  "pollster 1.0.1",
  "raw-window-handle",

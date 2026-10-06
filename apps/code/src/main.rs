@@ -389,14 +389,30 @@ impl App for NeoCode {
         subs
     }
 
+    fn menus(&self) -> Vec<Menu<Msg>> {
+        let file_open = self.active_tab().is_some();
+        let keys = KEYMAPS.iter().enumerate().map(|(i, (k, name))| MenuEntry::new(format!("{}{name} Keys", if *k == self.keymap { "✓ " } else { "" }), Msg::Keys(i)));
+        vec![
+            Menu::new("File")
+                .push(MenuEntry::new("Open Folder…", Msg::OpenFolder).shortcut(Shortcut::command("o")))
+                .separator()
+                .push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(file_open))
+                .push(MenuEntry::new("Close Tab", Msg::Close(self.active.unwrap_or(0))).shortcut(Shortcut::command("w")).enabled(file_open)),
+            Menu::new("Edit")
+                .push(MenuEntry::new("Undo", Msg::Edit(Action::Undo)).shortcut(Shortcut::command("z")).enabled(file_open))
+                .push(MenuEntry::new("Redo", Msg::Edit(Action::Redo)).shortcut(Shortcut::command("z").shift()).enabled(file_open))
+                .separator()
+                .push(MenuEntry::new("Select All", Msg::Edit(Action::SelectAll)).shortcut(Shortcut::command("a")).enabled(file_open)),
+            keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
+        ]
+    }
+
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
         if !k.modifiers.command() {
             return None;
         }
+        // Save, close and open are menu entries; their shortcuts live there.
         match &k.key {
-            Key::Character(c) if c == "s" => Some(Msg::Save),
-            Key::Character(c) if c == "o" => Some(Msg::OpenFolder),
-            Key::Character(c) if c == "w" => self.active.map(Msg::Close),
             Key::Character(c) => c.parse::<usize>().ok().filter(|n| (1..=self.tabs.len()).contains(n)).map(|n| Msg::Select(n - 1)),
             _ => None,
         }
@@ -557,15 +573,9 @@ impl NeoCode {
         let header = column()
             .spacing(6.0)
             .width(Length::Fill)
-            .push(
-                row()
-                    .align(Align::Center)
-                    .push(text("Explorer").role(TextRole::Label).tone(Tone::Muted))
-                    .push(Space::fill_x())
-                    .push(icon_button(icons::FOLDER_OPEN, 26.0).kind(ButtonKind::Ghost).on_press(Msg::OpenFolder)),
-            )
+            .push(text("Explorer").role(TextRole::Label).tone(Tone::Muted))
             .push(text(self.project.clone()).role(TextRole::Strong).no_wrap());
-        container(column().spacing(8.0).width(Length::Fill).height(Length::Fill).push(header).push(scrollable(list))).padding([8.0, 8.0, 0.0, 8.0]).width(240.0).height(Length::Fill).into()
+        container(column().spacing(8.0).width(Length::Fill).height(Length::Fill).push(header).push(scrollable(list))).padding([12.0, 8.0, 0.0, 8.0]).width(240.0).height(Length::Fill).into()
     }
 
     fn main(&self) -> Element<Msg> {
@@ -600,7 +610,7 @@ impl NeoCode {
                     .align(Align::Center)
                     .push(icon(icons::FILE_CODE).size(40.0).tone(Tone::Faint))
                     .push(text("Open a file from the Explorer").role(TextRole::Title).tone(Tone::Muted))
-                    .push(text("Cmd/Ctrl+O opens a folder, or drop one on the window").role(TextRole::Caption).tone(Tone::Faint))
+                    .push(text("File ▸ Open Folder… opens a folder, or drop one on the window").role(TextRole::Caption).tone(Tone::Faint))
                     .push(text("Cmd/Ctrl+S saves · Cmd/Ctrl+W closes · Cmd/Ctrl+1–9 switches tabs · :w and :q work with Vim and Helix keys").role(TextRole::Caption).tone(Tone::Faint)),
             )
             .background(Background::Color(surface))
@@ -707,7 +717,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     use neo::{Modifiers, Point};
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true), ("editor-helix", true)] {
+    for (name, dark) in [("editor-light", false), ("editor-dark", true), ("editor-insert", false), ("editor-recording", true), ("editor-helix", true), ("editor-menu", false)] {
         let mut app = NeoCode::sample();
         app.dark = Some(dark);
         if name == "editor-helix" {
@@ -726,6 +736,12 @@ fn snapshots(dir: PathBuf) {
             "editor-dark" => h.type_text("jVj"),
             "editor-insert" => h.type_text("jA // edited"),
             // Helix: three lines selected, with a pending text-object command.
+            // The File menu open, as Windows and Linux show it; macOS puts
+            // the menus in its own bar at the top of the screen.
+            "editor-menu" => {
+                h.click(Point::new(24.0, 23.0));
+                h.move_to(Point::new(60.0, 110.0));
+            }
             // Helix: a cursor on each of four lines, mid-way through typing.
             "editor-helix" => h.type_text("12GwCCCi"),
             _ => h.type_text("qad2"),
@@ -881,7 +897,39 @@ mod tests {
         let app = NeoCode::sample();
         let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
         let key = KeyEvent { key: Key::Character("o".into()), pressed: true, repeat: false, modifiers: cmd, text: None };
-        assert!(matches!(app.on_key(&key), Some(Msg::OpenFolder)));
+        let menus = app.menus();
+        let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, ["File", "Edit", "View"]);
+        let open = &menus[0].entries[0];
+        assert!(matches!(open.message, Some(Msg::OpenFolder)) && open.shortcut.as_ref().unwrap().matches(&key));
+        // The current keys are ticked in the View menu.
+        assert!(menus[2].entries.iter().any(|e| e.label == "✓ Vim Keys"));
+
+        // Save and Close need a file; they grey out without one.
+        let labelled = |app: &NeoCode, label: &str| app.menus()[0].entries.iter().find(|e| e.label == label).unwrap().message.is_some();
+        assert!(labelled(&app, "Save") && labelled(&app, "Close Tab"));
+        let mut empty = NeoCode::sample();
+        while let Some(i) = empty.active {
+            empty.update(Msg::Close(i));
+        }
+        assert!(!labelled(&empty, "Save") && !labelled(&empty, "Close Tab"));
+    }
+
+    #[test]
+    fn menu_shortcuts_save_and_close_through_the_window() {
+        let cmd = Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
+        let mut h = editing(0);
+        h.type_text("x");
+        assert!(h.app().active_tab().unwrap().dirty());
+        h.key(Key::Character("s".into()), cmd);
+        assert!(!h.app().active_tab().unwrap().dirty(), "saved by the File menu's shortcut");
+        let tabs = h.app().tabs.len();
+        h.key(Key::Character("w".into()), cmd);
+        assert_eq!(h.app().tabs.len(), tabs - 1);
+        // And by choosing the entry: File, then the fourth row down.
+        h.click(Point::new(24.0, 23.0));
+        h.click(Point::new(60.0, 44.0 + 32.0 + 9.0 + 32.0 + 16.0));
+        assert_eq!(h.app().tabs.len(), tabs - 2);
     }
 
     #[test]

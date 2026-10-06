@@ -96,6 +96,8 @@ Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framewo
 
 Text, Icon, Picture, Container, Row, Column, Stack, Space, Divider, Scrollable, MouseArea, PopupMenu, Button (raised, accent, ghost, round), Toggle, Checkbox, Slider, Segmented, TextInput, TextEditor, ProgressBar, Gauge and Sparkline.
 
+An app's menu bar comes from `App::menus`: a list of `Menu`s holding `MenuEntry`s, each with an optional `Shortcut`. macOS shows them in its own menu bar at the top of the screen; on Windows and Linux Neo draws them in the title bar. Entries without a message are greyed out, and a shortcut works whether or not its menu is open.
+
 TextEditor edits an app-owned `Document`. It supports undo and redo, auto-indent, word motions, the clipboard, and syntax highlighting for Rust, TOML and Markdown.
 
 A document can be driven by standard, Vim or Helix keys: `Document::set_keymap(Keymap::Vim)`, and `Document::mode_status` gives a status bar the mode, pending keys and messages for either.

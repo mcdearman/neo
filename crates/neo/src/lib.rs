@@ -59,6 +59,7 @@ pub use cx::{FocusRing, ThemeCx};
 
 pub use armature::{Align, Anim, Cx, CursorIcon, Decorations, DrawCx, Element, Error, EventCx, Length, Limits, Padding, Proxy, ResizeEdge, Subscription, Ui, Widget, WidgetId, WindowGeometry, WindowRequest, WindowSettings, WindowState};
 pub use armature::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
+pub use armature::{Menu, MenuEntry, Shortcut};
 
 pub use armature_render::{Corners, FontFamily, Image, Point, Rect, Scene, Size, TextLayout, TextStyle};
 pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface, TextRole, Theme, Weight};
@@ -66,5 +67,5 @@ pub use neo_theme::{self as theme, icons, Accent, Color, Glass, Scheme, Surface,
 /// Everything an application usually needs.
 pub mod prelude {
     pub use crate::widgets::*;
-    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, FocusRing, Glass, Length, Padding, Proxy, Scheme, Subscription, Surface, TextRole, Theme, ThemeCx, Weight, WindowSettings, WindowState};
+    pub use crate::{icons, run, Accent, Align, App, Color, Decorations, Element, FocusRing, Glass, Length, Menu, MenuEntry, Padding, Proxy, Scheme, Shortcut, Subscription, Surface, TextRole, Theme, ThemeCx, Weight, WindowSettings, WindowState};
 }

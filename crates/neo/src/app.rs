@@ -1,4 +1,4 @@
-use armature::{Chrome, KeyEvent, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
+use armature::{Chrome, KeyEvent, Menu, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
 use neo_theme::{Scheme, TextRole, Theme};
 
 use crate::core::Element;
@@ -23,6 +23,14 @@ pub trait App: 'static {
     /// The theme to use. `system` is the desktop's light or dark preference.
     fn theme(&self, system: Scheme) -> Theme {
         Theme { scheme: system, ..Theme::default() }
+    }
+
+    /// The menu bar: File, Edit and so on. On macOS these go in the system's
+    /// menu bar at the top of the screen; elsewhere Neo draws them at the
+    /// top of the window. Asked after every update, so entries can follow
+    /// app state. An entry's shortcut works whether or not its menu is open.
+    fn menus(&self) -> Vec<Menu<Self::Message>> {
+        vec![]
     }
 
     /// Key presses no widget handled, for app-wide shortcuts such as save.
@@ -115,7 +123,12 @@ impl<A: App> armature::App for Themed<A> {
     }
 
     fn frame(&self, view: Element<Self::Message>, chrome: Chrome) -> Element<Self::Message> {
-        Element::new(Frame::new(view, chrome.title, chrome.title_bar, chrome.rounded, chrome.background))
+        let menus = if chrome.menu_bar { self.0.menus() } else { vec![] };
+        Element::new(Frame::new(view, chrome.title, chrome.title_bar, chrome.rounded, chrome.background).menus(menus))
+    }
+
+    fn menus(&self) -> Vec<Menu<Self::Message>> {
+        self.0.menus()
     }
 
     fn on_key(&self, key: &KeyEvent) -> Option<Self::Message> {

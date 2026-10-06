@@ -702,3 +702,177 @@ mod search_field {
         assert_eq!(h.app().query, "abc");
     }
 }
+
+mod menu_bar {
+    use super::*;
+    use neo::{Menu, MenuEntry, Shortcut};
+
+    #[derive(Default)]
+    struct Editor {
+        opened: u32,
+        saved: u32,
+        zoomed: u32,
+        pressed: u32,
+        has_file: bool,
+        system_title_bar: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Msg {
+        Open,
+        Save,
+        Zoom,
+        Press,
+    }
+
+    impl App for Editor {
+        type Message = Msg;
+
+        fn window(&self) -> WindowSettings {
+            WindowSettings { decorations: if self.system_title_bar { Decorations::System } else { Decorations::Custom }, ..Default::default() }
+        }
+
+        fn update(&mut self, m: Msg) {
+            match m {
+                Msg::Open => self.opened += 1,
+                Msg::Save => self.saved += 1,
+                Msg::Zoom => self.zoomed += 1,
+                Msg::Press => self.pressed += 1,
+            }
+        }
+
+        fn menus(&self) -> Vec<Menu<Msg>> {
+            vec![
+                Menu::new("File").push(MenuEntry::new("Open…", Msg::Open).shortcut(Shortcut::command("o"))).separator().push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(self.has_file)),
+                Menu::new("View").push(MenuEntry::new("Zoom In", Msg::Zoom)),
+            ]
+        }
+
+        // A button filling the window under the bar.
+        fn view(&self) -> Element<Msg> {
+            button("Press").on_press(Msg::Press).width(Length::Fill).height(Length::Fill).into()
+        }
+    }
+
+    // With Neo's title bar (46px), the menu titles are 26px tall in its
+    // middle, from x = 8. A dropdown starts 2px under its title, with 6px
+    // of padding, 32px rows and 9px separators.
+    const FILE: Point = Point::new(24.0, 23.0);
+    const VIEW: Point = Point::new(76.0, 23.0);
+    const OPEN_ROW: Point = Point::new(40.0, 60.0);
+    const SAVE_ROW: Point = Point::new(40.0, 101.0);
+    const CONTENT: Point = Point::new(300.0, 250.0);
+
+    fn harness(app: Editor) -> Harness<Editor> {
+        Harness::new(app, Size::new(400.0, 300.0)).unwrap()
+    }
+
+    fn command() -> Modifiers {
+        Modifiers { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() }
+    }
+
+    #[test]
+    fn a_menu_opens_from_its_title_and_an_entry_sends_its_message() {
+        let mut h = harness(Editor::default());
+        let corner = Point::new(399.0, 299.0);
+        h.move_to(corner);
+        let closed = h.render(1.0);
+        h.click(FILE);
+        let open = h.render(1.0);
+        assert!(closed != open, "the dropdown is showing");
+        assert_eq!(h.app().opened, 0, "opening a menu does nothing by itself");
+        h.click(OPEN_ROW);
+        assert_eq!(h.app().opened, 1);
+        h.move_to(corner);
+        assert!(h.render(1.0) == closed, "and the menu has closed");
+    }
+
+    #[test]
+    fn a_greyed_out_entry_cannot_be_chosen() {
+        let mut h = harness(Editor::default());
+        h.click(FILE);
+        h.click(SAVE_ROW);
+        assert_eq!(h.app().saved, 0);
+        h.app_mut().has_file = true;
+        h.click(SAVE_ROW);
+        assert_eq!(h.app().saved, 1, "the menu stayed open, and the entry now works");
+    }
+
+    #[test]
+    fn a_click_outside_closes_the_menu_without_reaching_what_is_under_it() {
+        let mut h = harness(Editor::default());
+        h.click(FILE);
+        h.click(CONTENT);
+        assert_eq!(h.app().pressed, 0, "the click only closed the menu");
+        h.click(CONTENT);
+        assert_eq!(h.app().pressed, 1);
+        // Escape closes it too, and keys do not leak through while it is open.
+        h.click(FILE);
+        h.key(Key::Character("o".into()), command());
+        assert_eq!(h.app().opened, 0);
+        h.key(Key::Escape, Modifiers::default());
+        h.click(CONTENT);
+        assert_eq!(h.app().pressed, 2);
+    }
+
+    #[test]
+    fn moving_along_the_bar_switches_menus_once_one_is_open() {
+        let mut h = harness(Editor::default());
+        h.move_to(VIEW);
+        let hovering = h.render(1.0);
+        h.click(FILE);
+        let file = h.render(1.0);
+        h.move_to(VIEW);
+        let view = h.render(1.0);
+        assert!(file != view);
+        assert!(hovering != view, "View opened without a click");
+        // Its dropdown hangs under its own title.
+        h.click(Point::new(VIEW.x + 10.0, OPEN_ROW.y));
+        assert_eq!((h.app().zoomed, h.app().opened), (1, 0));
+    }
+
+    #[test]
+    fn shortcuts_work_with_the_menu_closed() {
+        let mut h = harness(Editor::default());
+        h.key(Key::Character("o".into()), command());
+        assert_eq!(h.app().opened, 1);
+        h.key(Key::Character("s".into()), command());
+        assert_eq!(h.app().saved, 0, "Save is greyed out, so its shortcut does nothing");
+        h.app_mut().has_file = true;
+        h.key(Key::Character("s".into()), command());
+        assert_eq!(h.app().saved, 1);
+        h.key(Key::Character("o".into()), Modifiers::default());
+        assert_eq!(h.app().opened, 1, "not without the command key");
+    }
+
+    #[test]
+    fn with_the_systems_title_bar_the_menus_get_a_bar_of_their_own() {
+        let mut h = harness(Editor { system_title_bar: true, ..Default::default() });
+        // The bar is 30px tall, so the title's middle is at y = 15 and the
+        // dropdown's first row is 16px higher than under Neo's title bar.
+        h.click(Point::new(24.0, 15.0));
+        h.click(Point::new(40.0, 44.0));
+        assert_eq!(h.app().opened, 1);
+        h.click(Point::new(300.0, 31.0));
+        assert_eq!(h.app().pressed, 1, "the content starts right under the bar");
+        h.click(Point::new(300.0, 28.0));
+        assert_eq!(h.app().pressed, 1);
+    }
+
+    #[test]
+    fn an_app_without_menus_has_no_bar() {
+        struct Plain;
+        impl App for Plain {
+            type Message = ();
+            fn window(&self) -> WindowSettings {
+                WindowSettings { decorations: Decorations::System, ..Default::default() }
+            }
+            fn update(&mut self, _: ()) {}
+            fn view(&self) -> Element<()> {
+                container(Space::new(Length::Fill, Length::Fill)).width(Length::Fill).height(Length::Fill).background(Background::Color(Color::hex(0xff0000))).into()
+            }
+        }
+        let mut h = Harness::new(Plain, Size::new(100.0, 100.0)).unwrap();
+        assert_eq!(&h.render(1.0)[..3], [255, 0, 0], "the content starts at the very top");
+    }
+}
