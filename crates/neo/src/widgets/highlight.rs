@@ -539,7 +539,10 @@ impl SyntaxColors {
             Scheme::Light => [hex(0x8A3FB5), hex(0xB4541A), hex(0x9A3FB8), hex(0x3F5BC4), hex(0x9A6A0E), hex(0x4A67D6), hex(0x8A5D08), hex(0x1E7A4F)],
         };
         let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };
-        Self { keyword, ty, function, string, number, comment, macro_: function, attribute: ty.mix(p.text, 0.25), punct: p.text, heading: keyword, variable: Some(variable), constructor, module }
+        // Attributes and lifetimes sit beside types (`&'static str`), so
+        // they are rose: near the types' peach, and plainly not it.
+        let attribute = hex(if scheme == Scheme::Dark { 0xFF8FA8 } else { 0xB8355A });
+        Self { keyword, ty, function, string, number, comment, macro_: function, attribute, punct: p.text, heading: keyword, variable: Some(variable), constructor, module }
     }
 
     pub fn color(&self, k: Kind) -> Option<Color> {
