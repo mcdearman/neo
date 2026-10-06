@@ -523,7 +523,8 @@ impl SyntaxColors {
     /// The Meadow REPL's colouring. The REPL names terminal colours, not
     /// shades: keywords magenta, types cyan, constructors blue, modules a
     /// dim cyan, functions bright yellow, other names bright blue, numbers
-    /// yellow, strings green, comments dim. These are the shades Neo's own
+    /// yellow, strings green, comments dim, and operators and punctuation
+    /// left as the text is. These are the shades Neo's own
     /// terminal gives those names, so code in the editor and the same code
     /// typed at the REPL beside it look alike.
     fn meadow(p: &Palette, scheme: Scheme) -> Self {
@@ -536,7 +537,7 @@ impl SyntaxColors {
         // Dim, as the REPL has comments: the text's colour, most of the
         // way to the ground, and for modules the type's.
         let comment = if scheme == Scheme::Dark { hex(0x8C898D) } else { p.muted };
-        Self { keyword, ty, function, string, number, comment, macro_: function, attribute: ty.mix(p.text, 0.25), punct: p.muted, heading: keyword, variable: Some(variable), constructor, module: ty.mix(p.bg, 0.4) }
+        Self { keyword, ty, function, string, number, comment, macro_: function, attribute: ty.mix(p.text, 0.25), punct: p.text, heading: keyword, variable: Some(variable), constructor, module: ty.mix(p.bg, 0.4) }
     }
 
     pub fn color(&self, k: Kind) -> Option<Color> {
