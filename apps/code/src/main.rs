@@ -2069,6 +2069,50 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_chosen_are_still_chosen_next_time() {
+        let dir = project("keys-kept");
+        let config = dir.parent().unwrap().join(format!("{}-config", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&config);
+        // As the app starts: settings read, then the folder's files reopened.
+        let start = || {
+            let mut app = NeoCode::folder(&dir);
+            app.config = Some(config.clone());
+            app.load_settings();
+            app.restore_workspace();
+            app
+        };
+        let open = |app: &mut NeoCode| {
+            let lib = app.nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+            app.update(Msg::Open(lib));
+        };
+        let mut app = start();
+        assert_eq!(app.keymap, Keymap::Vim, "the usual keys, with nothing saved");
+        open(&mut app);
+        // Each way of choosing: the settings panel and the View menu send
+        // the same message; the button in the status bar goes to the next.
+        for (choose, want) in [(2, Keymap::Helix), (0, Keymap::Plain), (1, Keymap::Vim), (2, Keymap::Helix)] {
+            app.update(Msg::Keys(choose));
+            assert_eq!(app.keymap, want);
+            let again = start();
+            assert_eq!(again.keymap, want, "a fresh start comes up with the keys last chosen");
+            assert_eq!(again.active_tab().map(|t| t.doc.keymap()), Some(want), "and so do the files it reopens");
+            assert_eq!(again.settings.keymap, want);
+        }
+        // The file says so in a word a person can read and change.
+        let text = std::fs::read_to_string(settings::user_file(&config)).unwrap();
+        assert!(text.contains("\"editor.keymap\": \"helix\""), "{text}");
+        // Chosen while a different folder is open, it holds for every folder.
+        let other = project("keys-kept-other");
+        let mut elsewhere = NeoCode::folder(&other);
+        elsewhere.config = Some(config.clone());
+        elsewhere.load_settings();
+        assert_eq!(elsewhere.keymap, Keymap::Helix);
+        elsewhere.update(Msg::Keys(0));
+        assert_eq!(start().keymap, Keymap::Plain);
+        std::fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
     fn a_function_with_arguments_asks_for_them_before_debugging() {
         let mut s = Served::new("debug-ask", "pub fn one() {}\n");
         let file = s.file.clone();
