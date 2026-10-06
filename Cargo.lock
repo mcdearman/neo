@@ -1715,6 +1715,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "neo-shell"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "neo",
+ "neo-desktop",
+]
+
+[[package]]
 name = "neo-terminal"
 version = "0.1.0"
 dependencies = [

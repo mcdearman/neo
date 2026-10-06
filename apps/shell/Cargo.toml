@@ -1,0 +1,11 @@
+[package]
+name = "neo-shell"
+description = "NeoShell: the desktop's background services, starting with notifications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }

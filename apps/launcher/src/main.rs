@@ -183,7 +183,7 @@ impl App for Launcher {
     fn window_state(&self) -> WindowState {
         // Centred, a little above the middle, where the eye goes first.
         let position = (self.screen != Rect::ZERO).then(|| Point::new((self.screen.x + (self.screen.w - WIDTH) * 0.5).round(), (self.screen.y + self.screen.h * 0.22).round()));
-        WindowState { visible: self.shown, always_on_top: true, bare: true, size: Some(Size::new(WIDTH, HEIGHT)), position, hidden_from_capture: false }
+        WindowState { visible: self.shown, always_on_top: true, bare: true, size: Some(Size::new(WIDTH, HEIGHT)), position, hidden_from_capture: false, passive: false }
     }
 
     fn on_window_geometry(&self, geometry: WindowGeometry) -> Option<Msg> {

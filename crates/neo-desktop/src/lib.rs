@@ -29,6 +29,7 @@
 mod appearance;
 pub mod autostart;
 pub mod fs;
+pub mod notify;
 mod prefs;
 pub mod ui;
 

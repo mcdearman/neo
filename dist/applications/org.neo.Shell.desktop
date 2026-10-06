@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NeoShell
+GenericName=Desktop Shell
+Comment=The Neo desktop's background services: notifications
+Exec=neo-shell
+Icon=org.neo.Shell
+Terminal=false
+Categories=Utility;
+NoDisplay=true
+StartupNotify=false
+StartupWMClass=org.neo.Shell

@@ -35,5 +35,6 @@ pub const APPS: &[AppInfo] = &[
     AppInfo { bin: "neo-videos", id: "org.neo.Videos", name: "Videos", former: "Neo Videos", glyph: icons::CLAPPERBOARD, top: Color::hex(0xAB9DF2), bottom: Color::hex(0x6A55C9), ink: Color::WHITE, background: false },
     AppInfo { bin: "neo-recorder", id: "org.neo.Recorder", name: "NeoCap", former: "Neo Recorder", glyph: icons::VIDEO, top: Color::hex(0xFF7A9C), bottom: Color::hex(0xC0443A), ink: Color::WHITE, background: true },
     AppInfo { bin: "neo-launcher", id: "org.neo.Launcher", name: "Launcher", former: "Neo Launcher", glyph: icons::SEARCH, top: Color::hex(0x5B78E6), bottom: Color::hex(0x2B3A8C), ink: Color::WHITE, background: true },
+    AppInfo { bin: "neo-shell", id: "org.neo.Shell", name: "NeoShell", former: "NeoShell", glyph: icons::PANEL_TOP, top: Color::hex(0x4A5568), bottom: Color::hex(0x1F2733), ink: Color::WHITE, background: true },
     AppInfo { bin: "neo-code", id: "org.neo.Code", name: "NeoCode", former: "Neo Code", glyph: icons::CODE, top: Color::hex(0x2F3542), bottom: Color::hex(0x14171C), ink: Color::hex(0x889FEC), background: false },
 ];

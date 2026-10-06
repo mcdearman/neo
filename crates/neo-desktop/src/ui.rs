@@ -143,6 +143,12 @@ impl<M: 'static> Widget<M> for Sheet<M> {
     }
 }
 
+/// A solid sheet `width` wide holding `content`, with a shadow. It stays
+/// readable over anything, which a card on a glass window does not.
+pub fn sheet<M: 'static>(content: impl Into<Element<M>>, width: f32) -> Element<M> {
+    Element::new(Sheet { content: [content.into()], width })
+}
+
 /// An app's settings panel, shown over `view`: the app's own rows, then
 /// the ones every Neo app has.
 pub(crate) fn settings_panel<M: Clone + 'static>(desktop: &Desktop, view: Element<M>, heading: &str, wrap: impl Fn(DesktopMsg) -> M + Clone + 'static, extra: Vec<Element<M>>) -> Element<M> {

@@ -35,12 +35,14 @@ pub struct Appearance {
     pub text_scale: f32,
     pub reduce_motion: bool,
     pub glass: Glass,
+    /// How long a notification stays on screen, in seconds.
+    pub notification_seconds: f32,
 }
 
 impl Default for Appearance {
     fn default() -> Self {
         let t = Theme::default();
-        Self { scheme: SchemePref::Auto, accent: t.accent, radius: t.radius, text_scale: 1.0, reduce_motion: false, glass: t.glass }
+        Self { scheme: SchemePref::Auto, accent: t.accent, radius: t.radius, text_scale: 1.0, reduce_motion: false, glass: t.glass, notification_seconds: 5.0 }
     }
 }
 
@@ -128,6 +130,7 @@ impl Appearance {
                 "glass" => a.glass.enabled = flag().unwrap_or(a.glass.enabled),
                 "glass-opacity" => a.glass.opacity = num(0.2, 1.0).unwrap_or(a.glass.opacity),
                 "glass-blur" => a.glass.blur = num(0.0, 60.0).unwrap_or(a.glass.blur),
+                "notification-seconds" => a.notification_seconds = num(1.0, 60.0).unwrap_or(a.notification_seconds),
                 _ => {}
             }
         }
@@ -137,7 +140,7 @@ impl Appearance {
     pub fn serialize(&self) -> String {
         format!(
             "# Neo appearance. Written by Settings; every Neo app reloads it on change.\n\
-             scheme = {}\naccent = {}\nradius = {}\ntext-scale = {}\nreduce-motion = {}\nglass = {}\nglass-opacity = {}\nglass-blur = {}\n",
+             scheme = {}\naccent = {}\nradius = {}\ntext-scale = {}\nreduce-motion = {}\nglass = {}\nglass-opacity = {}\nglass-blur = {}\nnotification-seconds = {}\n",
             self.scheme.key(),
             accent_key(self.accent),
             self.radius,
@@ -146,6 +149,7 @@ impl Appearance {
             self.glass.enabled,
             self.glass.opacity,
             self.glass.blur,
+            self.notification_seconds,
         )
     }
 
@@ -189,6 +193,7 @@ mod tests {
             text_scale: 1.25,
             reduce_motion: true,
             glass: Glass { enabled: true, opacity: 0.5, blur: 20.0 },
+            notification_seconds: 8.0,
         };
         assert_eq!(Appearance::parse(&a.serialize()), a);
     }

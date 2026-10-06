@@ -88,6 +88,7 @@ enum Msg {
     GlassBlur(f32),
     TextScale(f32),
     ReduceMotion(bool),
+    NotificationSeconds(f32),
     Poll,
     /// The Settings entry and panel every Neo app has.
     Desktop(neo_desktop::DesktopMsg),
@@ -143,6 +144,7 @@ impl App for Settings {
             Msg::GlassBlur(b) => self.change(|a| a.glass.blur = b),
             Msg::TextScale(s) => self.change(|a| a.text_scale = s),
             Msg::ReduceMotion(r) => self.change(|a| a.reduce_motion = r),
+            Msg::NotificationSeconds(n) => self.change(|a| a.notification_seconds = n),
             Msg::Preview => {}
             Msg::Desktop(m) => {
                 self.desktop.update(m);
@@ -237,8 +239,13 @@ impl Settings {
             .width(Length::Fill)
             .push(group(vec![
                 setting("Text size", "Scales text in every Neo app.", segmented(TEXT_SCALES.map(|(_, n)| n), scale_idx, |i| Msg::TextScale(TEXT_SCALES[i].0))),
-                setting("Reduce motion", "Turns off transitions and animation.", toggle(a.reduce_motion, Msg::ReduceMotion)),
+                setting("Reduce motion", "Turns off transitions and animation, including notifications sliding in and the flash after a screenshot.", toggle(a.reduce_motion, Msg::ReduceMotion)),
             ]))
+            .push(group(vec![setting(
+                "Notifications stay for",
+                &format!("{:.0} seconds, then they go on their own.", a.notification_seconds),
+                container(slider(2.0..=15.0, a.notification_seconds, Msg::NotificationSeconds).step(1.0)).width(180.0),
+            )]))
             .push(text("Text and controls meet WCAG AA contrast in both colour schemes with the royal blue accent.").role(TextRole::Caption).tone(Tone::Muted))
             .into()
     }

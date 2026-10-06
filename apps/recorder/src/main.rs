@@ -36,7 +36,7 @@ mod media;
 mod tray;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers as HotMods};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -88,6 +88,8 @@ enum Phase {
     Shooting(Target),
     /// The system's crosshair is up for the user to drag out an area.
     Picking,
+    /// A screenshot was just taken: the screen flashes, so it feels taken.
+    Flash(Saved),
     Recording,
     Saving,
     Done(Saved),
@@ -139,6 +141,8 @@ struct Recorder {
     /// The drag-to-select in progress, to take down if the user asks for
     /// NeoCap's window instead.
     picker: Option<capture::Picker>,
+    /// When the flash after a screenshot began.
+    flash_from: Option<Instant>,
     /// Kept alive after a screenshot is copied: on Linux the picture stays
     /// on the clipboard only while its owner is running.
     clipboard: Option<arboard::Clipboard>,
@@ -182,6 +186,8 @@ enum Msg {
     PickMore,
     /// The drag-to-select ended: with a picture, an error, or neither.
     Picked(Option<Result<Saved, String>>),
+    /// The flash after a screenshot moves on, or is over.
+    FlashTick,
     Tray(TrayAction),
     Autostart(bool),
     /// Whether this app's window is glass when the desktop's windows are.
@@ -275,6 +281,7 @@ impl Recorder {
             auto_shot: false,
             shot_in_flight: false,
             picker: None,
+            flash_from: None,
             clipboard: None,
             copied: None,
             copy_shots: register_hotkey,
@@ -378,7 +385,44 @@ impl Recorder {
     }
 }
 
+/// How long the screen flashes after a screenshot.
+const FLASH: Duration = Duration::from_millis(260);
+
 impl Recorder {
+    /// Whether to flash: not with motion reduced, and not before the
+    /// screen's size is known.
+    fn flashes(&self) -> bool {
+        !self.desktop.appearance.reduce_motion && self.screen != Rect::ZERO
+    }
+
+    /// How bright the flash is now: it starts strong and fades away.
+    fn flash_strength(&self) -> f32 {
+        let t = self.flash_from.map_or(1.0, |from| from.elapsed().as_secs_f32() / FLASH.as_secs_f32()).clamp(0.0, 1.0);
+        0.55 * (1.0 - t) * (1.0 - t)
+    }
+
+    /// The flash itself: white over everything, fading.
+    fn flash(&self) -> Element<Msg> {
+        container(Space::new(Length::Fill, Length::Fill)).width(Length::Fill).height(Length::Fill).background(Background::Color(Color::WHITE.with_alpha(self.flash_strength()))).into()
+    }
+
+    /// Says a screenshot was taken. NeoShell shows it as a notification,
+    /// with the picture and a way to find the file; without NeoShell this
+    /// window says so itself.
+    fn announce(&mut self, saved: Saved) {
+        let title = if matches!(self.copied, Some(Ok(()))) { "Screenshot copied to clipboard" } else { "Screenshot saved" };
+        let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let note = neo_desktop::notify::Notification::new(title, name).image(&saved.path).reveal(&saved.path);
+        // Tests must not reach a NeoShell that happens to be running here.
+        if !cfg!(test) && note.send() {
+            self.phase = Phase::Idle;
+            self.shown = false;
+        } else {
+            self.phase = Phase::Done(saved);
+            self.shown = true;
+        }
+    }
+
     /// The key that, pressed while dragging out a screenshot, opens
     /// NeoCap's window instead. It is a plain letter, so it is claimed only
     /// for as long as the crosshair is up.
@@ -439,6 +483,10 @@ impl App for Recorder {
     fn window_state(&self) -> WindowState {
         let recording = self.busy();
         let framing = self.mode == Mode::Area && self.phase == Phase::Idle;
+        if matches!(self.phase, Phase::Flash(_)) {
+            // Over the whole screen for an instant, without taking the keyboard.
+            return WindowState { visible: true, always_on_top: true, bare: true, size: Some(Size::new(self.screen.w, self.screen.h)), position: Some(Point::new(self.screen.x, self.screen.y)), hidden_from_capture: true, passive: true };
+        }
         WindowState {
             // Out of the way for the instant a screenshot is taken.
             visible: !matches!(self.phase, Phase::Shooting(_)) && (recording || self.shown),
@@ -450,6 +498,7 @@ impl App for Recorder {
             size: Some(if recording { BAR } else if framing { FRAME } else { POPUP }),
             position: if recording { Some(self.bar_origin()) } else { self.home },
             hidden_from_capture: recording && !self.include_bar,
+            passive: false,
         }
     }
 
@@ -507,6 +556,7 @@ impl App for Recorder {
             // Long enough for the window to leave the screen.
             Phase::Starting(_) => subs.push(Subscription::every(Duration::from_millis(400), Msg::Begin)),
             Phase::Shooting(_) => subs.push(Subscription::every(Duration::from_millis(350), Msg::Shoot)),
+            Phase::Flash(_) => subs.push(Subscription::every(Duration::from_millis(16), Msg::FlashTick)),
             Phase::Recording => {
                 subs.push(Subscription::every(Duration::from_millis(500), Msg::Tick));
                 if let Some(limit) = self.stop_after {
@@ -572,7 +622,7 @@ impl Recorder {
                             self.shown = true;
                         }
                     }
-                    Phase::Starting(_) | Phase::Shooting(_) | Phase::Picking | Phase::Saving => {}
+                    Phase::Starting(_) | Phase::Shooting(_) | Phase::Picking | Phase::Flash(_) | Phase::Saving => {}
                 },
                 TrayAction::ToggleAutostart => self.apply(Msg::Autostart(!self.autostart)),
                 TrayAction::Quit => self.apply(Msg::Quit),
@@ -672,6 +722,17 @@ impl Recorder {
                     _ => None,
                 };
                 self.phase = match result {
+                    // A screenshot flashes, then says where it went.
+                    Ok(saved) if saved.length.is_zero() => {
+                        if self.flashes() {
+                            self.flash_from = Some(Instant::now());
+                            self.shown = false;
+                            self.phase = Phase::Flash(saved);
+                        } else {
+                            self.announce(saved);
+                        }
+                        return;
+                    }
                     Ok(saved) => Phase::Done(saved),
                     Err(e) => Phase::Failed(e),
                 };
@@ -741,6 +802,14 @@ impl Recorder {
                     }
                 }
             }
+            Msg::FlashTick => {
+                if self.flash_from.is_none_or(|t| t.elapsed() >= FLASH)
+                    && let Phase::Flash(saved) = std::mem::replace(&mut self.phase, Phase::Idle)
+                {
+                    self.flash_from = None;
+                    self.announce(saved);
+                }
+            }
             Msg::Hide => self.shown = false,
             Msg::Quit => {
                 self.end_pick();
@@ -799,6 +868,7 @@ impl Recorder {
             Phase::Idle => self.chooser(),
             // Shown as the recording bar instead; see `recording_bar`.
             Phase::Starting(_) | Phase::Recording | Phase::Shooting(_) | Phase::Picking => Space::fill_y().into(),
+            Phase::Flash(_) => return self.flash(),
             Phase::Saving => status(icons::VIDEO, Tone::Accent, "Saving…".into(), if self.gif { "Making the GIF. Long recordings take a while.".into() } else { String::new() }, row()),
             Phase::Done(saved) => {
                 let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1180,6 +1250,10 @@ fn main() {
         app.shots_dir = PathBuf::from(dir);
     }
     app.include_bar = args.iter().any(|a| a == "--include-bar");
+    // Leave the clipboard alone, for scripts that only want the file.
+    if args.iter().any(|a| a == "--no-copy") {
+        app.copy_shots = false;
+    }
     app.gif = args.iter().any(|a| a == "--gif");
     app.microphone = args.iter().any(|a| a == "--mic");
     app.stop_after = value("--for").and_then(|s| s.parse::<f32>().ok()).filter(|s| *s > 0.0).map(Duration::from_secs_f32);
@@ -1390,6 +1464,52 @@ mod tests {
         let mut r = recorder();
         r.update(Msg::PickMore);
         assert_eq!(r.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn a_screenshot_flashes_the_screen_then_says_where_it_went() {
+        let mut r = recorder();
+        r.desktop.appearance.reduce_motion = false;
+        r.shown = false;
+        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
+        let screen = r.screen;
+        assert!(screen != Rect::ZERO);
+        let saved = Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO };
+        r.update(Msg::Finished(Ok(saved.clone())));
+        assert_eq!(r.phase, Phase::Flash(saved.clone()));
+        let w = r.window_state();
+        assert!(w.visible && w.bare && w.always_on_top && w.passive, "over everything, without taking the keyboard");
+        assert_eq!((w.position, w.size), (Some(Point::new(screen.x, screen.y)), Some(Size::new(screen.w, screen.h))), "the whole screen");
+        assert!(w.hidden_from_capture, "and it must not show up in the next picture");
+        let bright = r.flash_strength();
+        assert!(bright > 0.3, "starts strong: {bright}");
+        // Part-way through it has faded, and it is still a flash.
+        r.flash_from = Some(Instant::now() - FLASH / 2);
+        r.update(Msg::FlashTick);
+        assert!(matches!(r.phase, Phase::Flash(_)) && r.flash_strength() < bright / 2.0);
+        // When it is over, the news is given. With no NeoShell to show it,
+        // NeoCap's own window does.
+        r.flash_from = Some(Instant::now() - FLASH);
+        r.update(Msg::FlashTick);
+        assert_eq!(r.phase, Phase::Done(saved));
+        assert!(r.window_state().visible && !r.window_state().passive);
+    }
+
+    #[test]
+    fn with_motion_reduced_there_is_no_flash_and_recordings_never_flash() {
+        let saved = Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO };
+        let mut r = recorder();
+        r.desktop.appearance.reduce_motion = true;
+        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
+        r.update(Msg::Finished(Ok(saved.clone())));
+        assert_eq!(r.phase, Phase::Done(saved));
+        // A recording has a length, and goes straight to its window.
+        let mut r = recorder();
+        r.desktop.appearance.reduce_motion = false;
+        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
+        let film = Saved { path: "/tmp/film.mov".into(), bytes: 10, length: Duration::from_secs(3) };
+        r.update(Msg::Finished(Ok(film.clone())));
+        assert_eq!(r.phase, Phase::Done(film));
     }
 
     #[test]
