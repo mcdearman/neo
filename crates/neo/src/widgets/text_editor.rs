@@ -53,6 +53,12 @@ pub struct TextEditor<M> {
     on_lens: Option<Box<dyn Fn(usize, usize) -> M>>,
     /// Each lens's labels as laid out.
     lens_rows: Vec<Vec<TextLayout>>,
+    /// Lines with a breakpoint on them, and what to say when the margin
+    /// beside a line is clicked.
+    breakpoints: Vec<usize>,
+    on_margin: Option<Box<dyn Fn(usize) -> M>>,
+    /// The line a program being debugged is stopped at.
+    stopped: Option<usize>,
     /// The word marked as somewhere to jump from, and its length.
     jump: Option<(Pos, usize)>,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
@@ -95,6 +101,9 @@ impl<M> TextEditor<M> {
             lenses: vec![],
             on_lens: None,
             lens_rows: vec![],
+            breakpoints: vec![],
+            on_margin: None,
+            stopped: None,
             jump: None,
             on_popup_key: None,
             popup_rows: vec![],
@@ -176,6 +185,20 @@ impl<M> TextEditor<M> {
         lenses.dedup_by_key(|l| l.line);
         self.lenses = lenses;
         self.on_lens = Some(Box::new(on_lens));
+        self
+    }
+
+    /// Marks lines with a dot in the margin, as breakpoints are, and
+    /// calls back with the line when the margin beside one is clicked.
+    pub fn breakpoints(mut self, lines: Vec<usize>, on_margin: impl Fn(usize) -> M + 'static) -> Self {
+        self.breakpoints = lines;
+        self.on_margin = Some(Box::new(on_margin));
+        self
+    }
+
+    /// Marks the line a program being debugged is stopped at.
+    pub fn stopped_at(mut self, line: Option<usize>) -> Self {
+        self.stopped = line.filter(|l| *l < self.lines.len());
         self
     }
 
@@ -703,6 +726,12 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let y = self.line_y(b, scroll, self.first + i);
             cx.scene.text(layout, Point::new(tx.round(), (y + (self.line_h - layout.size().h) * 0.5).round()), default);
         }
+        // The line the program is stopped at, across the whole width.
+        if let Some(line) = self.stopped.filter(|l| self.row(*l).is_some()) {
+            let y = self.line_y(b, scroll, line);
+            let warm = Tone::Warn.resolve(p.text, &p);
+            cx.scene.fill(Rect::new(b.x, y, b.w, self.line_h), 0.0, warm.with_alpha(0.16), None);
+        }
         // Under the word a click would jump from.
         if let Some((at, len)) = self.jump.filter(|(at, _)| self.row(at.line).is_some()) {
             let (x0, x1) = (self.caret_x(at.line, at.col), self.caret_x(at.line, at.col + len));
@@ -773,6 +802,15 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             let color = if current { p.text } else { p.faint };
             let x = b.x + self.gutter_w - GUTTER_PAD - n.size().w;
             cx.scene.text(n, Point::new(x.round(), (y + (self.line_h - n.size().h) * 0.5).round()), color);
+            // A breakpoint is a dot at the margin's edge; where the program
+            // is stopped, a bar.
+            let mid = y + self.line_h * 0.5;
+            if self.breakpoints.contains(&line) {
+                cx.scene.fill(Rect::new(b.x + 3.0, (mid - 4.0).round(), 8.0, 8.0), 4.0, Tone::Bad.resolve(p.text, &p), None);
+            }
+            if self.stopped == Some(line) {
+                cx.scene.fill(Rect::new(b.x, y + 2.0, 3.0, self.line_h - 4.0), 1.5, Tone::Warn.resolve(p.text, &p), None);
+            }
         }
 
         // Scrollbars.
@@ -918,6 +956,14 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
             Event::PointerPressed { pos, button: PointerButton::Primary } => {
                 if !b.contains(*pos) {
                     return Status::Ignored;
+                }
+                // The margin sets and clears breakpoints.
+                if let (Some(on_margin), true) = (&self.on_margin, b.contains(*pos) && pos.x <= b.x + self.gutter_w) {
+                    let (line, lens) = self.line_at(pos.y - b.y - PAD_Y + scroll.y);
+                    if !lens && line < self.lines.len() {
+                        cx.emit(on_margin(line));
+                    }
+                    return Status::Captured;
                 }
                 // A lens is a button, not somewhere to put the caret.
                 if let (Some((k, i)), Some(on_lens)) = (self.lens_at(b, scroll, *pos), &self.on_lens) {

@@ -50,6 +50,9 @@ pub fn encode(k: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         Key::Delete => tilde(3),
         Key::PageUp => tilde(5),
         Key::PageDown => tilde(6),
+        // What an xterm sends for the function keys.
+        Key::F(n @ 1..=4) => format!("\x1bO{}", (b'P' + n - 1) as char).into_bytes(),
+        Key::F(n) => tilde(*[15, 17, 18, 19, 20, 21, 23, 24].get((*n as usize).wrapping_sub(5))?),
         Key::Character(c) if k.modifiers.ctrl => {
             let ch = c.chars().next()?;
             let b = match ch {

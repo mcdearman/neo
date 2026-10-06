@@ -471,7 +471,7 @@ impl NeoCode {
                     client.execute(&lens.command, &lens.arguments);
                 }
             }
-            LensAction::Debug => self.toast = Some("NeoCode has no debugger yet, so Debug can't start one.".into()),
+            LensAction::Debug => self.debug_lens(&lens, program),
             LensAction::Unknown => self.toast = Some(format!("NeoCode doesn't know how to do \"{}\" yet ({}).", crate::runner::label(&lens.title), lens.command)),
         }
     }

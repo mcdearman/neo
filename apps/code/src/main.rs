@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod dap;
+mod debug;
 mod intel;
 mod lsp;
 mod runner;
@@ -231,6 +233,17 @@ struct NeoCode {
     config: Option<PathBuf>,
     /// The folders opened lately, for the File menu.
     recent: Vec<PathBuf>,
+    /// The program being debugged, if one is.
+    debug: Option<debug::Session>,
+    debugs: u64,
+    /// Where the breakpoints are: by file, lines from zero, in order.
+    breakpoints: std::collections::HashMap<PathBuf, Vec<usize>>,
+    /// A function to debug that is waiting for its arguments.
+    asking: Option<debug::Asking>,
+    /// The arguments last given to each function debugged.
+    debug_args: std::collections::HashMap<(PathBuf, String), String>,
+    /// The Meadow program that last offered to debug something.
+    meadow: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +279,17 @@ enum Msg {
     /// Open `settings.json` to edit.
     OpenSettings,
     OpenRecent(PathBuf),
+    /// The margin beside this line was clicked: set or clear a breakpoint.
+    Margin(usize),
+    Debug(debug::Step),
+    /// Word from the debugger with this number.
+    Dap(u64, dap::Incoming),
+    DebugBuilt(u64, Result<debug::DebugSpec, String>),
+    DebugFrame(usize),
+    DebugRow(usize),
+    DebugAskTyped(String),
+    DebugAskGo,
+    DebugAskCancel,
     /// The lens on this line, and which of its labels, was clicked.
     Lens(usize, usize),
     /// A line printed by what is running, and how it ended.
@@ -296,7 +320,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![] };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -337,7 +361,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![] }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -594,6 +618,19 @@ impl NeoCode {
             Msg::Point(word) => self.point(word),
             Msg::HoverTick => self.hover_rested(),
             Msg::Lens(line, index) => self.lens_chosen(line, index),
+            Msg::Margin(line) => self.toggle_breakpoint(line),
+            Msg::Debug(step) => self.debug_step(step),
+            Msg::Dap(id, incoming) => self.debug_incoming(id, incoming),
+            Msg::DebugBuilt(id, result) => self.debug_built(id, result),
+            Msg::DebugFrame(i) => self.debug_frame(i),
+            Msg::DebugRow(i) => self.debug_row(i),
+            Msg::DebugAskTyped(typed) => {
+                if let Some(ask) = &mut self.asking {
+                    ask.typed = typed;
+                }
+            }
+            Msg::DebugAskGo => self.debug_asked(),
+            Msg::DebugAskCancel => self.asking = None,
             Msg::RunSaid(id, line) => {
                 if let Some(run) = self.run.as_mut().filter(|r| r.id == id) {
                     run.push(&line);
@@ -744,11 +781,38 @@ impl App for NeoCode {
                 .push(MenuEntry::new("Show Hover", Msg::Ask(intel::Ask::Hover)).shortcut(Shortcut::command("i")).enabled(served))
                 .push(MenuEntry::new("Go to Definition", Msg::Ask(intel::Ask::Definition)).shortcut(Shortcut::command("g")).enabled(served))
                 .push(MenuEntry::new("Complete", Msg::Ask(intel::Ask::Complete)).shortcut(Shortcut::command(".")).enabled(served)),
+            {
+                let (going, stopped) = (self.debug.as_ref().is_some_and(|d| !d.over()), self.debug.as_ref().is_some_and(|d| d.stopped()));
+                Menu::new("Debug")
+                    .push(MenuEntry::new(if going { "Continue  (F5)" } else { "Start Debugging  (F5)" }, Msg::Debug(debug::Step::Go)).enabled(file_open && (!going || stopped)))
+                    .push(MenuEntry::new("Pause  (F6)", Msg::Debug(debug::Step::Pause)).enabled(going && !stopped))
+                    .push(MenuEntry::new("Stop  (Shift+F5)", Msg::Debug(debug::Step::Stop)).enabled(self.debug.is_some()))
+                    .separator()
+                    .push(MenuEntry::new("Step Over  (F10)", Msg::Debug(debug::Step::Over)).enabled(stopped))
+                    .push(MenuEntry::new("Step Into  (F11)", Msg::Debug(debug::Step::In)).enabled(stopped))
+                    .push(MenuEntry::new("Step Out  (Shift+F11)", Msg::Debug(debug::Step::Out)).enabled(stopped))
+                    .separator()
+                    .push(MenuEntry::new("Toggle Breakpoint  (F9)", Msg::Margin(self.active_tab().map_or(0, |t| t.doc.cursor().line))).enabled(file_open))
+            },
             keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
         ]
     }
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
+        // The debugger's keys, as everywhere: F5 to go, F10 and F11 to step.
+        if let Key::F(n) = k.key {
+            let line = self.active_tab().map(|t| t.doc.cursor().line);
+            return match (n, k.modifiers.shift) {
+                (5, false) => Some(Msg::Debug(debug::Step::Go)),
+                (5, true) => Some(Msg::Debug(debug::Step::Stop)),
+                (6, _) => Some(Msg::Debug(debug::Step::Pause)),
+                (9, _) => line.map(Msg::Margin),
+                (10, _) => Some(Msg::Debug(debug::Step::Over)),
+                (11, false) => Some(Msg::Debug(debug::Step::In)),
+                (11, true) => Some(Msg::Debug(debug::Step::Out)),
+                _ => None,
+            };
+        }
         if !k.modifiers.command() {
             return None;
         }
@@ -846,7 +910,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).font_size(self.settings.font_size).lenses(self.editor_lenses(t), Msg::Lens).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).font_size(self.settings.font_size).lenses(self.editor_lenses(t), Msg::Lens).breakpoints(self.breakpoints_in(t), Msg::Margin).stopped_at(self.stopped_in(t)).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -867,7 +931,13 @@ impl NeoCode {
             .into(),
         };
         let mut col = column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor);
-        if let Some(run) = &self.run {
+        // One panel under the editor: a question before debugging, the
+        // debugger, or what was last run.
+        if let Some(ask) = &self.asking {
+            col = col.push(Divider::horizontal()).push(self.asking_panel(ask));
+        } else if let Some(session) = &self.debug {
+            col = col.push(Divider::horizontal()).push(self.debug_panel(session, surface));
+        } else if let Some(run) = &self.run {
             col = col.push(Divider::horizontal()).push(self.run_panel(run, surface));
         }
         col.into()
@@ -1334,11 +1404,11 @@ mod tests {
         let key = KeyEvent { key: Key::Character("o".into()), pressed: true, repeat: false, modifiers: cmd, text: None };
         let menus = app.menus();
         let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, ["File", "Edit", "Go", "View"]);
+        assert_eq!(titles, ["File", "Edit", "Go", "Debug", "View"]);
         let open = &menus[0].entries[0];
         assert!(matches!(open.message, Some(Msg::OpenFolder)) && open.shortcut.as_ref().unwrap().matches(&key));
         // The current keys are ticked in the View menu.
-        assert!(menus[3].entries.iter().any(|e| e.label == "✓ Vim Keys"));
+        assert!(menus[4].entries.iter().any(|e| e.label == "✓ Vim Keys"));
 
         // Save and Close need a file; they grey out without one.
         let labelled = |app: &NeoCode, label: &str| app.menus()[0].entries.iter().find(|e| e.label == label).unwrap().message.is_some();
@@ -1809,6 +1879,130 @@ mod tests {
     }
 
     #[test]
+    fn a_program_is_debugged_with_breakpoints_steps_and_a_look_at_its_variables() {
+        let dir = project("debugging");
+        std::fs::write(dir.join("src/lib.rs"), "fn one() {}\nfn two() {\n    one();\n    one();\n}\n").unwrap();
+        std::fs::write(dir.join("src/other.rs"), "fn elsewhere() {}\n").unwrap();
+        let mut app = NeoCode::folder(&dir);
+        let root = app.root.clone().unwrap();
+        let (file, other) = (root.join("src/lib.rs"), root.join("src/other.rs"));
+        let lib = app.nodes.iter().position(|n| n.name == "lib.rs").unwrap();
+        app.update(Msg::Open(lib));
+        let mut h = Harness::new(app, Size::new(1280.0, 820.0)).unwrap();
+        // Breakpoints are set and cleared from the margin, or with F9.
+        h.app_mut().update(Msg::Margin(3));
+        h.app_mut().update(Msg::Margin(1));
+        h.app_mut().update(Msg::Margin(3));
+        assert_eq!(h.app().breakpoints_in(h.app().active_tab().unwrap()), [1]);
+        let plain = h.render(1.0);
+        h.key(Key::F(9), Modifiers::default());
+        assert_eq!(h.app().breakpoints[&file], [0, 1], "F9: the caret's line");
+        assert!(h.render(1.0) != plain, "a breakpoint shows in the margin");
+
+        // A session, with the test playing the adapter.
+        let sink = Sink::default();
+        let known: Vec<(PathBuf, Vec<usize>)> = h.app().breakpoints.iter().map(|(p, l)| (p.clone(), l.clone())).collect();
+        h.app_mut().debug_with("debug two", crate::dap::Dap::new(Box::new(sink.clone()), json!({ "program": "x" }), known));
+        let id = h.app().debug.as_ref().unwrap().id;
+        let says = |h: &mut Harness<NeoCode>, message: Value| h.app_mut().update(Msg::Dap(id, crate::dap::Incoming::Message(message)));
+        let answer = |sent: &Value, body: Value| json!({ "type": "response", "request_seq": sent["seq"], "command": sent["command"], "success": true, "body": body });
+        let hello = sink.take();
+        says(&mut h, answer(&hello[0], json!({})));
+        says(&mut h, json!({ "type": "event", "event": "initialized" }));
+        let setup = sink.take();
+        assert_eq!(setup.iter().map(|m| m["command"].as_str().unwrap()).collect::<Vec<_>>(), ["launch", "setBreakpoints", "configurationDone"]);
+        assert_eq!(setup[1]["arguments"]["breakpoints"], json!([{ "line": 1 }, { "line": 2 }]));
+        // The adapter moves one to where it can go, and the margin follows.
+        says(&mut h, answer(&setup[1], json!({ "breakpoints": [{ "line": 1, "verified": true }, { "line": 3, "verified": true }] })));
+        assert_eq!(h.app().breakpoints[&file], [0, 2]);
+        says(&mut h, answer(&setup[2], json!({})));
+        assert_eq!(h.app().debug.as_ref().unwrap().state, debug::State::Running);
+        let running = h.render(1.0);
+
+        // It stops: the stack is asked for, the place shown, the locals fetched.
+        says(&mut h, json!({ "type": "event", "event": "stopped", "body": { "reason": "breakpoint", "threadId": 1 } }));
+        let ask = sink.take();
+        says(&mut h, answer(&ask[0], json!({ "stackFrames": [{ "id": 5, "name": "two", "line": 3, "source": { "path": file } }, { "id": 6, "name": "elsewhere", "line": 1, "source": { "path": other } }, { "id": 7, "name": "<runtime>", "line": 0 }] })));
+        let session = h.app().debug.as_ref().unwrap();
+        assert_eq!((session.summary().as_str(), session.frames.len(), session.frame), ("stopped: breakpoint", 3, 0));
+        assert_eq!(h.app().stopped_in(h.app().active_tab().unwrap()), Some(2));
+        assert_eq!(h.app().active_tab().unwrap().doc.cursor().line, 2, "the caret goes to where it stopped");
+        assert!(h.render(1.0) != running, "the line and the stack show");
+        let ask = sink.take();
+        assert_eq!((ask[0]["command"].as_str(), ask[0]["arguments"]["frameId"].as_i64()), (Some("scopes"), Some(5)));
+        says(&mut h, answer(&ask[0], json!({ "scopes": [{ "name": "Locals", "variablesReference": 1, "expensive": false }, { "name": "Heap", "variablesReference": 2, "expensive": true }] })));
+        let ask = sink.take();
+        assert_eq!(ask.len(), 1, "only what is cheap is fetched unasked");
+        says(&mut h, answer(&ask[0], json!({ "variables": [{ "name": "n", "value": "7", "type": "Int", "variablesReference": 0 }, { "name": "xs", "value": "[1; 2]", "variablesReference": 9 }] })));
+        let names = |h: &Harness<NeoCode>| h.app().debug.as_ref().unwrap().rows.iter().map(|r| (r.depth, r.name.clone(), r.value.clone())).collect::<Vec<_>>();
+        assert_eq!(names(&h), [(0, "Locals".into(), String::new()), (1, "n".into(), "7".into()), (1, "xs".into(), "[1; 2]".into()), (0, "Heap".into(), String::new())]);
+        // Opening a variable with parts fetches them; closing takes them away.
+        h.app_mut().update(Msg::DebugRow(2));
+        let ask = sink.take();
+        assert_eq!(ask[0]["arguments"]["variablesReference"], 9);
+        says(&mut h, answer(&ask[0], json!({ "variables": [{ "name": "0", "value": "1", "variablesReference": 0 }, { "name": "1", "value": "2", "variablesReference": 0 }] })));
+        assert_eq!(names(&h).iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(), [(0, "Locals"), (1, "n"), (1, "xs"), (2, "0"), (2, "1"), (0, "Heap")]);
+        h.app_mut().update(Msg::DebugRow(2));
+        assert_eq!(names(&h).len(), 4);
+        h.app_mut().update(Msg::DebugRow(1));
+        assert!(sink.take().is_empty(), "nothing inside a plain value");
+
+        // Another frame: its file opens at its line, and its variables are asked for.
+        h.app_mut().update(Msg::DebugFrame(1));
+        assert_eq!((h.app().active_tab().unwrap().name.as_str(), h.app().stopped_in(h.app().active_tab().unwrap())), ("other.rs", Some(0)));
+        assert_eq!(sink.take()[0]["arguments"]["frameId"], 6);
+        // The keys step, and a breakpoint set now is sent at once.
+        for (key, shift, command) in [(10, false, "next"), (11, false, "stepIn"), (11, true, "stepOut"), (5, false, "continue")] {
+            h.key(Key::F(key), Modifiers { shift, ..Default::default() });
+            assert_eq!(sink.take()[0]["command"], command);
+        }
+        h.app_mut().update(Msg::Margin(0));
+        let sent = sink.take();
+        assert_eq!((sent[0]["command"].as_str(), &sent[0]["arguments"]["source"]["path"]), (Some("setBreakpoints"), &json!(other)));
+        // Carrying on clears what was shown of the stopped program.
+        says(&mut h, json!({ "type": "event", "event": "continued", "body": { "threadId": 1 } }));
+        let session = h.app().debug.as_ref().unwrap();
+        assert!(session.frames.is_empty() && session.rows.is_empty() && session.state == debug::State::Running);
+        h.key(Key::F(10), Modifiers::default());
+        assert!(sink.take().is_empty(), "no stepping while it runs");
+        // What it prints is kept, and its end is reported.
+        says(&mut h, json!({ "type": "event", "event": "output", "body": { "category": "stdout", "output": "hello\nworld\n" } }));
+        says(&mut h, json!({ "type": "event", "event": "exited", "body": { "exitCode": 0 } }));
+        let session = h.app().debug.as_ref().unwrap();
+        assert_eq!((session.output.text().as_str(), session.summary().as_str()), ("hello\nworld", "finished"));
+        assert!(h.app().stopped_in(h.app().active_tab().unwrap()).is_none());
+        h.key(Key::F(5), Modifiers { shift: true, ..Default::default() });
+        assert!(h.app().debug.is_none());
+    }
+
+    #[test]
+    fn a_function_with_arguments_asks_for_them_before_debugging() {
+        let mut s = Served::new("debug-ask", "pub fn one() {}\n");
+        let file = s.file.clone();
+        let lens = |name: &str, params: u64| crate::lsp::Lens { line: 0, title: "▶ Debug".into(), command: "meadow.debugFunction".into(), arguments: json!([{ "uri": crate::lsp::client::uri(&file), "name": name, "params": params, "signature": "Int -> Bool", "line": 0 }]) };
+        let plain = s.h.render(1.0);
+        s.h.app_mut().debug_lens(&lens("isPrime", 1), Some("/opt/meadow".into()));
+        assert!(s.h.app().debug.is_none(), "not yet");
+        assert_eq!(s.h.app().asking.as_ref().map(|a| (a.name.as_str(), a.typed.as_str())), Some(("isPrime", "")));
+        assert!(s.h.render(1.0) != plain, "the question shows");
+        // Typed and entered: it starts on that expression.
+        s.h.type_text("7");
+        assert_eq!(s.h.app().asking.as_ref().unwrap().typed, "7", "the field has the keyboard");
+        s.h.key(Key::Enter, Modifiers::default());
+        assert!(s.h.app().asking.is_none());
+        assert_eq!(s.h.app().debug.as_ref().map(|d| d.title.as_str()), Some("debug isPrime 7"));
+        // Asked again, the same arguments are offered; Escape backs out.
+        s.h.app_mut().update(Msg::Debug(debug::Step::Stop));
+        s.h.app_mut().debug_lens(&lens("isPrime", 1), None);
+        assert_eq!(s.h.app().asking.as_ref().unwrap().typed, "7");
+        s.h.app_mut().update(Msg::DebugAskCancel);
+        assert!(s.h.app().asking.is_none() && s.h.app().debug.is_none());
+        // One that takes none starts at once.
+        s.h.app_mut().debug_lens(&lens("main", 0), None);
+        assert_eq!(s.h.app().debug.as_ref().map(|d| d.title.as_str()), Some("debug main"));
+    }
+
+    #[test]
     fn lenses_show_above_their_lines_and_run_what_they_offer() {
         let mut s = Served::new("lsp-lens", "pub fn one() {}\n\n#[test]\nfn adds() {\n    assert_eq!(1 + 1, 2);\n}\n");
         let ask = s.request("textDocument/codeLens");
@@ -1851,8 +2045,15 @@ mod tests {
         // Debug says there is no debugger; a command the server runs is
         // sent to it; one nobody knows says so.
         s.sent();
+        // Debug builds it first, to debug with lldb-dap, or says that is missing.
+        s.h.app_mut().toast = None;
         s.h.app_mut().update(Msg::Lens(3, 1));
-        assert!(s.h.app().toast.as_deref().is_some_and(|t| t.contains("no debugger")));
+        match &s.h.app().debug {
+            Some(session) => assert_eq!((session.title.as_str(), session.summary().as_str()), ("debug test adds", "building…")),
+            None => assert!(s.h.app().toast.as_deref().is_some_and(|t| t.contains("lldb-dap"))),
+        }
+        s.h.app_mut().update(Msg::Debug(debug::Step::Stop));
+        assert!(s.h.app().debug.is_none());
         s.h.app_mut().update(Msg::Lens(3, 2));
         let sent = s.request("workspace/executeCommand");
         assert_eq!(sent["params"], json!({ "command": "tool.tidy", "arguments": ["x"] }));
@@ -2107,6 +2308,58 @@ mod tests {
                 Some(run) => println!("ran: {}\n{}\n-> {}", run.spec.line(), run.output.text(), run.summary()),
                 None => println!("nothing ran; message: {:?}", h.app().toast),
             }
+        }
+        // `NEO_LSP_DEBUG=function|arguments|line` debugs that function with
+        // a breakpoint on that line (from one), steps once, and carries on.
+        if let Ok(wanted) = std::env::var("NEO_LSP_DEBUG") {
+            let mut parts = wanted.split('|');
+            let (function, arguments, line) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().and_then(|l| l.parse::<usize>().ok()));
+            let lens = h.app().active_tab().and_then(|t| t.lenses.iter().find(|l| l.command.contains("debug") && (l.arguments[0]["name"] == function || l.arguments[0]["label"].as_str().is_some_and(|label| label.contains(function)))).cloned()).expect("a Debug lens for that function");
+            h.app_mut().runs_commands = true;
+            if let Some(line) = line {
+                h.app_mut().update(Msg::Margin(line - 1));
+            }
+            let server = h.app().active_tab().and_then(|t| t.server).and_then(|s| h.app().servers.clients.get(s)).and_then(|(_, c)| c.program.clone());
+            h.app_mut().debug_lens(&lens, server);
+            if h.app().asking.is_some() {
+                h.app_mut().update(Msg::DebugAskTyped(arguments.into()));
+                h.app_mut().update(Msg::DebugAskGo);
+            }
+            let wait = |h: &mut Harness<NeoCode>, what: &str, done: &dyn Fn(&NeoCode) -> bool| {
+                let until = std::time::Instant::now() + Duration::from_secs(240);
+                while std::time::Instant::now() < until && !done(h.app()) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    h.advance(Duration::from_millis(100));
+                }
+                let d = h.app().debug.as_ref();
+                println!("{what}: {:?}; message: {:?}", d.map(|d| d.summary()), h.app().toast);
+                for f in d.map(|d| d.frames.clone()).unwrap_or_default().iter().take(4) {
+                    println!("    frame {} at {:?}:{}", f.name, f.path.as_ref().and_then(|p| p.file_name()), f.line + 1);
+                }
+                for r in d.map(|d| d.rows.clone()).unwrap_or_default().iter().take(8) {
+                    println!("    {}{} = {} {:?}", "  ".repeat(r.depth), r.name, r.value, r.kind);
+                }
+            };
+            let stopped_with_rows = |a: &NeoCode| a.debug.as_ref().is_none_or(|d| d.over() || (d.stopped() && d.rows.iter().any(|r| r.depth > 0)));
+            wait(&mut h, "first stop", &stopped_with_rows);
+            if let Some(out) = std::env::var_os("NEO_SNAPSHOT_DIR") {
+                h.app_mut().toast = None;
+                h.save_png(PathBuf::from(out).join("code-debug.png"), 1.0).unwrap();
+            }
+            for (name, step) in [("after Step Over", debug::Step::Over), ("after Continue", debug::Step::Go), ("after another Continue", debug::Step::Go)] {
+                if h.app().debug.as_ref().is_some_and(|d| d.stopped()) {
+                    h.app_mut().update(Msg::Debug(step));
+                    // Give the step a moment to be answered, then wait for
+                    // where it comes to rest.
+                    for _ in 0..15 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        h.advance(Duration::from_millis(100));
+                    }
+                    wait(&mut h, name, &stopped_with_rows);
+                }
+            }
+            println!("printed:\n{}", h.app().debug.as_ref().map(|d| d.output.text()).unwrap_or_default());
+            h.app_mut().update(Msg::Debug(debug::Step::Stop));
         }
         // `NEO_LSP_HOVER=line:col` (from zero) rests the mouse there first.
         if let Some((line, col)) = std::env::var("NEO_LSP_HOVER").ok().and_then(|at| at.split_once(':').and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))) {
