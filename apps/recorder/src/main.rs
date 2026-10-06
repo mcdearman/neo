@@ -86,6 +86,8 @@ enum Phase {
     Starting(Target),
     /// The window has been told to hide; the screenshot is taken once it is gone.
     Shooting(Target),
+    /// The system's crosshair is up for the user to drag out an area.
+    Picking,
     Recording,
     Saving,
     Done(Saved),
@@ -134,6 +136,9 @@ struct Recorder {
     auto_shot: bool,
     /// A screenshot has been asked for and has not come back yet.
     shot_in_flight: bool,
+    /// The drag-to-select in progress, to take down if the user asks for
+    /// NeoCap's window instead.
+    picker: Option<capture::Picker>,
     /// Kept alive after a screenshot is copied: on Linux the picture stays
     /// on the clipboard only while its owner is running.
     clipboard: Option<arboard::Clipboard>,
@@ -172,6 +177,11 @@ enum Msg {
     Finished(Result<Saved, String>),
     Hotkey,
     ScreenshotHotkey,
+    /// `S` pressed while dragging out a screenshot: show NeoCap's window
+    /// for its other choices instead.
+    PickMore,
+    /// The drag-to-select ended: with a picture, an error, or neither.
+    Picked(Option<Result<Saved, String>>),
     Tray(TrayAction),
     Autostart(bool),
     /// Whether this app's window is glass when the desktop's windows are.
@@ -264,6 +274,7 @@ impl Recorder {
             auto_record: false,
             auto_shot: false,
             shot_in_flight: false,
+            picker: None,
             clipboard: None,
             copied: None,
             copy_shots: register_hotkey,
@@ -367,6 +378,49 @@ impl Recorder {
     }
 }
 
+impl Recorder {
+    /// The key that, pressed while dragging out a screenshot, opens
+    /// NeoCap's window instead. It is a plain letter, so it is claimed only
+    /// for as long as the crosshair is up.
+    fn more_key() -> HotKey {
+        HotKey::new(None, Code::KeyS)
+    }
+
+    /// Hands over to the system's drag-to-select. Returns false if that
+    /// could not be started, so the caller can fall back to the frame.
+    fn start_pick(&mut self) -> bool {
+        // Without an event loop there is nothing to report back to, which
+        // is how tests run: they stand in for the crosshair themselves.
+        if let Some(proxy) = self.proxy.clone() {
+            let name = format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"));
+            match capture::pick(&self.shots_dir.join(name), move |result| {
+                proxy.send(Msg::Picked(result));
+            }) {
+                Ok(picker) => self.picker = Some(picker),
+                Err(_) => return false,
+            }
+        }
+        if let Some(keys) = &self.hotkeys {
+            let _ = keys.register(Self::more_key());
+        }
+        self.intent = Intent::Screenshot;
+        self.shown = false;
+        self.phase = Phase::Picking;
+        true
+    }
+
+    /// Takes the crosshair down if it is up, and gives `S` back to
+    /// whatever the user types next.
+    fn end_pick(&mut self) {
+        if let Some(picker) = self.picker.take() {
+            picker.cancel();
+        }
+        if let Some(keys) = &self.hotkeys {
+            let _ = keys.unregister(Self::more_key());
+        }
+    }
+}
+
 impl App for Recorder {
     type Message = Msg;
 
@@ -427,11 +481,18 @@ impl App for Recorder {
         let hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyR);
         let shot_hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyS);
         let shot_id = shot_hotkey.id();
+        let more_id = Self::more_key().id();
         match GlobalHotKeyManager::new().and_then(|m| m.register_all(&[hotkey, shot_hotkey]).map(|_| m)) {
             Ok(manager) => {
                 GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
                     if e.state() == HotKeyState::Pressed {
-                        proxy.send(if e.id() == shot_id { Msg::ScreenshotHotkey } else { Msg::Hotkey });
+                        proxy.send(if e.id() == more_id {
+                            Msg::PickMore
+                        } else if e.id() == shot_id {
+                            Msg::ScreenshotHotkey
+                        } else {
+                            Msg::Hotkey
+                        });
                     }
                 }));
                 self.hotkeys = Some(manager);
@@ -511,7 +572,7 @@ impl Recorder {
                             self.shown = true;
                         }
                     }
-                    Phase::Starting(_) | Phase::Shooting(_) | Phase::Saving => {}
+                    Phase::Starting(_) | Phase::Shooting(_) | Phase::Picking | Phase::Saving => {}
                 },
                 TrayAction::ToggleAutostart => self.apply(Msg::Autostart(!self.autostart)),
                 TrayAction::Quit => self.apply(Msg::Quit),
@@ -639,6 +700,34 @@ impl Recorder {
                     }
                 }
             },
+            // Pressed again while dragging: the same as `S`.
+            Msg::ScreenshotHotkey if self.phase == Phase::Picking => self.apply(Msg::PickMore),
+            // The shortcut goes straight to the mouse: drag out an area and
+            // let go. Where the system has no drag-to-select of its own, or
+            // its tool is missing, the frame below stands in.
+            Msg::ScreenshotHotkey if capture::can_pick() && matches!(self.phase, Phase::Idle | Phase::Done(_) | Phase::Failed(_)) && self.start_pick() => {}
+            Msg::PickMore => {
+                if self.phase == Phase::Picking {
+                    // The crosshair goes, and the picture it never took is not waited for.
+                    self.end_pick();
+                    self.phase = Phase::Idle;
+                    self.mode = Mode::Screen;
+                    self.intent = Intent::Screenshot;
+                    self.shown = true;
+                    self.apply(Msg::Refresh);
+                }
+            }
+            Msg::Picked(result) => {
+                // Word from a crosshair that was since taken down is stale.
+                if self.phase == Phase::Picking {
+                    self.end_pick();
+                    match result {
+                        Some(result) => self.apply(Msg::Finished(result)),
+                        // Backed out with Escape: nothing happened.
+                        None => self.phase = Phase::Idle,
+                    }
+                }
+            }
             Msg::ScreenshotHotkey => {
                 // Not while something is being recorded or saved.
                 if matches!(self.phase, Phase::Idle | Phase::Done(_) | Phase::Failed(_)) {
@@ -654,6 +743,7 @@ impl Recorder {
             }
             Msg::Hide => self.shown = false,
             Msg::Quit => {
+                self.end_pick();
                 // Finish the file rather than leave a broken one behind.
                 if let Some(session) = self.session.take() {
                     let _ = session.finish(self.gif);
@@ -708,7 +798,7 @@ impl Recorder {
         let body: Element<Msg> = match &self.phase {
             Phase::Idle => self.chooser(),
             // Shown as the recording bar instead; see `recording_bar`.
-            Phase::Starting(_) | Phase::Recording | Phase::Shooting(_) => Space::fill_y().into(),
+            Phase::Starting(_) | Phase::Recording | Phase::Shooting(_) | Phase::Picking => Space::fill_y().into(),
             Phase::Saving => status(icons::VIDEO, Tone::Accent, "Saving…".into(), if self.gif { "Making the GIF. Long recordings take a while.".into() } else { String::new() }, row()),
             Phase::Done(saved) => {
                 let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -751,6 +841,7 @@ fn mode_switch(mode: Mode) -> Element<Msg> {
 impl Recorder {
     fn shortcut_hint(&self) -> String {
         match &self.hotkey_error {
+            None if self.hotkeys.is_some() && capture::can_pick() => format!("{SHORTCUT} records an area. {SHOT_SHORTCUT} takes a screenshot: drag out an area, or press S for this window."),
             None if self.hotkeys.is_some() => format!("{SHORTCUT} records an area; {SHOT_SHORTCUT} takes a screenshot."),
             Some(e) => format!("The {SHORTCUT} shortcut is unavailable: {e}"),
             None => String::new(),
@@ -1244,26 +1335,75 @@ mod tests {
     }
 
     #[test]
-    fn the_screenshot_shortcut_frames_an_area_and_hides_to_shoot() {
+    fn the_screenshot_shortcut_goes_straight_to_dragging_out_an_area() {
+        if !capture::can_pick() {
+            return;
+        }
         let mut r = recorder();
         r.shown = false;
         r.update(Msg::ScreenshotHotkey);
-        let s = r.window_state();
-        assert!(s.visible && s.bare && r.mode == Mode::Area && r.intent == Intent::Screenshot);
-        // Enter now takes a screenshot, not a recording.
-        let enter = KeyEvent { key: Key::Enter, pressed: true, repeat: false, modifiers: Default::default(), text: None };
-        assert!(matches!(r.on_key(&enter), Some(Msg::Screenshot)));
-        r.update(Msg::Geometry(geometry(Rect::new(100.0, 50.0, 600.0, 400.0))));
-        r.update(Msg::Screenshot);
-        assert!(matches!(r.phase, Phase::Shooting(Target::Area(_))));
-        assert!(!r.window_state().visible, "the frame gets out of the picture");
-        // The recording shortcut switches the frame back to recording.
+        assert_eq!(r.phase, Phase::Picking);
+        assert!(!r.window_state().visible, "no window: just the mouse");
+        // Letting go with an area dragged out gives a picture, like any screenshot.
+        let saved = Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO };
+        r.update(Msg::Picked(Some(Ok(saved.clone()))));
+        assert_eq!(r.phase, Phase::Done(saved));
+        assert!(r.window_state().visible);
+        // Escape backs out, and nothing appears.
+        let mut r = recorder();
+        r.shown = false;
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::Picked(None));
+        assert_eq!(r.phase, Phase::Idle);
+        assert!(!r.window_state().visible);
+        // The system refusing is an error to show.
         let mut r = recorder();
         r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::Picked(Some(Err("no permission".into()))));
+        assert_eq!(r.phase, Phase::Failed("no permission".into()));
+    }
+
+    #[test]
+    fn s_while_dragging_opens_the_window_for_other_choices() {
+        if !capture::can_pick() {
+            return;
+        }
+        for again in [Msg::PickMore, Msg::ScreenshotHotkey] {
+            let mut r = recorder();
+            r.shown = false;
+            r.update(Msg::ScreenshotHotkey);
+            r.update(again);
+            let s = r.window_state();
+            assert!(s.visible && !s.bare, "the whole window, not the frame");
+            assert_eq!((r.phase.clone(), r.mode, r.intent), (Phase::Idle, Mode::Screen, Intent::Screenshot));
+            // Enter there takes a screenshot, not a recording.
+            let enter = KeyEvent { key: Key::Enter, pressed: true, repeat: false, modifiers: Default::default(), text: None };
+            assert!(matches!(r.on_key(&enter), Some(Msg::Screenshot)));
+            // The crosshair that was taken down reports back later: ignored.
+            r.update(Msg::Picked(None));
+            assert!(r.window_state().visible && r.phase == Phase::Idle);
+            // And pressing the shortcut from the window starts over with the mouse.
+            r.update(Msg::ScreenshotHotkey);
+            assert_eq!(r.phase, Phase::Picking);
+        }
+        // `S` at any other time does nothing.
+        let mut r = recorder();
+        r.update(Msg::PickMore);
+        assert_eq!(r.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn the_shortcuts_leave_a_recording_alone() {
+        let mut r = recorder();
+        r.phase = Phase::Recording;
         r.update(Msg::ScreenshotHotkey);
-        assert!(!r.window_state().visible, "pressed again while showing: hide");
+        assert_eq!(r.phase, Phase::Recording, "not while something is being recorded");
+        // The recording shortcut still frames an area to record.
+        let mut r = recorder();
+        r.shown = false;
         r.update(Msg::Hotkey);
-        assert!(r.window_state().visible && r.intent == Intent::Record);
+        let s = r.window_state();
+        assert!(s.visible && s.bare && r.mode == Mode::Area && r.intent == Intent::Record);
     }
 
     #[test]

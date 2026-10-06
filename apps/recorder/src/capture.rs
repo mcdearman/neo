@@ -163,6 +163,82 @@ fn command(target: &Target, options: Options, path: &Path) -> Result<Child, Stri
     spawn(cmd, "ffmpeg", "Install it, for example with `winget install ffmpeg`, and make sure it is on your PATH.")
 }
 
+/// A drag-to-select screenshot in progress: the system's own crosshair is
+/// up, waiting for the user to drag out an area.
+pub struct Picker {
+    child: std::sync::Arc<std::sync::Mutex<Child>>,
+}
+
+impl Picker {
+    /// Takes the crosshair down without a picture being taken.
+    pub fn cancel(&self) {
+        let _ = self.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+    }
+}
+
+/// The command that lets the user drag out an area and saves a picture of it.
+#[cfg(target_os = "macos")]
+fn pick_command(path: &Path) -> Option<Command> {
+    // -i is the same crosshair as the system's own shortcut; -x keeps it silent.
+    let mut cmd = Command::new("screencapture");
+    cmd.args(["-i", "-x"]).arg(path);
+    Some(cmd)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_command(path: &Path) -> Option<Command> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // slurp draws the selection and grim takes the picture of it.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "area=$(slurp) && grim -g \"$area\" \"$0\""]).arg(path);
+        return Some(cmd);
+    }
+    let mut cmd = Command::new("maim");
+    cmd.args(["-s", "-u"]).arg(path);
+    Some(cmd)
+}
+
+#[cfg(windows)]
+fn pick_command(_path: &Path) -> Option<Command> {
+    None
+}
+
+/// Whether the system has a drag-to-select of its own to hand over to.
+pub fn can_pick() -> bool {
+    pick_command(Path::new("probe.png")).is_some()
+}
+
+/// Puts up the system's crosshair for the user to drag out an area, and
+/// saves a picture of it at `path`. `done` is called from another thread
+/// when that ends: with the picture, with an error, or with `None` if the
+/// user backed out or [`Picker::cancel`] was called.
+pub fn pick(path: &Path, done: impl FnOnce(Option<Result<Saved, String>>) + Send + 'static) -> Result<Picker, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    }
+    let mut cmd = pick_command(path).ok_or("Selecting an area with the mouse is not available here.")?;
+    let tool = cmd.get_program().to_string_lossy().into_owned();
+    let child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("Selecting an area needs {tool}: {e}"))?;
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let (watched, path) = (child.clone(), path.to_path_buf());
+    std::thread::spawn(move || {
+        // Polled rather than waited on, so the lock is free for a cancel.
+        loop {
+            match watched.lock().unwrap_or_else(|e| e.into_inner()).try_wait() {
+                Ok(None) => {}
+                _ => break,
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        // No file means no picture was taken: Escape, or a cancel.
+        done(match std::fs::metadata(&path) {
+            Ok(m) if m.len() > 0 => Some(Ok(Saved { path, bytes: m.len(), length: Duration::ZERO })),
+            _ => None,
+        });
+    });
+    Ok(Picker { child })
+}
+
 /// Takes one picture of `target` and saves it as a PNG at `path`. Blocks
 /// for a moment, so call it off the main thread.
 pub fn screenshot(target: &Target, options: Options, path: &Path) -> Result<Saved, String> {
@@ -552,6 +628,26 @@ fn imp_windows() -> Vec<WindowInfo> {
 
 #[cfg(test)]
 mod tests {
+    /// Puts the real crosshair up for a second and takes it down again,
+    /// which no picture should come of. It shows on screen, so it runs only
+    /// when asked for: `cargo test -p neo-recorder -- --ignored crosshair`.
+    #[test]
+    #[ignore]
+    fn the_crosshair_comes_up_and_can_be_taken_down() {
+        let path = std::env::temp_dir().join(format!("neo-pick-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let picker = super::pick(&path, move |r| {
+            let _ = tx.send(r);
+        })
+        .expect("the system's drag-to-select starts");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(900)).is_err(), "it waits for the user");
+        picker.cancel();
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(3)).expect("it ends when cancelled");
+        assert!(ended.is_none(), "and no picture was taken");
+        assert!(!path.exists());
+    }
+
     use super::*;
 
     /// Counts the frames of a GIF.
