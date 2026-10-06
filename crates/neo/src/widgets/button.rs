@@ -223,6 +223,14 @@ impl<M: Clone + 'static> Widget<M> for Button<M> {
         };
         if !enabled {
             paint.content = p.faint;
+            // The accent's fill is too strong to read faint text on: a
+            // button that cannot be pressed is a quiet tint of it, with
+            // its label still legible.
+            if self.kind == ButtonKind::Accent {
+                paint.fill = p.accent.mix(p.surface, 0.72);
+                paint.shadows.clear();
+                paint.content = p.muted;
+            }
         }
         cx.scene.paint(b, radius, &paint);
         cx.focus_ring(b, radius);
