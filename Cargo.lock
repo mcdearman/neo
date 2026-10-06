@@ -1658,6 +1658,7 @@ version = "0.1.0"
 dependencies = [
  "neo",
  "neo-desktop",
+ "neo-term",
  "rfd",
  "serde_json",
 ]
@@ -1761,12 +1762,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "neo-terminal"
+name = "neo-term"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "neo",
+]
+
+[[package]]
+name = "neo-terminal"
+version = "0.1.0"
+dependencies = [
+ "neo",
  "neo-desktop",
+ "neo-term",
 ]
 
 [[package]]

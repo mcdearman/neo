@@ -19,6 +19,8 @@ struct EditorState {
     pointed: Option<Pos>,
     /// The lens label the mouse is over.
     lens_hover: Option<(usize, usize)>,
+    /// The last request for the keyboard that was met.
+    focus: u64,
     /// The word that a click would jump from: the one under the mouse
     /// while Command is held.
     jump: Option<Pos>,
@@ -61,6 +63,7 @@ pub struct TextEditor<M> {
     stopped: Option<usize>,
     /// The word marked as somewhere to jump from, and its length.
     jump: Option<(Pos, usize)>,
+    focus: u64,
     on_popup_key: Option<Box<dyn Fn(PopupKey) -> M>>,
     /// The popup's rows as laid out, and the first list item among them.
     popup_rows: Vec<(TextLayout, Option<TextLayout>)>,
@@ -105,6 +108,7 @@ impl<M> TextEditor<M> {
             on_margin: None,
             stopped: None,
             jump: None,
+            focus: 0,
             on_popup_key: None,
             popup_rows: vec![],
             popup_first: 0,
@@ -193,6 +197,13 @@ impl<M> TextEditor<M> {
     pub fn breakpoints(mut self, lines: Vec<usize>, on_margin: impl Fn(usize) -> M + 'static) -> Self {
         self.breakpoints = lines;
         self.on_margin = Some(Box::new(on_margin));
+        self
+    }
+
+    /// Takes the keyboard whenever this number is one not seen before,
+    /// as when a panel that had it is put away. Zero asks for nothing.
+    pub fn focus(mut self, serial: u64) -> Self {
+        self.focus = serial;
         self
     }
 
@@ -601,6 +612,9 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
                 highlight(self.language, l, &mut in_comment);
             }
         }
+        if std::mem::replace(&mut cx.state::<EditorState>().focus, self.focus) != self.focus && self.focus != 0 {
+            cx.request_focus();
+        }
         let jump = cx.state::<EditorState>().jump.filter(|j| j.line < self.lines.len() && self.lines[j.line].is_char_boundary(j.col));
         let (ink, strongest) = {
             let p = theme.palette();
@@ -869,7 +883,23 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
 
     fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
         let b = cx.bounds();
-        let Some(f) = self.on_action.as_ref() else { return Status::Ignored };
+        // Ctrl+Tab is the app's, for moving between panels.
+        if matches!(event, Event::Key(k) if k.key == Key::Tab && k.modifiers.ctrl) {
+            return Status::Ignored;
+        }
+        // Text that cannot be edited can still be scrolled.
+        let Some(f) = self.on_action.as_ref() else {
+            return match event {
+                Event::Wheel { pos, delta } if b.contains(*pos) => {
+                    let st = cx.state::<EditorState>();
+                    st.scroll.x += delta.x;
+                    st.scroll.y += delta.y;
+                    cx.request_layout();
+                    Status::Captured
+                }
+                _ => Status::Ignored,
+            };
+        };
         let scroll = cx.state::<EditorState>().scroll;
         let send = |cx: &mut EventCx<M>, a: Action| {
             cx.state::<EditorState>().blink_origin = Some(Instant::now());

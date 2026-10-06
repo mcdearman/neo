@@ -41,6 +41,8 @@ struct ViewState {
     wheel: f32,
     selecting: bool,
     mounted: bool,
+    /// The last request for the keyboard that was met.
+    focus: u64,
 }
 
 pub struct TermView<L: EventListener, M> {
@@ -49,11 +51,18 @@ pub struct TermView<L: EventListener, M> {
     font: Font,
     on_resize: Box<dyn Fn(WindowSize) -> M>,
     cell: Size,
+    focus: u64,
 }
 
 impl<L: EventListener, M> TermView<L, M> {
     pub fn new(term: Arc<FairMutex<Term<L>>>, pty: EventLoopSender, font: Font, on_resize: impl Fn(WindowSize) -> M + 'static) -> Self {
-        Self { term, pty, font, on_resize: Box::new(on_resize), cell: Size::new(8.0, 16.0) }
+        Self { term, pty, font, on_resize: Box::new(on_resize), cell: Size::new(8.0, 16.0), focus: 0 }
+    }
+
+    /// Takes the keyboard whenever this number is one not seen before.
+    pub fn focus(mut self, serial: u64) -> Self {
+        self.focus = serial;
+        self
     }
 
     fn write(&self, bytes: Vec<u8>) {
@@ -103,7 +112,8 @@ impl<L: EventListener + 'static, M: 'static> Widget<M> for TermView<L, M> {
             let ws = WindowSize { num_cols: cols as u16, num_lines: rows as u16, cell_width: self.cell.w.round() as u16, cell_height: self.cell.h as u16 };
             cx.defer((self.on_resize)(ws));
         }
-        if first {
+        let asked = std::mem::replace(&mut cx.state::<ViewState>().focus, self.focus) != self.focus;
+        if first || asked {
             cx.request_focus();
         }
         size
@@ -301,6 +311,8 @@ impl<L: EventListener + 'static, M: 'static> Widget<M> for TermView<L, M> {
                 }
                 Status::Captured
             }
+            // Ctrl+Tab is the app's, for moving to and from the terminal.
+            Event::Key(k) if k.key == Key::Tab && k.modifiers.ctrl => Status::Ignored,
             Event::Key(k) if k.pressed && cx.is_focused() => {
                 let m = k.modifiers;
                 // Copy and paste: Command on macOS, Ctrl+Shift elsewhere.

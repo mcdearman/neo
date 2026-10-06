@@ -244,6 +244,11 @@ struct NeoCode {
     debug_args: std::collections::HashMap<(PathBuf, String), String>,
     /// The Meadow program that last offered to debug something.
     meadow: Option<PathBuf>,
+    /// A shell under the editor, once it has been asked for.
+    terminal: Option<neo_term::Shell>,
+    terminal_shown: bool,
+    /// Raised to hand the keyboard back to the editor.
+    editor_focus: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +284,10 @@ enum Msg {
     /// Open `settings.json` to edit.
     OpenSettings,
     OpenRecent(PathBuf),
+    /// Show the terminal under the editor, or put it away.
+    ToggleTerminal,
+    /// Something that happened in the terminal.
+    Term(neo_term::TermMsg),
     /// The margin beside this line was clicked: set or clear a breakpoint.
     Margin(usize),
     Debug(debug::Step),
@@ -320,7 +329,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0 };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -361,7 +370,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0 }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -443,6 +452,10 @@ impl NeoCode {
         if let Some(mut run) = self.run.take() {
             run.stop();
         }
+        self.end_debugging();
+        // The shell was in the old folder.
+        self.terminal = None;
+        self.terminal_shown = false;
         self.load_settings();
         self.restore_workspace();
         // They may have been found already; the files just reopened are
@@ -619,6 +632,12 @@ impl NeoCode {
             Msg::HoverTick => self.hover_rested(),
             Msg::Lens(line, index) => self.lens_chosen(line, index),
             Msg::Margin(line) => self.toggle_breakpoint(line),
+            Msg::ToggleTerminal => self.toggle_terminal(),
+            Msg::Term(m) => {
+                if let Some(shell) = &mut self.terminal {
+                    shell.update(m);
+                }
+            }
             Msg::Debug(step) => self.debug_step(step),
             Msg::Dap(id, incoming) => self.debug_incoming(id, incoming),
             Msg::DebugBuilt(id, result) => self.debug_built(id, result),
@@ -794,11 +813,15 @@ impl App for NeoCode {
                     .separator()
                     .push(MenuEntry::new("Toggle Breakpoint  (F9)", Msg::Margin(self.active_tab().map_or(0, |t| t.doc.cursor().line))).enabled(file_open))
             },
-            keys.fold(Menu::new("View").push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
+            keys.fold(Menu::new("View").push(MenuEntry::new(if self.terminal_shown { "Hide Terminal  (Ctrl+Tab)" } else { "Terminal  (Ctrl+Tab)" }, Msg::ToggleTerminal)).push(MenuEntry::new(if self.is_dark() { "Light Appearance" } else { "Dark Appearance" }, Msg::ToggleScheme)).separator(), Menu::push),
         ]
     }
 
     fn on_key(&self, k: &KeyEvent) -> Option<Msg> {
+        // Ctrl+Tab goes to the terminal and back, on every system.
+        if k.key == Key::Tab && k.modifiers.ctrl {
+            return Some(Msg::ToggleTerminal);
+        }
         // The debugger's keys, as everywhere: F5 to go, F10 and F11 to step.
         if let Key::F(n) = k.key {
             let line = self.active_tab().map(|t| t.doc.cursor().line);
@@ -910,7 +933,7 @@ impl NeoCode {
         let tabs = container(tabs).padding([6.0, 0.0]).height(34.0).width(Length::Fill).align_y(Align::Center);
 
         let editor: Element<Msg> = match self.active_tab() {
-            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).font_size(self.settings.font_size).lenses(self.editor_lenses(t), Msg::Lens).breakpoints(self.breakpoints_in(t), Msg::Margin).stopped_at(self.stopped_in(t)).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
+            Some(t) => container(text_editor(&t.doc).language(t.language).on_action(Msg::Edit).marks(self.editor_marks(t)).tokens(t.tokens.clone()).popup(self.editor_popup(t)).popup_at(self.editor_popup_at(t)).font_size(self.settings.font_size).lenses(self.editor_lenses(t), Msg::Lens).breakpoints(self.breakpoints_in(t), Msg::Margin).stopped_at(self.stopped_in(t)).focus(self.editor_focus).on_point(Msg::Point).on_jump(|_| Msg::Jump).on_popup_key(Msg::PopupKey).into_element_keyed(&t.path))
                 .background(Background::Color(surface))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -931,9 +954,11 @@ impl NeoCode {
             .into(),
         };
         let mut col = column().width(Length::Fill).height(Length::Fill).push(tabs).push(Divider::horizontal()).push(editor);
-        // One panel under the editor: a question before debugging, the
-        // debugger, or what was last run.
-        if let Some(ask) = &self.asking {
+        // One panel under the editor: the terminal while it is up, else a
+        // question before debugging, the debugger, or what was last run.
+        if let Some(shell) = self.terminal.as_ref().filter(|_| self.terminal_shown) {
+            col = col.push(Divider::horizontal()).push(self.terminal_panel(shell));
+        } else if let Some(ask) = &self.asking {
             col = col.push(Divider::horizontal()).push(self.asking_panel(ask));
         } else if let Some(session) = &self.debug {
             col = col.push(Divider::horizontal()).push(self.debug_panel(session, surface));
@@ -941,6 +966,45 @@ impl NeoCode {
             col = col.push(Divider::horizontal()).push(self.run_panel(run, surface));
         }
         col.into()
+    }
+
+    /// Shows the terminal under the editor with the keyboard in it, or
+    /// puts it away and hands the keyboard back. The shell is started the
+    /// first time, in the folder that is open, and keeps running while
+    /// out of sight.
+    fn toggle_terminal(&mut self) {
+        if self.terminal_shown {
+            self.terminal_shown = false;
+            self.editor_focus += 1;
+            return;
+        }
+        self.terminal_shown = true;
+        if self.terminal.is_none() {
+            let mut shell = neo_term::Shell::new(self.root.clone().unwrap_or_else(neo_desktop::fs::home_dir), None);
+            // Tests show the panel without a shell behind it.
+            if let Some(proxy) = self.servers.proxy.clone().filter(|_| self.runs_commands) {
+                shell.start(move |m| {
+                    proxy.send(Msg::Term(m));
+                });
+            }
+            self.terminal = Some(shell);
+        }
+        if let Some(shell) = &mut self.terminal {
+            shell.focus();
+        }
+    }
+
+    fn terminal_panel(&self, shell: &neo_term::Shell) -> Element<Msg> {
+        let head = row()
+            .spacing(8.0)
+            .align(Align::Center)
+            .width(Length::Fill)
+            .push(icon(icons::SQUARE_TERMINAL).size(14.0).tone(Tone::Muted))
+            .push(text("Terminal").role(TextRole::Strong).no_wrap())
+            .push(container(text(shell.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| shell.cwd.display().to_string())).role(TextRole::Caption).tone(Tone::Muted).no_wrap()).width(Length::Fill))
+            .push(text("Ctrl+Tab").role(TextRole::Caption).tone(Tone::Faint).no_wrap())
+            .push(icon_button(icons::X, 22.0).kind(ButtonKind::Ghost).on_press(Msg::ToggleTerminal));
+        column().width(Length::Fill).height(280.0).push(container(head).padding([10.0, 4.0]).width(Length::Fill)).push(shell.view(Msg::Term)).into()
     }
 
     /// What was run from a lens: its name, how it stands, and what it
@@ -1976,6 +2040,35 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_tab_brings_up_a_terminal_and_puts_it_away_again() {
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        let mut h = editing(0);
+        h.type_text("x");
+        let typed = h.app().active_tab().unwrap().doc.text();
+        let plain = h.render(1.0);
+        // From the editor, whatever its keys are doing.
+        h.key(Key::Tab, ctrl);
+        assert!(h.app().terminal_shown && h.app().terminal.is_some());
+        assert_eq!(h.app().active_tab().unwrap().doc.text(), typed, "the editor did not take it for a tab");
+        assert!(h.render(1.0) != plain, "the panel shows");
+        assert!(h.app().menus()[4].entries.iter().any(|e| e.label.starts_with("Hide Terminal")));
+        // Again puts it away, keeping the shell, and typing goes to the
+        // editor once more without a click.
+        h.key(Key::Tab, ctrl);
+        assert!(!h.app().terminal_shown && h.app().terminal.is_some());
+        h.render(1.0);
+        h.type_text("y");
+        assert_ne!(h.app().active_tab().unwrap().doc.text(), typed, "the editor has the keyboard back");
+        // The close button and the menu do the same.
+        h.app_mut().update(Msg::ToggleTerminal);
+        assert!(h.app().terminal_shown);
+        h.app_mut().update(Msg::ToggleTerminal);
+        assert!(!h.app().terminal_shown);
+        // A plain Tab is still the editor's.
+        assert!(h.app().on_key(&KeyEvent { key: Key::Tab, pressed: true, repeat: false, modifiers: Modifiers::default(), text: None }).is_none());
+    }
+
+    #[test]
     fn a_function_with_arguments_asks_for_them_before_debugging() {
         let mut s = Served::new("debug-ask", "pub fn one() {}\n");
         let file = s.file.clone();
@@ -2360,6 +2453,21 @@ mod tests {
             }
             println!("printed:\n{}", h.app().debug.as_ref().map(|d| d.output.text()).unwrap_or_default());
             h.app_mut().update(Msg::Debug(debug::Step::Stop));
+        }
+        // `NEO_TERMINAL=command` brings up the terminal and types that in.
+        if let Ok(command) = std::env::var("NEO_TERMINAL") {
+            h.app_mut().runs_commands = true;
+            h.app_mut().update(Msg::ToggleTerminal);
+            for i in 0..30 {
+                std::thread::sleep(Duration::from_millis(100));
+                h.advance(Duration::from_millis(100));
+                h.render(1.0);
+                if i == 12 {
+                    h.app().terminal.as_ref().unwrap().write(format!("{command}\n"));
+                }
+            }
+            let shell = h.app().terminal.as_ref().unwrap();
+            println!("terminal: running {}, in {}, error {:?}", shell.running(), shell.cwd.display(), shell.error);
         }
         // `NEO_LSP_HOVER=line:col` (from zero) rests the mouse there first.
         if let Some((line, col)) = std::env::var("NEO_LSP_HOVER").ok().and_then(|at| at.split_once(':').and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))) {

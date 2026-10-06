@@ -15,3 +15,4 @@ armature-render = { path = "../armature/crates/armature-render" }
 armature = { path = "../armature/crates/armature" }
 neo = { path = "crates/neo" }
 neo-desktop = { path = "crates/neo-desktop" }
+neo-term = { path = "crates/neo-term" }

@@ -1,0 +1,10 @@
+[package]
+name = "neo-term"
+description = "A terminal to put in a Neo app: a shell, its screen, and the widget that shows it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+alacritty_terminal = "0.25"

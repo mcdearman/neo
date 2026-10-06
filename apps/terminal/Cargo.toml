@@ -8,4 +8,4 @@ license.workspace = true
 [dependencies]
 neo.workspace = true
 neo-desktop.workspace = true
-alacritty_terminal = "0.25"
+neo-term.workspace = true
