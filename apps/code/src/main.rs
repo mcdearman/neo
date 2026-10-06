@@ -2219,11 +2219,17 @@ mod tests {
         let mut again = NeoCode::folder(&dir);
         again.config = Some(config.clone());
         again.load_settings();
-        assert_eq!(again.settings.types, neo::TypeColour::Orchid);
-        assert!(std::fs::read_to_string(settings::user_file(&config)).unwrap().contains("\"editor.typeColor\": \"orchid\""));
+        assert_eq!(again.settings.types, neo::TypeColour::Rose);
+        assert!(std::fs::read_to_string(settings::user_file(&config)).unwrap().contains("\"editor.typeColor\": \"rose\""));
+        // One tried before and since dropped falls back without complaint.
+        std::fs::write(settings::user_file(&config), "{ \"editor.typeColor\": \"teal\" }").unwrap();
+        again.toast = None;
+        again.load_settings();
+        assert_eq!((again.settings.types, again.toast.clone()), (neo::TypeColour::Peach, None));
+        again.update(Msg::Types(1));
         // The menu lists them all, with a tick by the one in use.
         let labels: Vec<String> = again.menus()[4].entries.iter().map(|e| e.label.clone()).collect();
-        assert!(labels.contains(&"✓ Types: Orchid".to_owned()) && labels.contains(&"Types: Peach".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"✓ Types: Rose".to_owned()) && labels.contains(&"Types: Peach".to_owned()), "{labels:?}");
         std::fs::remove_dir_all(config).unwrap();
     }
 

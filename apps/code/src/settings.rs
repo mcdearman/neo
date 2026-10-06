@@ -109,7 +109,11 @@ impl Settings {
                     .map(|dark| s.dark = dark),
                 "window.restoreWorkspace" => value.as_bool().map(|b| s.restore = b),
                 SYNTAX => value.as_str().and_then(Syntax::from_name).map(|x| s.syntax = x),
-                TYPES => value.as_str().and_then(neo::TypeColour::from_name).map(|x| s.types = x),
+                // One that is no longer offered is passed over quietly.
+                TYPES => {
+                    s.types = value.as_str().and_then(neo::TypeColour::from_name).unwrap_or_default();
+                    Some(())
+                }
                 _ => Some(()),
             };
             if ok.is_none() {

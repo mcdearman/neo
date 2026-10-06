@@ -116,27 +116,18 @@ impl Default for Glass {
 /// until one is chosen: then it becomes the scheme's colour and this goes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TypeColour {
-    /// The terminal's cyan, as the REPL has it.
     #[default]
-    Teal,
     Peach,
     Rose,
-    Sky,
-    Sand,
-    Orchid,
 }
 
 impl TypeColour {
-    pub const ALL: [TypeColour; 6] = [TypeColour::Teal, TypeColour::Peach, TypeColour::Rose, TypeColour::Sky, TypeColour::Sand, TypeColour::Orchid];
+    pub const ALL: [TypeColour; 2] = [TypeColour::Peach, TypeColour::Rose];
 
     pub fn name(self) -> &'static str {
         match self {
-            TypeColour::Teal => "Teal",
             TypeColour::Peach => "Peach",
             TypeColour::Rose => "Rose",
-            TypeColour::Sky => "Sky",
-            TypeColour::Sand => "Sand",
-            TypeColour::Orchid => "Orchid",
         }
     }
 
@@ -148,12 +139,8 @@ impl TypeColour {
     /// same hue that reads on a light one.
     pub fn tone(self, scheme: Scheme) -> Color {
         let (dark, light) = match self {
-            TypeColour::Teal => (0x78DCE8, 0x16706A),
             TypeColour::Peach => (0xFFB07A, 0xB4541A),
             TypeColour::Rose => (0xFF8FA8, 0xB8355A),
-            TypeColour::Sky => (0x7DBBFF, 0x1F6FC2),
-            TypeColour::Sand => (0xE2C08D, 0x8A6A2A),
-            TypeColour::Orchid => (0xE0A3F5, 0x9A3FB8),
         };
         Color::hex(if scheme == Scheme::Dark { dark } else { light })
     }
