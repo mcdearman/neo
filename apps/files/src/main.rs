@@ -10,6 +10,8 @@
 // Release builds on Windows open no console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod folders;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -88,6 +90,27 @@ struct Files {
     /// Counts folder visits, so the worker can skip work for a folder that
     /// is no longer shown.
     visit: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// How much each folder seen holds, kept while moving around so going
+    /// back shows them at once, and measured again on each visit.
+    sizes: std::collections::HashMap<PathBuf, FolderSize>,
+    /// Folders waiting for the measuring workers, tagged like thumbnails.
+    size_queue: Option<std::sync::mpsc::Sender<(u64, PathBuf)>>,
+    /// The folders bookmarked in the sidebar, in order.
+    bookmarks: Vec<PathBuf>,
+    /// Where they are kept. Tests keep them nowhere unless they say where.
+    bookmarks_file: Option<PathBuf>,
+    /// The menu open on a bookmark, and where.
+    bookmark_menu: Option<(PathBuf, Point)>,
+}
+
+/// What is known of how much a folder holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderSize {
+    /// Being added up, with nothing known yet.
+    Measuring,
+    Known(u64),
+    /// It could not be read.
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +144,16 @@ enum Msg {
     Geometry(WindowGeometry),
     /// The worker finished a thumbnail, or found the file is not a picture.
     Thumb(PathBuf, Option<Image>),
+    /// A worker finished adding up what a folder holds.
+    Measured(PathBuf, Option<u64>),
+    /// Take a folder out of the sidebar.
+    /// Things were dropped on the Bookmarks heading: the folders among them
+    /// are bookmarked, not copied.
+    BookmarkDrop(Vec<PathBuf>),
+    RemoveBookmark(PathBuf),
+    /// A right click on a bookmark.
+    BookmarkMenu(PathBuf, Point),
+    CloseBookmarkMenu,
     Poll,
     /// The Settings entry and panel every Neo app has.
     Desktop(neo_desktop::DesktopMsg),
@@ -178,6 +211,8 @@ enum Choice {
     Trash,
     NewFolder,
     Hidden,
+    /// Put the folder clicked, or this one, in the sidebar, or take it out.
+    Bookmark,
 }
 
 fn read_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
@@ -225,7 +260,15 @@ impl Files {
             thumbs: Default::default(),
             thumb_queue: None,
             visit: Default::default(),
+            sizes: Default::default(),
+            size_queue: None,
+            bookmarks_file: (!cfg!(test)).then(folders::bookmarks_file),
+            bookmarks: vec![],
+            bookmark_menu: None,
         };
+        if let Some(file) = &f.bookmarks_file {
+            f.bookmarks = folders::load_bookmarks(file);
+        }
         f.load(dir);
         f
     }
@@ -248,6 +291,7 @@ impl Files {
                 self.dir = dir;
                 self.status = None;
                 self.request_thumbs();
+                self.request_sizes();
             }
             Err(e) => self.status = Some((Tone::Bad, format!("Could not open {}: {e}", dir.display()))),
         }
@@ -279,6 +323,55 @@ impl Files {
         }
     }
 
+    /// Asks for each folder shown to be measured. What was known from an
+    /// earlier visit stays showing until the new count is in.
+    fn request_sizes(&mut self) {
+        let visit = self.visit.load(std::sync::atomic::Ordering::Relaxed);
+        let dirs: Vec<PathBuf> = self.entries.iter().filter(|e| e.dir && !e.link).map(|e| e.path.clone()).collect();
+        for path in dirs {
+            self.sizes.entry(path.clone()).or_insert(FolderSize::Measuring);
+            match &self.size_queue {
+                Some(queue) => {
+                    let _ = queue.send((visit, path));
+                }
+                // No workers, as in tests: measure now.
+                None => {
+                    let size = folders::measure(&path, &|| true);
+                    self.sizes.insert(path, size.map_or(FolderSize::Unknown, FolderSize::Known));
+                }
+            }
+        }
+    }
+
+    /// How much an entry holds: a file's length, or a folder's contents
+    /// once they have been added up.
+    fn size_of(&self, e: &Entry) -> Option<u64> {
+        if !e.dir {
+            return Some(e.size);
+        }
+        match self.sizes.get(&e.path) {
+            Some(FolderSize::Known(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Puts a folder in the sidebar, or takes it out, and writes it down.
+    fn set_bookmark(&mut self, path: PathBuf, on: bool) {
+        let had = self.bookmarks.contains(&path);
+        if on && !had && path.is_dir() {
+            self.bookmarks.push(path);
+        } else if !on && had {
+            self.bookmarks.retain(|b| *b != path);
+        } else {
+            return;
+        }
+        if let Some(file) = &self.bookmarks_file
+            && let Err(e) = folders::save_bookmarks(file, &self.bookmarks)
+        {
+            self.status = Some((Tone::Bad, format!("Could not save the sidebar: {e}")));
+        }
+    }
+
     /// Selects one entry and nothing else, and makes it the range anchor.
     fn select_only(&mut self, path: PathBuf) {
         self.anchor = Some(path.clone());
@@ -298,7 +391,7 @@ impl Files {
             let dirs_first = b.dir.cmp(&a.dir);
             let by = match self.sort {
                 SortBy::Name => natural_cmp(&a.name, &b.name),
-                SortBy::Size => a.size.cmp(&b.size).then_with(|| natural_cmp(&a.name, &b.name)),
+                SortBy::Size => self.size_of(a).cmp(&self.size_of(b)).then_with(|| natural_cmp(&a.name, &b.name)),
                 SortBy::Modified => a.modified.cmp(&b.modified),
                 SortBy::Created => a.created.cmp(&b.created),
             };
@@ -374,7 +467,9 @@ impl App for Files {
         // One worker makes thumbnails, so a folder of photos does not swamp the machine.
         let (tx, rx) = std::sync::mpsc::channel::<(u64, PathBuf)>();
         let visit = self.visit.clone();
+        let thumbs = proxy.clone();
         std::thread::spawn(move || {
+            let proxy = thumbs;
             for (wanted_in, path) in rx {
                 // The folder has changed since this was asked for.
                 if visit.load(std::sync::atomic::Ordering::Relaxed) != wanted_in {
@@ -388,6 +483,30 @@ impl App for Files {
         });
         self.thumb_queue = Some(tx);
         self.request_thumbs();
+        // A few workers add up folders, each taking the next one waiting, so
+        // one huge folder does not hold up the rest.
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, PathBuf)>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..3 {
+            let (rx, visit, proxy) = (rx.clone(), self.visit.clone(), proxy.clone());
+            std::thread::spawn(move || {
+                loop {
+                    let Ok((wanted_in, path)) = rx.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
+                    // Given up as soon as the folder shown changes.
+                    let current = || visit.load(std::sync::atomic::Ordering::Relaxed) == wanted_in;
+                    if !current() {
+                        continue;
+                    }
+                    if let Some(size) = folders::measure(&path, &current).map(Some).or_else(|| (current()).then_some(None)) {
+                        if !proxy.send(Msg::Measured(path, size)) {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        self.size_queue = Some(tx);
+        self.request_sizes();
     }
 
     fn on_window_geometry(&self, geometry: WindowGeometry) -> Option<Msg> {
@@ -602,6 +721,31 @@ impl App for Files {
                     *slot = image.map_or(Thumb::Failed, Thumb::Ready);
                 }
             }
+            Msg::Measured(path, size) => {
+                // A folder that could not be read keeps any size known before.
+                match size {
+                    Some(n) => {
+                        self.sizes.insert(path, FolderSize::Known(n));
+                    }
+                    None => {
+                        let slot = self.sizes.entry(path).or_insert(FolderSize::Unknown);
+                        if *slot == FolderSize::Measuring {
+                            *slot = FolderSize::Unknown;
+                        }
+                    }
+                }
+            }
+            Msg::BookmarkDrop(paths) => {
+                for path in paths.into_iter().filter(|p| p.is_dir()) {
+                    self.set_bookmark(path, true);
+                }
+            }
+            Msg::RemoveBookmark(path) => {
+                self.bookmark_menu = None;
+                self.set_bookmark(path, false);
+            }
+            Msg::BookmarkMenu(path, at) => self.bookmark_menu = Some((path, at)),
+            Msg::CloseBookmarkMenu => self.bookmark_menu = None,
             Msg::Context(path, at) => {
                 // Right-clicking an entry selects it, as file managers do,
                 // unless it is already part of a selection to act on.
@@ -621,6 +765,11 @@ impl App for Files {
                     Choice::Trash => self.update(Msg::Trash),
                     Choice::NewFolder => self.update(Msg::NewFolder),
                     Choice::Hidden => self.update(Msg::Hidden),
+                    Choice::Bookmark => {
+                        let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
+                        let on = !self.bookmarks.contains(&dir);
+                        self.set_bookmark(dir, on);
+                    }
                     Choice::Terminal => {
                         let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
                         if !neo_desktop::fs::open_in("neo-terminal", "NeoTerm", &dir) {
@@ -652,6 +801,11 @@ impl Files {
     /// The window's content, which the settings panel goes over.
     fn content(&self) -> Element<Msg> {
         let main = split(self.places(), column().width(Length::Fill).height(Length::Fill).push(self.toolbar()).push(Divider::horizontal()).push(self.list()).push(Divider::horizontal()).push(self.status_bar()));
+        // The menu on a bookmark in the sidebar.
+        if let Some((path, at)) = &self.bookmark_menu {
+            let items = vec![MenuItem::new("Open", Msg::Go(path.clone())).icon(icons::FOLDER_OPEN), MenuItem::separator(), MenuItem::new("Remove from Sidebar", Msg::RemoveBookmark(path.clone())).icon(icons::BOOKMARK_MINUS)];
+            return stack().width(Length::Fill).height(Length::Fill).push(main).push(popup_menu(*at, items, Msg::CloseBookmarkMenu)).into();
+        }
         let Some((target, at)) = &self.menu else { return main };
         let entry = target.as_ref().and_then(|p| self.entries.iter().find(|e| &e.path == p));
         let items = match entry {
@@ -666,6 +820,8 @@ impl Files {
                 let mut items = vec![MenuItem::new("Open", Msg::Choose(Choice::Open)).icon(if e.dir { icons::FOLDER_OPEN } else { icons::EXTERNAL_LINK })];
                 if e.dir {
                     items.push(MenuItem::new("Open in Terminal", Msg::Choose(Choice::Terminal)).icon(icons::SQUARE_TERMINAL));
+                    let marked = self.bookmarks.contains(&e.path);
+                    items.push(MenuItem::new(if marked { "Remove from Sidebar" } else { "Add to Sidebar" }, Msg::Choose(Choice::Bookmark)).icon(if marked { icons::BOOKMARK_MINUS } else { icons::BOOKMARK_PLUS }));
                 }
                 items.extend([MenuItem::separator(), MenuItem::new("Rename…", Msg::Choose(Choice::Rename)).icon(icons::PENCIL), MenuItem::new("Move to Trash", Msg::Choose(Choice::Trash)).icon(icons::TRASH_2).danger()]);
                 items
@@ -673,6 +829,10 @@ impl Files {
             None => vec![
                 MenuItem::new("New Folder", Msg::Choose(Choice::NewFolder)).icon(icons::FOLDER_PLUS),
                 MenuItem::new("Open Terminal Here", Msg::Choose(Choice::Terminal)).icon(icons::SQUARE_TERMINAL),
+                {
+                    let marked = self.bookmarks.contains(&self.dir);
+                    MenuItem::new(if marked { "Remove This Folder from Sidebar" } else { "Add This Folder to Sidebar" }, Msg::Choose(Choice::Bookmark)).icon(if marked { icons::BOOKMARK_MINUS } else { icons::BOOKMARK_PLUS })
+                },
                 MenuItem::separator(),
                 MenuItem::new(if self.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" }, Msg::Choose(Choice::Hidden)).icon(if self.show_hidden { icons::EYE_OFF } else { icons::EYE }),
             ],
@@ -698,6 +858,19 @@ impl Files {
             // Files can be dropped on a place to put them there.
             let target = path.clone();
             col = col.push(mouse_area(nav_item(glyph, name, here, Msg::Go(path))).on_drop(move |files| Msg::Drop(target.clone(), files)));
+        }
+        // Bookmarks: folders put here from the right-click menu, or by
+        // dropping them on the heading.
+        let heading = mouse_area(section("Bookmarks")).on_drop(Msg::BookmarkDrop);
+        col = col.push(heading);
+        for path in &self.bookmarks {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            let (target, menu) = (path.clone(), path.clone());
+            let glyph = if path.is_dir() { icons::FOLDER } else { icons::FOLDER_X };
+            col = col.push(mouse_area(nav_item(glyph, name, self.dir == *path, Msg::Go(path.clone()))).on_drop(move |files| Msg::Drop(target.clone(), files)).on_secondary_press(move |at| Msg::BookmarkMenu(menu.clone(), at)));
+        }
+        if self.bookmarks.is_empty() {
+            col = col.push(container(text("Right-click a folder and choose Add to Sidebar, or drop one here.").role(TextRole::Caption).tone(Tone::Faint)).padding([4.0, 10.0]));
         }
         col = col.push(section("Devices"));
         for (name, root) in roots() {
@@ -797,7 +970,13 @@ impl Files {
             return self.name_field(file_icon(&e.path, e.dir), name.clone());
         }
         let compact = self.view == ViewMode::Compact;
-        let size = if e.dir { "—".to_string() } else { human_size(e.size) };
+        // A folder's size once added up; a pause while that happens.
+        let size = match (e.dir, self.sizes.get(&e.path)) {
+            (false, _) => human_size(e.size),
+            (true, Some(FolderSize::Known(n))) => human_size(*n),
+            (true, Some(FolderSize::Measuring)) => "…".to_string(),
+            (true, _) => "—".to_string(),
+        };
         let when = e.modified.map(friendly_time).unwrap_or_default();
         let created = e.created.map(friendly_time).unwrap_or_else(|| "—".into());
         let faded = if e.hidden() { Tone::Muted } else { Tone::Inherit };
@@ -902,10 +1081,14 @@ impl Files {
         let chosen: Vec<&Entry> = self.entries.iter().filter(|e| self.selected.contains(&e.path)).collect();
         match chosen.as_slice() {
             [] => {}
-            [e] => summary = if e.dir { format!("“{}” selected", e.name) } else { format!("“{}” selected ({})", e.name, human_size(e.size)) },
+            [e] => summary = match self.size_of(e) {
+                Some(n) => format!("“{}” selected ({})", e.name, human_size(n)),
+                None => format!("“{}” selected", e.name),
+            },
             many => {
-                let bytes: u64 = many.iter().filter(|e| !e.dir).map(|e| e.size).sum();
-                summary = if many.iter().all(|e| e.dir) { format!("{} items selected", many.len()) } else { format!("{} items selected ({})", many.len(), human_size(bytes)) };
+                // Folders count once they have been added up.
+                let sizes: Vec<Option<u64>> = many.iter().map(|e| self.size_of(e)).collect();
+                summary = if sizes.iter().all(Option::is_some) { format!("{} items selected ({})", many.len(), human_size(sizes.iter().flatten().sum())) } else { format!("{} items selected", many.len()) };
             }
         }
         let mut r = row().spacing(12.0).align(Align::Center).width(Length::Fill).padding([16.0, 10.0]).push(text(summary).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x());
@@ -981,6 +1164,8 @@ fn snapshots(dir: PathBuf) {
         let mut app = Files::new(root.clone());
         app.desktop.appearance.scheme = scheme;
         app.selected = vec![root.join("Cargo.toml")];
+        // Two folders in the sidebar's Bookmarks.
+        app.bookmarks = vec![root.join("crates"), root.join("apps")];
         let mut h = Harness::new(app, Size::new(1040.0, 680.0)).expect("GPU");
         if name == "files-dark" {
             h.app_mut().show_hidden = true;
@@ -1005,6 +1190,81 @@ mod tests {
         std::fs::create_dir_all(d.join("alpha")).unwrap();
         std::fs::write(d.join("notes.txt"), "hi").unwrap();
         d
+    }
+
+    #[test]
+    fn folders_show_how_much_they_hold_and_sort_by_it() {
+        let root = temp_dir("sizes");
+        std::fs::create_dir_all(root.join("big/deeper")).unwrap();
+        std::fs::write(root.join("big/deeper/data.bin"), vec![0u8; 5000]).unwrap();
+        std::fs::write(root.join("big/more.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(root.join("alpha/a.txt"), vec![0u8; 300]).unwrap();
+        let mut f = Files::new(root.clone());
+        let size = |f: &Files, name: &str| f.entries.iter().find(|e| e.name == name).and_then(|e| f.size_of(e));
+        assert_eq!((size(&f, "big"), size(&f, "alpha"), size(&f, "notes.txt")), (Some(6000), Some(300), Some(2)), "everything under a folder, however deep");
+        // Sorting by size puts the bigger folder first, folders still before files.
+        f.update(Msg::Sort(SortBy::Size));
+        if !f.descending {
+            f.update(Msg::Sort(SortBy::Size));
+        }
+        assert_eq!(f.visible().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["big", "alpha", "notes.txt"]);
+        // A selection's size counts the folders in it.
+        f.update(Msg::Click(root.join("big"), Modifiers::default()));
+        f.update(Msg::Click(root.join("notes.txt"), Modifiers { shift: true, ..Default::default() }));
+        let mut h = neo::testing::Harness::new(f, Size::new(1040.0, 680.0)).unwrap();
+        h.render(1.0);
+        // While a worker is still counting, the folder says so.
+        h.app_mut().sizes.insert(root.join("alpha"), FolderSize::Measuring);
+        let alpha = h.app().entries.iter().find(|e| e.name == "alpha").unwrap().clone();
+        assert_eq!(h.app().size_of(&alpha), None);
+        // A late answer for a folder that could not be read keeps what was known.
+        h.app_mut().update(Msg::Measured(root.join("big"), None));
+        assert_eq!(h.app().sizes[&root.join("big")], FolderSize::Known(6000));
+        h.app_mut().update(Msg::Measured(root.join("alpha"), None));
+        assert_eq!(h.app().sizes[&root.join("alpha")], FolderSize::Unknown);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folders_can_be_bookmarked_in_the_sidebar_and_kept() {
+        let root = temp_dir("bookmarks");
+        let file = root.join("kept/files-bookmarks");
+        let mut f = Files::new(root.clone());
+        assert!(f.bookmarks_file.is_none() && f.bookmarks.is_empty(), "tests keep nothing unless they say where");
+        f.bookmarks_file = Some(file.clone());
+        // From a folder's right-click menu.
+        f.update(Msg::Context(Some(root.join("alpha")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::Bookmark));
+        assert_eq!(f.bookmarks, [root.join("alpha")]);
+        // From the folder's own background: the folder being shown.
+        f.update(Msg::Context(None, Point::new(300.0, 400.0)));
+        f.update(Msg::Choose(Choice::Bookmark));
+        assert_eq!(f.bookmarks, [root.join("alpha"), root.clone()]);
+        // Dropped on the heading: folders are bookmarked, files are not, and nothing twice.
+        f.update(Msg::BookmarkDrop(vec![root.join("notes.txt"), root.join("alpha")]));
+        assert_eq!(f.bookmarks.len(), 2);
+        // Kept for next time, in order.
+        assert_eq!(folders::load_bookmarks(&file), [root.join("alpha"), root.clone()]);
+        // A bookmark goes where it points, and its own menu takes it out.
+        f.update(Msg::Go(root.join("alpha")));
+        assert_eq!(f.dir, root.join("alpha"));
+        f.update(Msg::BookmarkMenu(root.join("alpha"), Point::new(40.0, 300.0)));
+        assert!(f.bookmark_menu.is_some());
+        f.update(Msg::RemoveBookmark(root.join("alpha")));
+        assert!(f.bookmark_menu.is_none());
+        assert_eq!(folders::load_bookmarks(&file), [root.clone()]);
+        // The same choice on a bookmarked folder takes it out too.
+        f.update(Msg::Go(root.clone()));
+        f.update(Msg::Context(None, Point::new(300.0, 400.0)));
+        f.update(Msg::Choose(Choice::Bookmark));
+        assert!(f.bookmarks.is_empty());
+        // The sidebar shows them.
+        f.update(Msg::BookmarkDrop(vec![root.join("alpha")]));
+        let mut h = neo::testing::Harness::new(f, Size::new(1040.0, 680.0)).unwrap();
+        let with = h.render(1.0);
+        h.app_mut().update(Msg::RemoveBookmark(root.join("alpha")));
+        assert!(h.render(1.0) != with);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
