@@ -497,10 +497,11 @@ impl App for Files {
                     if !current() {
                         continue;
                     }
-                    if let Some(size) = folders::measure(&path, &current).map(Some).or_else(|| (current()).then_some(None)) {
-                        if !proxy.send(Msg::Measured(path, size)) {
-                            return;
-                        }
+                    let size = folders::measure(&path, &current);
+                    // Nothing, if it stopped because the folder changed;
+                    // otherwise the size, or that it could not be read.
+                    if (size.is_some() || current()) && !proxy.send(Msg::Measured(path, size)) {
+                        return;
                     }
                 }
             });

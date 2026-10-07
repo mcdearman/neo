@@ -20,7 +20,7 @@ pub fn measure(dir: &Path, keep_going: &dyn Fn() -> bool) -> Option<u64> {
         let Ok(read) = std::fs::read_dir(&here) else { continue };
         for item in read.flatten() {
             counted += 1;
-            if counted % 512 == 0 && !keep_going() {
+            if counted.is_multiple_of(512) && !keep_going() {
                 return None;
             }
             // Not followed: a link counts as itself.
