@@ -9,6 +9,7 @@
 mod detail;
 mod inspect;
 mod heat;
+mod power;
 mod sensors;
 #[cfg(target_os = "macos")]
 mod smc;
@@ -42,6 +43,7 @@ enum SortBy {
     Cpu,
     Memory,
     Swap,
+    Energy,
     Threads,
     Pid,
 }
@@ -61,6 +63,8 @@ struct Proc {
     threads: Option<u32>,
     /// Swapped-out bytes, on systems that report it cheaply for every process.
     swap: Option<u64>,
+    /// The power it drew since the last sample, in watts, where that is known.
+    energy: Option<f32>,
 }
 
 struct Monitor {
@@ -73,6 +77,10 @@ struct Monitor {
     page: Page,
     cpu: VecDeque<f32>,
     memory: VecDeque<f32>,
+    /// Memory pressure from 0 to 100, and how the system grades it now.
+    pressure: VecDeque<f32>,
+    pressure_now: Option<power::Pressure>,
+    meter: power::Meter,
     rx: VecDeque<f32>,
     tx: VecDeque<f32>,
     procs: Vec<Proc>,
@@ -140,6 +148,9 @@ impl Monitor {
             page: Page::Processes,
             cpu: filled(HISTORY),
             memory: filled(HISTORY),
+            pressure: filled(HISTORY),
+            pressure_now: None,
+            meter: power::Meter::default(),
             rx: filled(HISTORY),
             tx: filled(HISTORY),
             procs: vec![],
@@ -169,6 +180,10 @@ impl Monitor {
         push(&mut self.cpu, self.sys.global_cpu_usage());
         let total = self.sys.total_memory().max(1) as f32;
         push(&mut self.memory, self.sys.used_memory() as f32 / total * 100.0);
+        self.pressure_now = power::pressure();
+        if let Some(p) = self.pressure_now {
+            push(&mut self.pressure, p.percent);
+        }
         let now = Instant::now();
         let secs = now.duration_since(self.last_sample).as_secs_f32().max(0.05);
         self.last_sample = now;
@@ -177,6 +192,8 @@ impl Monitor {
         push(&mut self.tx, tx as f32 / secs);
         let pids: Vec<u32> = self.sys.processes().values().filter(|p| p.thread_kind().is_none()).map(|p| p.pid().as_u32()).collect();
         let quick = inspect::quick(&pids);
+        let shares: std::collections::HashMap<u32, f32> = self.sys.processes().values().filter(|p| p.thread_kind().is_none()).map(|p| (p.pid().as_u32(), p.cpu_usage())).collect();
+        let energy = self.meter.sample(&shares);
         self.procs = self
             .sys
             .processes()
@@ -194,6 +211,7 @@ impl Monitor {
                 resident: p.memory(),
                 threads: quick.get(&p.pid().as_u32()).and_then(|q| q.threads),
                 swap: quick.get(&p.pid().as_u32()).and_then(|q| q.swap),
+                energy: energy.get(&p.pid().as_u32()).copied(),
             })
             .collect();
         if let Some(i) = &mut self.inspect {
@@ -211,6 +229,7 @@ impl Monitor {
                 SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
                 SortBy::Memory => a.memory.cmp(&b.memory),
                 SortBy::Swap => a.swap.cmp(&b.swap),
+                SortBy::Energy => a.energy.unwrap_or(-1.0).total_cmp(&b.energy.unwrap_or(-1.0)),
                 SortBy::Threads => a.threads.cmp(&b.threads),
                 SortBy::Pid => a.pid.cmp(&b.pid),
             };
@@ -310,7 +329,7 @@ impl App for Monitor {
                     self.descending = !self.descending;
                 } else {
                     self.sort = s;
-                    self.descending = matches!(s, SortBy::Cpu | SortBy::Memory | SortBy::Swap | SortBy::Threads);
+                    self.descending = matches!(s, SortBy::Cpu | SortBy::Memory | SortBy::Swap | SortBy::Energy | SortBy::Threads);
                 }
             }
             Msg::Select(pid) => {
@@ -405,6 +424,10 @@ impl Monitor {
         if swap_total > 0 {
             meters = meters.push(mini("Swap", self.sys.used_swap() as f32 / swap_total as f32 * 100.0, Tone::Warn));
         }
+        // Memory pressure, coloured as the system grades it.
+        if let Some(p) = self.pressure_now {
+            meters = meters.push(mini("Pressure", p.percent, pressure_tone(p.level)));
+        }
         side = side.push(Space::fill_y()).push(container(meters).padding([10.0, 12.0]));
         let body = match self.page {
             Page::Processes => match &self.inspect {
@@ -416,6 +439,23 @@ impl Monitor {
             Page::Storage => self.storage(),
         };
         split(side, body)
+    }
+}
+
+/// The colour for a memory pressure level: green, yellow and red, as
+/// Activity Monitor has them.
+fn pressure_tone(level: power::Level) -> Tone {
+    match level {
+        power::Level::Normal => Tone::Good,
+        power::Level::Warning => Tone::Warn,
+        power::Level::Critical => Tone::Bad,
+    }
+}
+
+impl Monitor {
+    /// Whether any process has an energy figure, so the table shows the column.
+    fn has_energy(&self) -> bool {
+        self.procs.iter().any(|p| p.energy.is_some())
     }
 }
 
@@ -459,6 +499,10 @@ impl Monitor {
         if inspect::QUICK_SWAP {
             header = header.push(header_cell("Swap", SortBy::Swap, Length::Fixed(80.0), Align::End));
         }
+        let energy = self.has_energy();
+        if energy {
+            header = header.push(header_cell("Energy", SortBy::Energy, Length::Fixed(80.0), Align::End));
+        }
         let header = header.push(header_cell("Threads", SortBy::Threads, Length::Fixed(76.0), Align::End)).push(header_cell("PID", SortBy::Pid, Length::Fixed(70.0), Align::End));
         let mut rows = column().spacing(1.0).width(Length::Fill).padding([10.0, 4.0, 10.0, 10.0]);
         for p in v.iter().take(MAX_PROCESSES) {
@@ -473,6 +517,15 @@ impl Monitor {
                 .push(text(human_bytes_binary(p.memory)).mono().role(TextRole::Caption).align(Align::End).width(90.0));
             if inspect::QUICK_SWAP {
                 content = content.push(text(p.swap.map_or("—".into(), human_bytes_binary)).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(80.0));
+            }
+            if energy {
+                // A process drawing a watt or more stands out.
+                let tone = match p.energy {
+                    Some(w) if w >= 1.0 => Tone::Warn,
+                    Some(_) => Tone::Inherit,
+                    None => Tone::Faint,
+                };
+                content = content.push(text(p.energy.map_or("—".into(), power::watts)).mono().role(TextRole::Caption).tone(tone).align(Align::End).width(80.0));
             }
             let content = content
                 .push(text(p.threads.map_or("—".into(), |n| n.to_string())).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(76.0))
@@ -544,6 +597,23 @@ impl Monitor {
         let (used, total) = (self.sys.used_memory(), self.sys.total_memory());
         let (swap_used, swap_total) = (self.sys.used_swap(), self.sys.total_swap());
         let mut mem_body = column().spacing(12.0).width(Length::Fill).push(sparkline(Vec::from(self.memory.clone()), 0.0, 100.0).height(70.0).tone(Tone::Good));
+        // Pressure, which says more than how full memory is: a healthy system
+        // keeps most of it in use as cache.
+        if let Some(p) = self.pressure_now {
+            let tone = pressure_tone(p.level);
+            mem_body = mem_body
+                .push(
+                    row()
+                        .spacing(8.0)
+                        .align(Align::Center)
+                        .width(Length::Fill)
+                        .push(text("Memory pressure").role(TextRole::Caption).tone(Tone::Muted))
+                        .push(Space::fill_x())
+                        .push(text(p.level.label()).role(TextRole::Caption).tone(tone))
+                        .push(text(format!("{:.0}%", p.percent)).mono().role(TextRole::Caption)),
+                )
+                .push(sparkline(Vec::from(self.pressure.clone()), 0.0, 100.0).height(44.0).tone(tone));
+        }
         if swap_total > 0 {
             mem_body = mem_body.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("Swap").role(TextRole::Caption).tone(Tone::Muted).width(60.0)).push(progress_bar(swap_used as f32 / swap_total as f32).height(6.0).tone(Tone::Warn)).push(text(format!("{} of {}", human_bytes_binary(swap_used), human_bytes_binary(swap_total))).mono().role(TextRole::Caption).tone(Tone::Muted)));
         }
@@ -619,8 +689,9 @@ fn snapshots(dir: std::path::PathBuf) {
         let mut app = Monitor::new();
         app.desktop.appearance.scheme = scheme;
         app.page = page;
-        for _ in 0..HISTORY {
-            std::thread::sleep(Duration::from_millis(20));
+        for i in 0..HISTORY {
+            // The last gap is long enough to measure energy over.
+            std::thread::sleep(Duration::from_millis(if i + 1 == HISTORY { 1200 } else { 20 }));
             app.sample();
         }
         if let Some(first) = app.sorted().first().map(|p| p.pid) {
