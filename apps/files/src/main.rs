@@ -1253,7 +1253,7 @@ mod tests {
         assert!(f.bookmark_menu.is_some());
         f.update(Msg::RemoveBookmark(root.join("alpha")));
         assert!(f.bookmark_menu.is_none());
-        assert_eq!(folders::load_bookmarks(&file), [root.clone()]);
+        assert_eq!(folders::load_bookmarks(&file), std::slice::from_ref(&root));
         // The same choice on a bookmarked folder takes it out too.
         f.update(Msg::Go(root.clone()));
         f.update(Msg::Context(None, Point::new(300.0, 400.0)));
