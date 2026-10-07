@@ -84,6 +84,10 @@ impl App for Counter {
 fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 ```
 
+## The Meadow colours in VS Code
+
+`dist/vscode/neo-meadow` is a VS Code extension with the same colour scheme, as **Neo Meadow Dark** and **Neo Meadow Light**. `dist/vscode/package.sh` packs it as a `.vsix` under `target/`, to install with `code --install-extension`. Its colours are a copy of the ones in `crates/neo/src/widgets/highlight.rs` and `neo-theme`, to be brought up to date by hand if those change.
+
 ## Crates
 
 Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framework with no look of its own, which supplies the windows, input, layout, renderer and test harness. Clone it next to this repository (`../armature`); the workspace finds it there.

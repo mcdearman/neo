@@ -1,0 +1,39 @@
+{
+  "name": "neo-meadow-theme",
+  "displayName": "Neo Meadow",
+  "description": "The Meadow colour scheme from NeoCode: a colour for each kind of name, after the Meadow REPL.",
+  "version": "0.1.0",
+  "publisher": "mcdearman",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mcdearman/neo"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Themes"
+  ],
+  "keywords": [
+    "theme",
+    "dark",
+    "light",
+    "meadow",
+    "neo"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "Neo Meadow Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/neo-meadow-dark-color-theme.json"
+      },
+      {
+        "label": "Neo Meadow Light",
+        "uiTheme": "vs",
+        "path": "./themes/neo-meadow-light-color-theme.json"
+      }
+    ]
+  }
+}
