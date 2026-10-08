@@ -37,6 +37,9 @@ struct Videos {
     position: f64,
     duration: Option<f64>,
     playing: bool,
+    /// Start playing as soon as the file is ready: it was opened to be
+    /// watched, from Files or a notification, not to be looked at paused.
+    autoplay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +63,7 @@ fn clock(seconds: f64) -> String {
 
 impl Videos {
     fn new(path: Option<PathBuf>) -> Self {
-        let mut app = Self { desktop: Desktop::load(), path: None, player: None, frame: None, error: None, volume: 1.0, muted: false, position: 0.0, duration: None, playing: false };
+        let mut app = Self { desktop: Desktop::load(), path: None, player: None, frame: None, error: None, volume: 1.0, muted: false, position: 0.0, duration: None, playing: false, autoplay: false };
         if let Some(p) = path {
             match Player::open(&p) {
                 Ok(player) => app.player = Some(player),
@@ -81,11 +84,16 @@ impl Videos {
     /// Copies the player's clock and newest frame into the app's state.
     fn sync(&mut self) {
         let Some(p) = &mut self.player else { return };
-        if let PlayerStatus::Failed(e) = p.status() {
-            self.error = Some(e);
-            self.player = None;
-            self.playing = false;
-            return;
+        match p.status() {
+            PlayerStatus::Failed(e) => {
+                self.error = Some(e);
+                self.player = None;
+                self.playing = false;
+                return;
+            }
+            // Ready, and opened to be watched: play, once.
+            PlayerStatus::Ready if std::mem::take(&mut self.autoplay) => p.set_playing(true),
+            _ => {}
         }
         if let Some(next) = p.frame(self.frame.as_ref()) {
             self.frame = Some(next);
@@ -293,7 +301,10 @@ fn main() {
         eprintln!("neo-videos: {} is not a file", p.display());
         std::process::exit(2);
     }
-    if let Err(e) = neo::run(Videos::new(path)) {
+    let mut app = Videos::new(path);
+    // Given a video to open, it is played without being asked twice.
+    app.autoplay = app.player.is_some();
+    if let Err(e) = neo::run(app) {
         eprintln!("neo-videos: {e}");
         std::process::exit(1);
     }
@@ -311,16 +322,15 @@ fn snapshots(dir: PathBuf, video: Option<PathBuf>) {
     for (name, video, scheme) in shots {
         let playing = video.is_some();
         let mut app = Videos::new(video);
+        // As when opened on a file: it plays once it is ready.
+        app.autoplay = app.player.is_some();
         app.desktop.appearance.scheme = scheme;
         let mut h = Harness::new(app, Size::new(1040.0, 700.0)).expect("GPU");
         if playing {
             h.app_mut().update(Msg::Volume(0.0));
             // Let it load, play for a moment, and report what happened.
-            for i in 0..80 {
+            for _ in 0..80 {
                 player::pump(0.025);
-                if i == 20 {
-                    h.app_mut().update(Msg::Toggle);
-                }
                 h.app_mut().update(Msg::Tick);
             }
             let a = h.app();
@@ -336,6 +346,37 @@ fn snapshots(dir: PathBuf, video: Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_opened_to_be_watched_starts_playing_when_it_is_ready() {
+        // Made with ffmpeg, where there is one; a kind it plays itself, so
+        // the test does not need the main thread's run loop.
+        let path = std::env::temp_dir().join(format!("neo-videos-{}-autoplay.mkv", std::process::id()));
+        let made = std::process::Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=12", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        // Opened and left alone, as from inside the app: it waits.
+        let mut still = Videos::new(Some(path.clone()));
+        still.update(Msg::Tick);
+        assert!(!still.playing && !still.autoplay);
+        // Opened to be watched: the first tick with the file ready plays it.
+        let mut app = Videos::new(Some(path.clone()));
+        app.autoplay = true;
+        app.update(Msg::Tick);
+        assert!(app.playing && !app.autoplay, "playing, and not to be started again");
+        // Pausing it afterwards stays paused.
+        app.update(Msg::Toggle);
+        app.update(Msg::Tick);
+        assert!(!app.playing);
+        // With nothing to play there is nothing to start.
+        let mut empty = Videos::new(None);
+        empty.autoplay = empty.player.is_some();
+        empty.update(Msg::Tick);
+        assert!(!empty.playing && !empty.autoplay);
+        drop((still, app));
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn formats_the_clock() {
