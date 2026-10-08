@@ -10,6 +10,8 @@ neo.workspace = true
 neo-desktop.workspace = true
 neo-apollo-core = { path = "../../crates/neo-apollo-core" }
 rfd = "0.17.2"
+# Hears from the system which files have changed, so that only they are read.
+notify = "8"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

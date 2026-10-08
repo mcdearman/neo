@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use neo::prelude::*;
-use neo::{Image, Size};
+use neo::{Image, Point, Rect, Size};
 use neo_apollo_core::assistant::{self, Answer};
 use neo_apollo_core::index::{self, Progress};
 use neo_apollo_core::key;
@@ -44,13 +44,20 @@ const THUMBS_KEPT: usize = 400;
 /// The pictures under an answer: how large, and how many at most.
 const TILE: (f32, f32) = (108.0, 72.0);
 const TILES: usize = 6;
+/// How wide a model's menu button is in Sources.
+const MODEL_W: f32 = 230.0;
 /// How tall the cloud is, and the graph that takes its place.
 const CLOUD_H: f32 = 300.0;
 /// How many picked words the graph shows at once, and how many words go round each.
 const HUBS: usize = 3;
 const ROUND_EACH: usize = 12;
-/// How often the folders are looked through again while the app is open.
-const READ_EVERY: Duration = Duration::from_secs(15 * 60);
+/// How often the folders are looked through in full while the app is
+/// open. Changes are heard of as they happen; this is for any that were not.
+const READ_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long the folders must be quiet before what changed is read, and
+/// the longest that changes are gathered for before some are read anyway.
+const CHANGES_QUIET: Duration = Duration::from_millis(1500);
+const CHANGES_AT_MOST: Duration = Duration::from_secs(20);
 /// How soon reading is tried again after being held off for want of memory.
 const RETRY_EVERY: Duration = Duration::from_secs(2 * 60);
 
@@ -156,8 +163,17 @@ struct Apollo {
     /// The models as typed in Sources, before they are put to use: the one
     /// that answers, the one that sees, the one that embeds.
     drafts: [String; 3],
-    /// The models the server has.
-    installed: Vec<String>,
+    /// The models the server has, each with what it can do: `completion`,
+    /// `vision`, `embedding`. Nothing, for a server too old to say.
+    installed: Vec<(String, Vec<String>)>,
+    /// Which model's menu is open, and where it hangs from.
+    choosing: Option<(usize, Point)>,
+    /// Which model's name is being typed, for one that is not here yet.
+    typing: Option<usize>,
+    /// Files the system says have changed, waiting to be read.
+    pending: Vec<PathBuf>,
+    /// Tells of changes in the folders that are read. Dropped to stop.
+    watcher: Option<notify::RecommendedWatcher>,
     /// Why the memory cannot be used with the model now chosen, if it was
     /// made with another.
     stale: Option<String>,
@@ -213,7 +229,16 @@ enum Msg {
     ModelDraft(usize, String),
     /// Put the models typed to use.
     UseModels,
-    Installed(Vec<String>),
+    Installed(Vec<(String, Vec<String>)>),
+    /// Open the menu of models for one of the three jobs, under its control.
+    ChooseModel(usize, Rect),
+    CloseChoice,
+    /// A model was picked from the menu: put it to use.
+    PickModel(usize, String),
+    /// Type the name of one that is not in the menu.
+    OtherModel(usize),
+    /// The system says these files or folders have changed.
+    Changed(Vec<PathBuf>),
     AskReset,
     CancelReset,
     /// Forget everything and read it all again with the model now chosen.
@@ -224,6 +249,47 @@ enum Msg {
     RemoveFolder(usize),
     RememberTalk(bool),
     ReadAutomatically(bool),
+}
+
+/// Has the system tell of changes under `roots`, giving `heard` the paths
+/// that changed. Changes come in bursts (a file is written in pieces, a
+/// folder is copied in), so they are gathered until it has gone quiet and
+/// given together. It goes on until what is returned is dropped, or
+/// `heard` returns false. `None` if the system will not tell.
+fn listen(roots: &[PathBuf], heard: impl Fn(Vec<PathBuf>) -> bool + Send + 'static) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        // Being opened or read is not a change.
+        if let Ok(event) = event
+            && !event.kind.is_access()
+        {
+            for path in event.paths {
+                let _ = tx.send(path);
+            }
+        }
+    })
+    .ok()?;
+    for root in roots {
+        let _ = watcher.watch(root, notify::RecursiveMode::Recursive);
+    }
+    // The thread ends when the watcher is dropped, which closes the channel.
+    std::thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let (mut changed, began) = (vec![first], std::time::Instant::now());
+            while began.elapsed() < CHANGES_AT_MOST {
+                match rx.recv_timeout(CHANGES_QUIET) {
+                    Ok(path) if !changed.contains(&path) => changed.push(path),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if !heard(changed) {
+                break;
+            }
+        }
+    });
+    Some(watcher)
 }
 
 /// A number with its noun: "1 memory", "1,204 memories".
@@ -321,6 +387,10 @@ impl Apollo {
             held: false,
             drafts: Default::default(),
             installed: vec![],
+            choosing: None,
+            typing: None,
+            pending: vec![],
+            watcher: None,
             stale: None,
             asking_reset: false,
             short_of_memory: || false,
@@ -420,7 +490,7 @@ impl Apollo {
                 }
             });
             if let Ok(have) = server.models() {
-                send(Msg::Installed(have));
+                send(Msg::Installed(have.into_iter().map(|m| (server.capabilities(&m).unwrap_or_default(), m)).map(|(can, m)| (m, can)).collect()));
             }
             let (ready, dims) = found.unwrap_or_else(|e| (Engine::Trouble(e), 0));
             send(Msg::Ready(ready, dims));
@@ -655,7 +725,23 @@ impl Apollo {
         });
     }
 
+    /// Looks through all the folders for what is new, changed or gone.
     fn read(&mut self) {
+        self.read_some(None);
+    }
+
+    /// Reads what the system has said changed, if nothing stands in the way.
+    /// What it is not the time for waits: the next full look finds it.
+    fn catch_up(&mut self) {
+        if !self.pending.is_empty() && !self.reading && self.settings.read_automatically && self.memory().is_some() {
+            let changed = std::mem::take(&mut self.pending);
+            self.read_some(Some(changed));
+        }
+    }
+
+    /// Brings the memory up to date: with everything in the folders, or
+    /// with just the paths in `only`.
+    fn read_some(&mut self, only: Option<Vec<PathBuf>>) {
         let Some((db, key)) = self.memory() else { return };
         if self.reading {
             return;
@@ -665,27 +751,43 @@ impl Apollo {
         if self.held {
             return;
         }
+        // A full look finds whatever changes were waiting.
+        if only.is_none() {
+            self.pending.clear();
+        }
         self.reading = true;
         self.stop_reading = Arc::default();
         self.progress = Progress::default();
         let (model, roots, stop, short) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory);
         self.work(move |send| {
-            let done = match Store::open_for(&db, &key, &*model) {
-                Ok(mut store) => index::run(&mut store, &*model, &roots, &mut |p| {
-                    send(Msg::Progress(p.clone()));
-                    // Between files is where it can stop without losing anything.
-                    if short() {
-                        send(Msg::Held);
-                        return false;
-                    }
-                    !stop.load(Ordering::Relaxed)
-                }),
-                Err(e) => Progress { trouble: Some(e), ..Progress::default() },
+            let mut report = |p: &Progress| {
+                send(Msg::Progress(p.clone()));
+                // Between files is where it can stop without losing anything.
+                if short() {
+                    send(Msg::Held);
+                    return false;
+                }
+                !stop.load(Ordering::Relaxed)
+            };
+            let done = match (Store::open_for(&db, &key, &*model), &only) {
+                (Ok(mut store), None) => index::run(&mut store, &*model, &roots, &mut report),
+                (Ok(mut store), Some(changed)) => index::update(&mut store, &*model, &roots, changed, &mut report),
+                (Err(e), _) => Progress { trouble: Some(e), ..Progress::default() },
             };
             // Done for now: give the memory of the model that sees back.
             model.rest();
             send(Msg::ReadDone(done));
         });
+    }
+
+    /// Has the system tell of changes in the folders that are read, so
+    /// that a new screenshot is remembered in moments and without looking
+    /// through everything else. Asked again whenever the folders change.
+    fn watch(&mut self) {
+        self.watcher = None;
+        if let Some(proxy) = self.proxy.clone().filter(|_| self.settings.read_automatically) {
+            self.watcher = listen(&self.settings.roots(), move |changed| proxy.send(Msg::Changed(changed)));
+        }
     }
 
     /// One line on what Apollo is doing, for the sidebar.
@@ -753,6 +855,7 @@ impl App for Apollo {
             }
         }
         self.check_model();
+        self.watch();
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
@@ -940,6 +1043,8 @@ impl App for Apollo {
                 }
                 self.progress = p;
                 self.show();
+                // Whatever changed while that was going on.
+                self.catch_up();
             }
             Msg::Held => self.held = true,
             Msg::ModelDraft(i, name) => {
@@ -947,8 +1052,32 @@ impl App for Apollo {
                     *draft = name;
                 }
             }
-            Msg::UseModels => self.use_models(),
+            Msg::UseModels => {
+                self.typing = None;
+                self.use_models();
+            }
             Msg::Installed(have) => self.installed = have,
+            Msg::ChooseModel(i, under) => {
+                self.typing = None;
+                self.choosing = Some((i, Point::new(under.x, under.bottom() + 4.0)));
+            }
+            Msg::CloseChoice => self.choosing = None,
+            Msg::PickModel(i, name) => {
+                self.choosing = None;
+                if let Some(draft) = self.drafts.get_mut(i) {
+                    *draft = name;
+                    self.use_models();
+                }
+            }
+            Msg::OtherModel(i) => (self.choosing, self.typing) = (None, Some(i)),
+            Msg::Changed(paths) => {
+                for path in paths {
+                    if !self.pending.contains(&path) {
+                        self.pending.push(path);
+                    }
+                }
+                self.catch_up();
+            }
             Msg::AskReset => self.asking_reset = self.stale.is_some(),
             Msg::CancelReset => self.asking_reset = false,
             Msg::Reset => self.reset(),
@@ -958,6 +1087,7 @@ impl App for Apollo {
                     if !self.settings.folders.iter().any(|f| f.path == dir) {
                         self.settings.folders.push(Folder { path: dir, on: true });
                         self.save_settings();
+                        self.watch();
                     }
                     self.read();
                 }
@@ -966,6 +1096,7 @@ impl App for Apollo {
                 if let Some(f) = self.settings.folders.get_mut(i) {
                     f.on = on;
                     self.save_settings();
+                    self.watch();
                     self.read();
                 }
             }
@@ -973,12 +1104,14 @@ impl App for Apollo {
                 if i < self.settings.folders.len() {
                     self.settings.folders.remove(i);
                     self.save_settings();
+                    self.watch();
                     self.read();
                 }
             }
             Msg::ReadAutomatically(on) => {
                 self.settings.read_automatically = on;
                 self.save_settings();
+                self.watch();
                 if on {
                     self.read();
                 }
@@ -1003,7 +1136,33 @@ impl Apollo {
             Page::Memory => self.memory_page(),
             Page::Sources => self.sources_page(),
         };
-        split(self.sidebar(), main)
+        let page = split(self.sidebar(), main);
+        // The menu of models hangs over everything, from the control that opened it.
+        match self.choosing {
+            Some((job, at)) => stack().width(Length::Fill).height(Length::Fill).push(page).push(popup_menu(at, self.model_menu(job), Msg::CloseChoice)).into(),
+            None => page,
+        }
+    }
+
+    /// The models that can do one of the three jobs (answer, see, embed),
+    /// of those the server has. One whose abilities are not known is offered
+    /// for every job.
+    fn models_for(&self, job: usize) -> Vec<&str> {
+        let need = ["completion", "vision", "embedding"][job.min(2)];
+        self.installed.iter().filter(|(_, can)| can.is_empty() || (can.iter().any(|c| c == need) && (job == 2 || !can.iter().all(|c| c == "embedding")))).map(|(name, _)| name.as_str()).collect()
+    }
+
+    fn model_menu(&self, job: usize) -> Vec<MenuItem<Msg>> {
+        let now = self.chosen()[job.min(2)].clone();
+        // Had as "name:latest", chosen as "name": the same model.
+        let same = |a: &str, b: &str| a == b || a.strip_suffix(":latest") == Some(b) || b.strip_suffix(":latest") == Some(a);
+        let mut items: Vec<MenuItem<Msg>> = self.models_for(job).into_iter().map(|name| if same(name, &now) { MenuItem::new(name, Msg::CloseChoice).icon(icons::CHECK) } else { MenuItem::new(name, Msg::PickModel(job, name.to_owned())) }).collect();
+        if items.is_empty() {
+            items.push(MenuItem::disabled("None here yet that can do this"));
+        }
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new("Another, by name…", Msg::OtherModel(job)).icon(icons::DOWNLOAD));
+        items
     }
 
     /// Asks before everything remembered is thrown away.
@@ -1254,14 +1413,22 @@ impl Apollo {
         page = page.push(section("Conversations")).push(setting("Remember what I ask", "What you ask Apollo and what it answers go into its memory, so it can be brought up later.", toggle(self.settings.remember_conversations, Msg::RememberTalk)));
         // The models, which can be any the server has or can get.
         let running = text(if self.ready == Engine::Ready { "Running" } else { "Not running" }).role(TextRole::Caption).tone(if self.ready == Engine::Ready { Tone::Good } else { Tone::Warn });
-        page = page.push(section("Models")).push(setting("On this computer", "Apollo's models are served by Ollama here, and nothing is sent anywhere. Any model it offers can be used: type its name as Ollama lists it, such as qwen3:8b, and it is downloaded if it is not here yet.", running));
+        page = page.push(section("Models")).push(setting("On this computer", "Apollo's models are served by Ollama here, and nothing is sent anywhere. Each job below can be given to any model that is here, or to another by name, which is downloaded.", running));
         let jobs = [("Answers with", "The model that holds the conversation."), ("Describes pictures with", "A model that can see: it is shown each picture and each frame of a video."), ("Places text by meaning with", "An embedding model. Memories made with one cannot be searched with another, so changing it means starting the memory afresh.")];
         for (i, (title, help)) in jobs.into_iter().enumerate() {
-            page = page.push(setting(title, help, text_input("model name", self.drafts[i].clone()).on_input(move |name| Msg::ModelDraft(i, name)).on_submit(Msg::UseModels).width(230.0)));
+            // A menu of the models that are here; or, for one that is not, its name typed.
+            let control: Element<Msg> = if self.typing == Some(i) {
+                text_input("name, as Ollama lists it", self.drafts[i].clone()).on_input(move |name| Msg::ModelDraft(i, name)).on_submit(Msg::UseModels).autofocus(true).width(MODEL_W).into()
+            } else {
+                let face = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text(self.chosen()[i].clone()).no_wrap().width(Length::Fill)).push(icon(icons::CHEVRONS_UP_DOWN).size(14.0).tone(Tone::Muted));
+                mouse_area(container(face).surface(Surface::Raised).radius(8.0).padding([12.0, 7.0]).width(MODEL_W)).on_press_in(move |at| Msg::ChooseModel(i, at)).into()
+            };
+            page = page.push(setting(title, help, control));
         }
-        let changed = self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() && self.drafts.iter().all(|m| !m.trim().is_empty());
-        let have = if self.installed.is_empty() { "Type a model's name and press Use These Models.".to_owned() } else { format!("Here already: {}", self.installed.join(", ")) };
-        page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(have).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Use These Models")).on_press_maybe(changed.then_some(Msg::UseModels))));
+        if self.typing.is_some() {
+            let changed = self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() && self.drafts.iter().all(|m| !m.trim().is_empty());
+            page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("Type a model's name and press Return. It is downloaded if it is not here yet.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Use This Model")).on_press_maybe(changed.then_some(Msg::UseModels))));
+        }
         if let Some(why) = &self.stale {
             page = page.push(notice(Tone::Warn, format!("{why} Go back to the model it was made with, or start the memory afresh."))).push(row().push(Button::new(text("Start Memory Afresh…")).on_press(Msg::AskReset)));
         }
@@ -1368,7 +1535,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
     type Shot<'a> = (&'a str, neo_desktop::SchemePref, &'a dyn Fn(&mut Apollo));
-    let shots: [Shot; 5] = [
+    let shots: [Shot; 6] = [
         ("apollo-ask", neo_desktop::SchemePref::Light, &|a| {
             a.update(Msg::Unlock);
             a.update(Msg::Suggest("Which photos show a dog on the beach?".into()));
@@ -1386,6 +1553,12 @@ fn snapshots(dir: PathBuf) {
             a.update(Msg::Word("beach".into()));
         }),
         ("apollo-sources", neo_desktop::SchemePref::Light, &|a| a.update(Msg::Page(Page::Sources))),
+        ("apollo-models", neo_desktop::SchemePref::Dark, &|a| {
+            a.update(Msg::Page(Page::Sources));
+            let can = |name: &str, what: &[&str]| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>());
+            a.update(Msg::Installed(vec![can("gemma3:1b", &["completion"]), can("gemma3:4b", &["completion", "vision"]), can("qwen3:8b", &["completion", "tools"]), can("nomic-embed-text:latest", &["embedding"])]));
+            a.update(Msg::ChooseModel(0, Rect::new(826.0, 250.0, MODEL_W, 34.0)));
+        }),
     ];
     for (name, scheme, set) in shots {
         let (mut app, scratch) = sample(name, true);
@@ -1727,6 +1900,33 @@ mod tests {
         std::fs::remove_file(folder.join("more.txt")).unwrap();
         a.update(Msg::Read);
         assert_eq!(a.stats.of(Kind::Document), before + 1);
+        // Told of a change, only that file is read, and nothing else is looked for.
+        std::fs::write(folder.join("told.txt"), "A note about a cat and a kitten.").unwrap();
+        std::fs::write(folder.join("untold.txt"), "A note nobody mentioned, about code.").unwrap();
+        a.update(Msg::Changed(vec![folder.join("told.txt"), folder.join("told.txt")]));
+        assert_eq!((a.progress.read, a.progress.total, a.stats.of(Kind::Document), a.pending.len()), (1, 1, before + 2, 0));
+        // While memory is short, changes wait; a full look later finds them and what was not mentioned.
+        std::fs::write(folder.join("later.txt"), "Another, about snow on a peak.").unwrap();
+        a.short_of_memory = || true;
+        a.update(Msg::Changed(vec![folder.join("later.txt")]));
+        assert_eq!((a.held, a.stats.of(Kind::Document)), (true, before + 2));
+        a.short_of_memory = || false;
+        a.update(Msg::Read);
+        assert_eq!((a.progress.read, a.stats.of(Kind::Document), a.pending.len()), (2, before + 4, 0));
+        // Gone again, told of: forgotten.
+        for name in ["told.txt", "untold.txt", "later.txt"] {
+            std::fs::remove_file(folder.join(name)).unwrap();
+        }
+        a.update(Msg::Changed(vec![folder.join("told.txt"), folder.join("untold.txt"), folder.join("later.txt")]));
+        assert_eq!((a.progress.forgotten, a.stats.of(Kind::Document)), (3, before + 1));
+        // With reading by itself turned off, changes are not acted on.
+        a.settings.read_automatically = false;
+        std::fs::write(folder.join("quiet.txt"), "Not to be read unasked.").unwrap();
+        a.update(Msg::Changed(vec![folder.join("quiet.txt")]));
+        assert_eq!(a.stats.of(Kind::Document), before + 1);
+        std::fs::remove_file(folder.join("quiet.txt")).unwrap();
+        a.settings.read_automatically = true;
+        a.pending.clear();
         // Turned off, the folder's memories are forgotten; the choice is saved.
         a.update(Msg::FolderOn(0, false));
         assert_eq!((a.stats.of(Kind::Document), a.progress.forgotten), (before, 1));
@@ -1863,7 +2063,30 @@ mod tests {
         assert_eq!((a.settings.chat_model.as_str(), a.settings.vision_model.as_str(), a.settings.embed_model.as_str()), ("qwen3:8b", "qwen3-vl:8b", "nomic-embed-text"));
         let saved = Settings::load_from(&file);
         assert_eq!((saved.chat_model, saved.vision_model), ("qwen3:8b".to_owned(), "qwen3-vl:8b".to_owned()));
-        a.update(Msg::Installed(vec!["qwen3:8b".into()]));
+        // The menu for each job offers the models that can do it.
+        let can = |name: &str, what: &[&str]| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>());
+        a.update(Msg::Installed(vec![can("qwen3:8b", &["completion", "tools"]), can("gemma3:4b", &["completion", "vision"]), can("nomic-embed-text:latest", &["embedding"]), can("mystery", &[])]));
+        assert_eq!((a.models_for(0), a.models_for(1), a.models_for(2)), (vec!["qwen3:8b", "gemma3:4b", "mystery"], vec!["gemma3:4b", "mystery"], vec!["nomic-embed-text:latest", "mystery"]));
+        a.update(Msg::ChooseModel(1, Rect::new(700.0, 400.0, 230.0, 32.0)));
+        assert_eq!(a.choosing, Some((1, Point::new(700.0, 436.0))), "the menu hangs under its control");
+        assert_eq!(a.model_menu(1).len(), 4, "the two that can see, a line, and another by name");
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.app_mut().update(Msg::Page(Page::Sources));
+        h.render(1.0);
+        h.key(Key::Escape, Modifiers::default());
+        let mut a = std::mem::replace(h.app_mut(), sample("models-menu", false).0);
+        assert_eq!(a.choosing, None, "Escape closes it");
+        // Picked from the menu, a model is put to use at once.
+        a.update(Msg::ChooseModel(1, Rect::new(700.0, 400.0, 230.0, 32.0)));
+        a.update(Msg::PickModel(1, "gemma3:4b".into()));
+        assert_eq!((a.choosing, a.settings.vision_model.as_str(), Settings::load_from(&file).vision_model.as_str()), (None, "gemma3:4b", "gemma3:4b"));
+        // One that is not in the menu is typed.
+        a.update(Msg::OtherModel(1));
+        assert_eq!(a.typing, Some(1));
+        a.update(Msg::ModelDraft(1, "qwen3-vl:8b".into()));
+        a.update(Msg::UseModels);
+        assert_eq!((a.typing, a.settings.vision_model.as_str()), (None, "qwen3-vl:8b"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-models-menu-{}", std::process::id())));
 
         // The memory is marked as the first model's when it is first used.
         let folder = scratch.0.join("things");
@@ -1898,6 +2121,26 @@ mod tests {
         a.update(Msg::Unlock);
         assert_eq!((a.stats.total(), a.stats.of(Kind::Document)), (1, 1), "only what was read again; the rest is gone");
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-models-swap-{}", std::process::id())));
+    }
+
+    #[test]
+    fn the_system_tells_of_a_file_that_changes() {
+        let dir = std::env::temp_dir().join(format!("neo-apollo-listen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        // As the system names it, which on macOS is not as it was asked for.
+        let dir = dir.canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = listen(std::slice::from_ref(&dir), move |changed| tx.send(changed).is_ok()).expect("this system tells of changes");
+        // Watching takes a moment to begin.
+        std::thread::sleep(Duration::from_millis(400));
+        std::fs::write(dir.join("inner/new.txt"), "one").unwrap();
+        std::fs::write(dir.join("inner/new.txt"), "one, and more").unwrap();
+        let told: Vec<PathBuf> = rx.recv_timeout(Duration::from_secs(15)).expect("told of the change");
+        assert!(told.iter().any(|p| p.ends_with("inner/new.txt")), "{told:?}");
+        assert_eq!(told.iter().filter(|p| p.ends_with("inner/new.txt")).count(), 1, "a file written twice in a burst is told of once");
+        drop(watcher);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

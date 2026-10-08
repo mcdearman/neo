@@ -82,6 +82,23 @@ fn modified(meta: &std::fs::Metadata) -> u64 {
     meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
 }
 
+/// Whether a folder of this name is passed over with all that is in it:
+/// hidden ones, those that are not the user's own things, and packages,
+/// such as an app or a photo library, which are one thing and not a
+/// folder of files.
+fn passed_over(name: &str) -> bool {
+    name.starts_with('.') || SKIPPED.contains(&name) || ["app", "photoslibrary", "bundle", "framework"].contains(&extension(Path::new(name)).as_str())
+}
+
+/// What a file is to Apollo, if it is one Apollo reads: of a kind it
+/// knows, and neither an icon nor a heap of data.
+fn fits(path: &Path, meta: &std::fs::Metadata) -> Option<What> {
+    let what = classify(path)?;
+    let too_small = what == What::Photo && meta.len() < SMALLEST_PHOTO;
+    let too_large = what == What::Document && meta.len() > MOST_TEXT && extension(path) != "pdf";
+    (meta.is_file() && meta.len() > 0 && !too_small && !too_large && !name(path).starts_with('.')).then_some(what)
+}
+
 /// Every file under `roots` that Apollo reads: documents, which are quick,
 /// and then photos and videos together, the newest first, so that what
 /// was just made is remembered soonest.
@@ -96,16 +113,11 @@ pub fn walk(roots: &[PathBuf]) -> Vec<PathBuf> {
                 continue;
             }
             if kind.is_dir() {
-                // A package, such as an app or a photo library, is one thing and not a folder of files.
-                let package = ["app", "photoslibrary", "bundle", "framework"].contains(&extension(&path).as_str());
-                if !SKIPPED.contains(&name.as_str()) && !package {
+                if !passed_over(&name) {
                     into(&path, out);
                 }
-            } else if let Some(what) = classify(&path)
-                && let Ok(meta) = entry.metadata()
-                && !(what == What::Photo && meta.len() < SMALLEST_PHOTO)
-                && !(what == What::Document && meta.len() > MOST_TEXT && extension(&path) != "pdf")
-                && meta.len() > 0
+            } else if let Ok(meta) = entry.metadata()
+                && let Some(what) = fits(&path, &meta)
             {
                 out.push((what, modified(&meta), path));
             }
@@ -409,7 +421,57 @@ pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], report: &mut
         Ok(n) => p.forgotten = n,
         Err(e) => p.trouble = Some(e),
     }
-    let files = walk(roots);
+    read_files(store, model, walk(roots), p, report)
+}
+
+/// Brings the memory up to date with what has changed at `changed`, and
+/// nothing else: a file there is read if it is new or different, what was
+/// remembered of one that has gone is forgotten, and a folder is looked
+/// through. Paths outside `roots`, or in folders that are passed over,
+/// are left alone. For when the system says which files changed, so that
+/// one new screenshot does not mean looking through everything again.
+pub fn update(store: &mut Store, model: &dyn Model, roots: &[PathBuf], changed: &[PathBuf], report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+    let mut p = Progress::default();
+    let mut files: Vec<PathBuf> = vec![];
+    for path in changed {
+        let Some(root) = roots.iter().find(|r| path.starts_with(r)) else { continue };
+        let inside = path.strip_prefix(root).unwrap_or(path);
+        let folders = inside.parent().into_iter().flat_map(Path::components);
+        if folders.into_iter().any(|c| passed_over(&c.as_os_str().to_string_lossy())) {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                if !passed_over(&name(path)) || path == root {
+                    files.extend(walk(std::slice::from_ref(path)));
+                }
+            }
+            Ok(meta) => {
+                if fits(path, &meta).is_some() {
+                    files.push(path.clone());
+                }
+            }
+            // Gone: the file itself, or a folder with files in it.
+            Err(_) => {
+                let was: Vec<PathBuf> = store.files().unwrap_or_default().into_iter().filter(|f| f.starts_with(path)).collect();
+                for file in was {
+                    match store.forget_source(&file) {
+                        Ok(_) => p.forgotten += 1,
+                        Err(e) => p.trouble = Some(e),
+                    }
+                }
+            }
+        }
+    }
+    if p.forgotten > 0 {
+        let _ = store.tidy_words();
+    }
+    files.sort();
+    files.dedup();
+    read_files(store, model, files, p, report)
+}
+
+fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: Progress, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
     p.total = files.len();
     for file in files {
         let unchanged = std::fs::metadata(&file).ok().map(|m| stamp_of(&file, &m)).is_some_and(|s| store.file_stamp(&file).ok().flatten().as_deref() == Some(s.as_str()));
@@ -565,6 +627,45 @@ mod tests {
             assert_eq!((w, h), (160, 90));
             assert!(rgba[2] > 150 && rgba[0] < 110, "a frame of the video itself: {:?}", &rgba[..4]);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_what_changed_is_looked_at_when_the_changes_are_known() {
+        let dir = scratch("update");
+        let model = Fake::default();
+        let mut store = Store::open(&dir.join("db/memory.db"), &[1; 32], model.dims().unwrap()).unwrap();
+        let root = dir.join("things");
+        std::fs::create_dir_all(root.join("trip")).unwrap();
+        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        std::fs::write(root.join("old.txt"), "An old note about an invoice.").unwrap();
+        let roots = vec![root.clone()];
+        assert_eq!(run(&mut store, &model, &roots, &mut |_| true).read, 1);
+        // Another file is there that no change was told of: it is not gone looking for.
+        std::fs::write(root.join("unseen.txt"), "Nobody said this was here.").unwrap();
+        picture(&root.join("trip/red.png"), [220, 40, 40]);
+        picture(&root.join(".cache/blue.png"), [40, 40, 220]);
+        std::fs::write(root.join("program.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("outside.txt"), "Not in a folder that is read.").unwrap();
+        let told = [root.join("trip/red.png"), root.join(".cache/blue.png"), root.join("program.rs"), dir.join("outside.txt"), root.join("old.txt")];
+        let mut seen = vec![];
+        let p = update(&mut store, &model, &roots, &told, &mut |p| {
+            seen.extend(p.now.as_deref().map(name));
+            true
+        });
+        assert_eq!((p.read, p.total, seen), (1, 2, vec!["red.png".to_owned()]), "the new picture is read; the note is looked at and found the same; the rest are not Apollo's to read");
+        assert_eq!((store.stats().unwrap().total(), store.file_stamp(&root.join("unseen.txt")).unwrap()), (2, None));
+        // A folder that appears is looked through; one that goes takes its memories with it.
+        std::fs::create_dir_all(root.join("more")).unwrap();
+        picture(&root.join("more/green.png"), [40, 220, 40]);
+        std::fs::write(root.join("more/note.md"), "Hiking the mountain in the snow.").unwrap();
+        assert_eq!(update(&mut store, &model, &roots, &[root.join("more")], &mut |_| true).read, 2);
+        std::fs::remove_dir_all(root.join("more")).unwrap();
+        std::fs::remove_file(root.join("trip/red.png")).unwrap();
+        let p = update(&mut store, &model, &roots, &[root.join("more"), root.join("trip/red.png"), root.join("never-was.png")], &mut |_| true);
+        assert_eq!((p.forgotten, p.read, store.stats().unwrap().total()), (3, 0, 1));
+        // A full look afterwards finds what no change told of.
+        assert_eq!(run(&mut store, &model, &roots, &mut |_| true).read, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
