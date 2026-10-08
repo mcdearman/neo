@@ -11,6 +11,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod folders;
+mod props;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -101,6 +102,8 @@ struct Files {
     bookmarks_file: Option<PathBuf>,
     /// The menu open on a bookmark, and where.
     bookmark_menu: Option<(PathBuf, Point)>,
+    /// The file or folder whose Properties are showing.
+    props: Option<props::Properties>,
     /// Raised to bring the selection into view, when it has moved without
     /// being clicked: by the keyboard, or by being asked to show a file.
     reveal: u64,
@@ -154,6 +157,9 @@ enum Msg {
     /// are bookmarked, not copied.
     BookmarkDrop(Vec<PathBuf>),
     RemoveBookmark(PathBuf),
+    CloseProps,
+    /// Put this text on the clipboard: a path, from the menu or from Properties.
+    Copy(String),
     /// A right click on a bookmark.
     BookmarkMenu(PathBuf, Point),
     CloseBookmarkMenu,
@@ -216,6 +222,14 @@ enum Choice {
     Hidden,
     /// Put the folder clicked, or this one, in the sidebar, or take it out.
     Bookmark,
+    /// Open what was clicked, or this folder, in NeoCode.
+    Code,
+    /// See what is using the space in a folder, in NeoDisk.
+    Disk,
+    CopyPath,
+    /// Make a copy beside the original.
+    Duplicate,
+    Properties,
 }
 
 fn read_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
@@ -268,6 +282,7 @@ impl Files {
             bookmarks_file: (!cfg!(test)).then(folders::bookmarks_file),
             bookmarks: vec![],
             bookmark_menu: None,
+            props: None,
             reveal: 0,
         };
         if let Some(file) = &f.bookmarks_file {
@@ -762,6 +777,12 @@ impl App for Files {
                 self.bookmark_menu = None;
                 self.set_bookmark(path, false);
             }
+            Msg::CloseProps => self.props = None,
+            Msg::Copy(text) => {
+                // Tests leave the clipboard alone.
+                let copied = cfg!(test) || arboard::Clipboard::new().and_then(|mut c| c.set_text(text)).is_ok();
+                self.status = Some(if copied { (Tone::Good, "Copied.".into()) } else { (Tone::Bad, "Could not reach the clipboard.".into()) });
+            }
             Msg::BookmarkMenu(path, at) => self.bookmark_menu = Some((path, at)),
             Msg::CloseBookmarkMenu => self.bookmark_menu = None,
             Msg::Context(path, at) => {
@@ -787,6 +808,63 @@ impl App for Files {
                         let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
                         let on = !self.bookmarks.contains(&dir);
                         self.set_bookmark(dir, on);
+                    }
+                    Choice::Code => {
+                        let path = target.unwrap_or_else(|| self.dir.clone());
+                        if !neo_desktop::fs::open_in("neo-code", "NeoCode", &path) {
+                            self.status = Some((Tone::Bad, "NeoCode is not installed.".into()));
+                        }
+                    }
+                    Choice::Disk => {
+                        let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
+                        if !neo_desktop::fs::open_in("neo-disk", "NeoDisk", &dir) {
+                            self.status = Some((Tone::Bad, "NeoDisk is not installed.".into()));
+                        }
+                    }
+                    Choice::CopyPath => {
+                        // Every selected entry, a line each; or this folder.
+                        let paths: Vec<String> = if target.is_some() { self.selected.iter().map(|p| p.display().to_string()).collect() } else { vec![self.dir.display().to_string()] };
+                        self.update(Msg::Copy(paths.join("\n")));
+                    }
+                    Choice::Duplicate => {
+                        let sources = self.selected.clone();
+                        let work = move || {
+                            let mut done = neo_desktop::fs::Transferred::default();
+                            for src in &sources {
+                                let (Some(dir), Some(name)) = (src.parent(), src.file_name()) else { continue };
+                                neo_desktop::fs::copy_all(src, &neo_desktop::fs::free_name(dir, &name.to_string_lossy())).map_err(|e| e.to_string())?;
+                                done.copied += 1;
+                            }
+                            Ok(done)
+                        };
+                        match self.proxy.clone() {
+                            Some(proxy) => {
+                                self.status = Some((Tone::Muted, "Working…".into()));
+                                std::thread::spawn(move || proxy.send(Msg::Dropped(work())));
+                            }
+                            None => self.update(Msg::Dropped(work())),
+                        }
+                    }
+                    Choice::Properties => {
+                        let path = target.unwrap_or_else(|| self.dir.clone());
+                        self.props = props::Properties::read(&path);
+                        // A folder not among those listed, such as this one,
+                        // has not been added up yet.
+                        if path.is_dir() && !self.sizes.contains_key(&path) {
+                            self.sizes.insert(path.clone(), FolderSize::Measuring);
+                            match &self.size_queue {
+                                Some(queue) => {
+                                    let _ = queue.send((self.visit.load(std::sync::atomic::Ordering::Relaxed), path.clone()));
+                                }
+                                None => {
+                                    let size = folders::measure(&path, &|| true);
+                                    self.sizes.insert(path.clone(), size.map_or(FolderSize::Unknown, FolderSize::Known));
+                                }
+                            }
+                        }
+                        if self.props.is_none() {
+                            self.status = Some((Tone::Bad, format!("{} is no longer there.", path.display())));
+                        }
                     }
                     Choice::Terminal => {
                         let dir = target.filter(|p| p.is_dir()).unwrap_or_else(|| self.dir.clone());
@@ -819,6 +897,10 @@ impl Files {
     /// The window's content, which the settings panel goes over.
     fn content(&self) -> Element<Msg> {
         let main = split(self.places(), column().width(Length::Fill).height(Length::Fill).push(self.toolbar()).push(Divider::horizontal()).push(self.list()).push(Divider::horizontal()).push(self.status_bar()));
+        // Properties, over everything else until it is closed.
+        if let Some(p) = &self.props {
+            return neo_desktop::ui::modal(main, self.properties(p), 460.0, Msg::CloseProps);
+        }
         // The menu on a bookmark in the sidebar.
         if let Some((path, at)) = &self.bookmark_menu {
             let items = vec![MenuItem::new("Open", Msg::Go(path.clone())).icon(icons::FOLDER_OPEN), MenuItem::separator(), MenuItem::new("Remove from Sidebar", Msg::RemoveBookmark(path.clone())).icon(icons::BOOKMARK_MINUS)];
@@ -831,28 +913,49 @@ impl Files {
             Some(_) if self.selected.len() > 1 => vec![
                 MenuItem::new(format!("Open {} Items", self.selected.len()), Msg::Choose(Choice::Open)).icon(icons::EXTERNAL_LINK),
                 MenuItem::separator(),
+                MenuItem::new("Copy Paths", Msg::Choose(Choice::CopyPath)).icon(icons::CLIPBOARD_COPY),
+                MenuItem::new(format!("Duplicate {} Items", self.selected.len()), Msg::Choose(Choice::Duplicate)).icon(icons::COPY),
                 MenuItem::disabled("Rename…").icon(icons::PENCIL),
+                MenuItem::separator(),
                 MenuItem::new(format!("Move {} Items to Trash", self.selected.len()), Msg::Choose(Choice::Trash)).icon(icons::TRASH_2).danger(),
             ],
             Some(e) => {
                 let mut items = vec![MenuItem::new("Open", Msg::Choose(Choice::Open)).icon(if e.dir { icons::FOLDER_OPEN } else { icons::EXTERNAL_LINK })];
                 if e.dir {
                     items.push(MenuItem::new("Open in Terminal", Msg::Choose(Choice::Terminal)).icon(icons::SQUARE_TERMINAL));
+                }
+                items.push(MenuItem::new("Open in NeoCode", Msg::Choose(Choice::Code)).icon(icons::CODE));
+                if e.dir {
+                    items.push(MenuItem::new("See What Is Using It", Msg::Choose(Choice::Disk)).icon(icons::CHART_PIE));
                     let marked = self.bookmarks.contains(&e.path);
                     items.push(MenuItem::new(if marked { "Remove from Sidebar" } else { "Add to Sidebar" }, Msg::Choose(Choice::Bookmark)).icon(if marked { icons::BOOKMARK_MINUS } else { icons::BOOKMARK_PLUS }));
                 }
-                items.extend([MenuItem::separator(), MenuItem::new("Rename…", Msg::Choose(Choice::Rename)).icon(icons::PENCIL), MenuItem::new("Move to Trash", Msg::Choose(Choice::Trash)).icon(icons::TRASH_2).danger()]);
+                items.extend([
+                    MenuItem::separator(),
+                    MenuItem::new("Copy Path", Msg::Choose(Choice::CopyPath)).icon(icons::CLIPBOARD_COPY),
+                    MenuItem::new("Duplicate", Msg::Choose(Choice::Duplicate)).icon(icons::COPY),
+                    MenuItem::new("Rename…", Msg::Choose(Choice::Rename)).icon(icons::PENCIL),
+                    MenuItem::separator(),
+                    MenuItem::new("Properties", Msg::Choose(Choice::Properties)).icon(icons::INFO),
+                    MenuItem::separator(),
+                    MenuItem::new("Move to Trash", Msg::Choose(Choice::Trash)).icon(icons::TRASH_2).danger(),
+                ]);
                 items
             }
             None => vec![
                 MenuItem::new("New Folder", Msg::Choose(Choice::NewFolder)).icon(icons::FOLDER_PLUS),
                 MenuItem::new("Open Terminal Here", Msg::Choose(Choice::Terminal)).icon(icons::SQUARE_TERMINAL),
+                MenuItem::new("Open This Folder in NeoCode", Msg::Choose(Choice::Code)).icon(icons::CODE),
+                MenuItem::new("See What Is Using It", Msg::Choose(Choice::Disk)).icon(icons::CHART_PIE),
+                MenuItem::new("Copy Path", Msg::Choose(Choice::CopyPath)).icon(icons::CLIPBOARD_COPY),
                 {
                     let marked = self.bookmarks.contains(&self.dir);
                     MenuItem::new(if marked { "Remove This Folder from Sidebar" } else { "Add This Folder to Sidebar" }, Msg::Choose(Choice::Bookmark)).icon(if marked { icons::BOOKMARK_MINUS } else { icons::BOOKMARK_PLUS })
                 },
                 MenuItem::separator(),
                 MenuItem::new(if self.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" }, Msg::Choose(Choice::Hidden)).icon(if self.show_hidden { icons::EYE_OFF } else { icons::EYE }),
+                MenuItem::separator(),
+                MenuItem::new("Properties", Msg::Choose(Choice::Properties)).icon(icons::INFO),
             ],
         };
         stack().width(Length::Fill).height(Length::Fill).push(main).push(popup_menu(*at, items, Msg::CloseMenu)).into()
@@ -1098,6 +1201,70 @@ impl Files {
         view.push(rows).into()
     }
 
+    /// Everything known about one file or folder.
+    fn properties(&self, p: &props::Properties) -> Element<Msg> {
+        let head = row()
+            .spacing(12.0)
+            .align(Align::Center)
+            .width(Length::Fill)
+            .push(icon(if p.dir { icons::FOLDER } else { file_icon(&p.path, false) }).size(30.0).tone(if p.dir { Tone::Accent } else { Tone::Muted }))
+            .push(column().spacing(2.0).width(Length::Fill).push(text(p.name.clone()).role(TextRole::Title)).push(text(p.kind.clone()).role(TextRole::Caption).tone(Tone::Muted)))
+            .push(icon_button(icons::X, 28.0).kind(ButtonKind::Ghost).on_press(Msg::CloseProps));
+        let line = |name: &str, value: String| row().spacing(12.0).width(Length::Fill).push(container(text(name.to_owned()).role(TextRole::Caption).tone(Tone::Muted)).width(110.0)).push(text(value).role(TextRole::Caption).width(Length::Fill));
+        let exact = |n: u64| if n < 1000 { format!("{n} bytes") } else { format!("{} ({n} bytes)", human_size(n)) };
+        let mut rows = column().spacing(8.0).width(Length::Fill);
+        // A folder's size is everything in it, once that has been added up.
+        rows = rows.push(line(
+            "Size",
+            match (p.dir, self.sizes.get(&p.path)) {
+                (false, _) => exact(p.size),
+                (true, Some(FolderSize::Known(n))) => exact(*n),
+                (true, Some(FolderSize::Measuring)) => "Being added up…".into(),
+                (true, _) => "—".into(),
+            },
+        ));
+        if let Some(on_disk) = p.on_disk.filter(|d| *d != p.size) {
+            rows = rows.push(line("On disk", exact(on_disk)));
+        }
+        if let Some(n) = p.items {
+            rows = rows.push(line("Contains", if n == 1 { "1 item".into() } else { format!("{n} items") }));
+        }
+        if let Some((w, h)) = p.pixels {
+            rows = rows.push(line("Dimensions", format!("{w} × {h} pixels")));
+        }
+        if let Some(target) = &p.link {
+            rows = rows.push(line("Points to", target.display().to_string()));
+        }
+        rows = rows.push(line("Where", p.path.parent().map(|d| d.display().to_string()).unwrap_or_default()));
+        rows = rows.push(Divider::horizontal());
+        for (name, time) in [("Created", p.created), ("Modified", p.modified), ("Last opened", p.accessed)] {
+            if let Some(t) = time {
+                rows = rows.push(line(name, neo_desktop::fs::full_time(t)));
+            }
+        }
+        if p.permissions.is_some() || p.owner.is_some() {
+            rows = rows.push(Divider::horizontal());
+        }
+        if let Some((user, group)) = &p.owner {
+            rows = rows.push(line("Owner", format!("{user}, group {group}")));
+        }
+        if let Some((letters, number)) = &p.permissions {
+            rows = rows.push(line("Permissions", format!("{letters}  ({number:o})")));
+        }
+        let mut notes = vec![];
+        if p.read_only {
+            notes.push("Read-only");
+        }
+        if p.hidden {
+            notes.push("Hidden");
+        }
+        if !notes.is_empty() {
+            rows = rows.push(line("Also", notes.join(", ")));
+        }
+        let foot = row().spacing(8.0).width(Length::Fill).push(Space::fill_x()).push(button("Copy Path").on_press(Msg::Copy(p.path.display().to_string()))).push(Button::new(text("Done").role(TextRole::Strong)).kind(ButtonKind::Accent).on_press(Msg::CloseProps));
+        column().spacing(16.0).width(Length::Fill).push(head).push(Divider::horizontal()).push(rows).push(foot).into()
+    }
+
     fn status_bar(&self) -> Element<Msg> {
         let v = self.visible();
         let folders = v.iter().filter(|e| e.dir).count();
@@ -1206,6 +1373,16 @@ fn snapshots(dir: PathBuf) {
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());
     }
+
+    // A file's Properties.
+    let mut app = Files::new(root.clone());
+    app.desktop.appearance.scheme = neo_desktop::SchemePref::Dark;
+    app.update(Msg::Context(Some(root.join("Cargo.lock")), Point::new(300.0, 300.0)));
+    app.update(Msg::Choose(Choice::Properties));
+    let mut h = Harness::new(app, Size::new(1040.0, 680.0)).expect("GPU");
+    let path = dir.join("files-properties.png");
+    h.save_png(&path, 1.0).expect("write png");
+    println!("wrote {}", path.display());
 }
 
 #[cfg(test)]
@@ -1333,6 +1510,57 @@ mod tests {
         assert!(!f.show_hidden);
         f.show(root.join(".hidden-one"));
         assert!(f.show_hidden && f.visible().iter().any(|e| e.name == ".hidden-one"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_menu_offers_properties_a_copy_of_the_path_and_a_duplicate() {
+        let root = temp_dir("menu-more");
+        std::fs::write(root.join("alpha/inner.txt"), vec![0u8; 700]).unwrap();
+        let mut f = Files::new(root.clone());
+        // Properties of a file: read when asked, shown over the window.
+        f.update(Msg::Context(Some(root.join("notes.txt")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::Properties));
+        let p = f.props.clone().expect("its properties");
+        assert_eq!((p.name.as_str(), p.kind.as_str(), p.size, p.dir), ("notes.txt", "Plain text", 2, false));
+        assert!(f.menu.is_none(), "the menu has gone");
+        let mut h = neo::testing::Harness::new(f, Size::new(1040.0, 680.0)).unwrap();
+        let shown = h.render(1.0);
+        // Escape, or a click outside it, puts it away.
+        h.key(Key::Escape, Modifiers::default());
+        assert!(h.app().props.is_none());
+        assert!(h.render(1.0) != shown);
+        let mut f = Files::new(root.clone());
+        // Of a folder: what it holds, from the sizes already added up.
+        f.update(Msg::Context(Some(root.join("alpha")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::Properties));
+        let p = f.props.clone().unwrap();
+        assert_eq!((p.dir, p.items, p.kind.as_str()), (true, Some(1), "Folder"));
+        assert_eq!(f.sizes[&root.join("alpha")], FolderSize::Known(700));
+        f.update(Msg::CloseProps);
+        // Of the folder being shown, from its own background: added up now.
+        f.update(Msg::Context(None, Point::new(300.0, 400.0)));
+        f.update(Msg::Choose(Choice::Properties));
+        assert_eq!(f.props.as_ref().map(|p| p.path.clone()), Some(root.clone()));
+        assert_eq!(f.sizes[&root], FolderSize::Known(702));
+        f.update(Msg::CloseProps);
+        // Copying a path says so; several selected are copied a line each.
+        f.update(Msg::Context(Some(root.join("notes.txt")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::CopyPath));
+        assert_eq!(f.status, Some((Tone::Good, "Copied.".into())));
+        // A duplicate is made beside the original, folder and all.
+        f.update(Msg::Context(Some(root.join("notes.txt")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::Duplicate));
+        assert_eq!(std::fs::read_to_string(root.join("notes copy.txt")).unwrap(), "hi");
+        f.update(Msg::Context(Some(root.join("alpha")), Point::new(300.0, 200.0)));
+        f.update(Msg::Choose(Choice::Duplicate));
+        assert!(root.join("alpha copy/inner.txt").is_file());
+        assert!(f.entries.iter().any(|e| e.name == "alpha copy"), "and the list shows it");
+        // Something that has gone has no properties to show.
+        std::fs::remove_file(root.join("notes copy.txt")).unwrap();
+        f.menu = Some((Some(root.join("notes copy.txt")), Point::new(1.0, 1.0)));
+        f.update(Msg::Choose(Choice::Properties));
+        assert!(f.props.is_none() && f.status.as_ref().is_some_and(|(tone, _)| *tone == Tone::Bad));
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1687,7 +1687,9 @@ dependencies = [
 name = "neo-files"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "image",
+ "libc",
  "neo",
  "neo-desktop",
 ]

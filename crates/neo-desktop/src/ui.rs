@@ -149,6 +149,14 @@ pub fn sheet<M: 'static>(content: impl Into<Element<M>>, width: f32) -> Element<
     Element::new(Sheet { content: [content.into()], width })
 }
 
+/// Shows a panel over `view`: what is behind is dimmed and out of reach,
+/// and a click on it, or Escape, sends `on_dismiss`. `content` goes in a
+/// solid sheet `width` wide in the middle of the window.
+pub fn modal<M: Clone + 'static>(view: impl Into<Element<M>>, content: impl Into<Element<M>>, width: f32, on_dismiss: M) -> Element<M> {
+    let panel = Element::new(Sheet { content: [content.into()], width });
+    stack().push(view).push(Element::new(Scrim { on_dismiss })).push(container(panel).width(Length::Fill).height(Length::Fill).center()).into()
+}
+
 /// An app's settings panel, shown over `view`: the app's own rows, then
 /// the ones every Neo app has.
 pub(crate) fn settings_panel<M: Clone + 'static>(desktop: &Desktop, view: Element<M>, heading: &str, wrap: impl Fn(DesktopMsg) -> M + Clone + 'static, extra: Vec<Element<M>>) -> Element<M> {
@@ -171,6 +179,5 @@ pub(crate) fn settings_panel<M: Clone + 'static>(desktop: &Desktop, view: Elemen
     if let Some(e) = &desktop.error {
         rows = rows.push(notice(Tone::Bad, e.clone()));
     }
-    let panel = Element::new(Sheet { content: [rows.into()], width: 480.0 });
-    stack().push(view).push(Element::new(Scrim { on_dismiss: close })).push(container(panel).width(Length::Fill).height(Length::Fill).center()).into()
+    modal(view, rows, 480.0, close)
 }

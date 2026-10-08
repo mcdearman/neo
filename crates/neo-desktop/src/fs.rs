@@ -204,6 +204,12 @@ pub fn friendly_time(t: SystemTime) -> String {
     }
 }
 
+/// A time in full, for where the exact moment matters: "8 Oct 2026, 09:41:07".
+pub fn full_time(t: SystemTime) -> String {
+    let t: DateTime<Local> = t.into();
+    t.format("%-d %b %Y, %H:%M:%S").to_string()
+}
+
 /// An icon for a file, chosen by extension.
 pub fn file_icon(path: &Path, is_dir: bool) -> Icon {
     if is_dir {

@@ -10,3 +10,8 @@ neo.workspace = true
 neo-desktop.workspace = true
 # For thumbnails in the grid view.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+# For copying a path.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
