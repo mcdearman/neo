@@ -1867,6 +1867,7 @@ dependencies = [
 name = "neo-apollo"
 version = "0.1.0"
 dependencies = [
+ "image",
  "neo",
  "neo-apollo-core",
  "neo-desktop",

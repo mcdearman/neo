@@ -11,14 +11,15 @@
 //!     cargo run -p neo-apollo -- --index        read the folders, without a window
 //!     cargo run -p neo-apollo -- --snapshot target/snapshots
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use neo::Size;
 use neo::prelude::*;
+use neo::{Image, Size};
 use neo_apollo_core::assistant::{self, Answer};
 use neo_apollo_core::index::{self, Progress};
 use neo_apollo_core::key;
@@ -34,6 +35,12 @@ use cloud::{Cloud, Graph, Hub};
 /// How many words the cloud shows, and how many memories a list.
 const CLOUD_WORDS: usize = 90;
 const LISTED: usize = 40;
+/// The longest side of a photo's or a video's small picture in the list,
+/// in pixels, and the size it is shown at.
+const THUMB_SIDE: u32 = 192;
+const THUMB: (f32, f32) = (72.0, 48.0);
+/// How many small pictures are kept before the oldest listing's are let go.
+const THUMBS_KEPT: usize = 400;
 /// How tall the cloud is, and the graph that takes its place.
 const CLOUD_H: f32 = 300.0;
 /// How many picked words the graph shows at once, and how many words go round each.
@@ -127,6 +134,10 @@ struct Apollo {
     trail: Vec<String>,
     graph: Rc<Vec<Hub>>,
     shown: Shown,
+    /// Small pictures of the photos and videos listed. `None` for one being
+    /// made, or that could not be. Kept only in memory, and only while the
+    /// memory is unlocked: on disk they would give away what is encrypted.
+    thumbs: HashMap<PathBuf, Option<Image>>,
     cloud: Rc<Vec<Word>>,
     stats: Stats,
 
@@ -181,6 +192,8 @@ enum Msg {
     Open(PathBuf),
     Reveal(PathBuf),
     Forget(i64),
+    /// A small picture of a file has been made, or could not be.
+    Thumb(PathBuf, Option<(u32, u32, Vec<u8>)>),
 
     Read,
     Progress(Progress),
@@ -287,6 +300,7 @@ impl Apollo {
             trail: vec![],
             graph: Rc::default(),
             shown: Shown::default(),
+            thumbs: HashMap::new(),
             cloud: Rc::default(),
             stats: Stats::default(),
             reading: false,
@@ -490,6 +504,7 @@ impl Apollo {
         self.store = None;
         (self.shown, self.cloud, self.graph, self.stats, self.asked) = (Shown::default(), Rc::default(), Rc::default(), Stats::default(), None);
         self.trail.clear();
+        self.thumbs.clear();
         self.query.clear();
     }
 
@@ -536,7 +551,7 @@ impl Apollo {
         shown
             .iter()
             .map(|word| {
-                let related = store.related(word, &self.also(word), each)?;
+                let related = store.related(word, &self.also(word), each, self.kind)?;
                 let most = related.iter().map(|r| r.shared).max().unwrap_or(0).max(1) as f32;
                 // One that only means something near counts for less than any that shares a memory.
                 Ok(Hub { word: word.clone(), related: related.into_iter().map(|r| (r.word, if r.shared > 0 { 0.25 + 0.75 * r.shared as f32 / most } else { 0.1 })).collect() })
@@ -550,7 +565,7 @@ impl Apollo {
         let Some(store) = self.store.take() else { return };
         let filled = (|| -> Result<(), String> {
             self.stats = store.stats()?;
-            self.cloud = Rc::new(store.cloud(CLOUD_WORDS)?);
+            self.cloud = Rc::new(store.cloud(CLOUD_WORDS, self.kind)?);
             self.graph = Rc::new(self.hubs(&store)?);
             self.shown = self.listed(&store)?;
             Ok(())
@@ -559,6 +574,29 @@ impl Apollo {
             self.trouble = Some(e);
         }
         self.store = Some(store);
+        self.picture_the_list();
+    }
+
+    /// Has small pictures made of the photos and videos listed that have
+    /// none yet, off the main thread.
+    fn picture_the_list(&mut self) {
+        if self.thumbs.len() > THUMBS_KEPT {
+            let listed: Vec<&PathBuf> = self.shown.items.iter().filter_map(|(m, _)| m.source.as_ref()).collect();
+            self.thumbs.retain(|path, _| listed.contains(&path));
+        }
+        let wanted: Vec<PathBuf> = self.shown.items.iter().filter(|(m, _)| matches!(m.kind, Kind::Photo | Kind::Video)).filter_map(|(m, _)| m.source.clone()).filter(|p| !self.thumbs.contains_key(p)).collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for path in &wanted {
+            self.thumbs.insert(path.clone(), None);
+        }
+        self.work(move |send| {
+            for path in wanted {
+                let pixels = index::thumbnail(&path, THUMB_SIDE);
+                send(Msg::Thumb(path, pixels));
+            }
+        });
     }
 
     fn search(&mut self) {
@@ -809,6 +847,12 @@ impl App for Apollo {
                     let _ = neo_desktop::fs::reveal(&path);
                 }
             }
+            Msg::Thumb(path, pixels) => {
+                // One that comes after the memory was locked is not kept.
+                if self.store.is_some() {
+                    self.thumbs.insert(path, pixels.map(|(w, h, rgba)| Image::new(w, h, rgba)));
+                }
+            }
             Msg::Forget(id) => {
                 if let Some(store) = &mut self.store {
                     if let Err(e) = store.forget(id).and_then(|()| store.tidy_words()) {
@@ -1055,8 +1099,16 @@ impl Apollo {
     fn memory_row(&self, m: &Memory, distance: Option<f32>) -> Element<Msg> {
         let when = neo_desktop::fs::friendly_time(std::time::UNIX_EPOCH + Duration::from_secs(m.created));
         let place = m.source.as_deref().and_then(Path::parent).map(|p| format!("{}  ·  ", short_path(p))).unwrap_or_default();
-        let words = column().spacing(2.0).width(Length::Fill).push(text(m.title.clone()).role(TextRole::Strong).no_wrap()).push(text(snippet(&m.text, 210)).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(text(format!("{place}{when}")).role(TextRole::Caption).tone(Tone::Faint).no_wrap());
-        let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(icon(kind_icon(m.kind)).size(18.0).tone(Tone::Accent)).push(words);
+        let title: Element<Msg> = if m.kind == Kind::Video { row().spacing(6.0).align(Align::Center).push(icon(icons::FILM).size(13.0).tone(Tone::Accent)).push(text(m.title.clone()).role(TextRole::Strong).no_wrap()).into() } else { text(m.title.clone()).role(TextRole::Strong).no_wrap().into() };
+        let words = column().spacing(2.0).width(Length::Fill).push(title).push(text(snippet(&m.text, 210)).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(text(format!("{place}{when}")).role(TextRole::Caption).tone(Tone::Faint).no_wrap());
+        // A photo or a video is shown by a small picture of it; the rest, and
+        // those whose picture is not made yet, by what kind of thing they are.
+        let lead: Element<Msg> = match m.source.as_ref().and_then(|p| self.thumbs.get(p)).and_then(Option::as_ref) {
+            Some(small) => container(picture(small).fit(Fit::Cover).width(THUMB.0).height(THUMB.1)).width(THUMB.0).height(THUMB.1).into(),
+            None if matches!(m.kind, Kind::Photo | Kind::Video) => container(icon(kind_icon(m.kind)).size(18.0).tone(Tone::Accent)).surface(Surface::Well).radius(6.0).width(THUMB.0).height(THUMB.1).center().into(),
+            None => container(icon(kind_icon(m.kind)).size(18.0).tone(Tone::Accent)).width(THUMB.0).center().into(),
+        };
+        let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(lead).push(words);
         if let Some(d) = distance {
             // How near in meaning, as a share: the same is 100%.
             line = line.push(text(format!("{:.0}%", ((1.0 - d) * 100.0).clamp(0.0, 100.0))).role(TextRole::Caption).tone(Tone::Muted));
@@ -1263,6 +1315,7 @@ fn snapshots(dir: PathBuf) {
         ("apollo-word", neo_desktop::SchemePref::Light, &|a| {
             a.update(Msg::Page(Page::Memory));
             a.update(Msg::Unlock);
+            a.update(Msg::Kind(Some(Kind::Photo)));
             a.update(Msg::Word("dog".into()));
             a.update(Msg::Word("beach".into()));
         }),
@@ -1272,6 +1325,13 @@ fn snapshots(dir: PathBuf) {
         let (mut app, scratch) = sample(name, true);
         app.desktop.appearance.scheme = scheme;
         set(&mut app);
+        // The sample's files are not there to take pictures from: stand-ins, each its own colours.
+        let listed: Vec<PathBuf> = app.shown.items.iter().filter(|(m, _)| matches!(m.kind, Kind::Photo | Kind::Video)).filter_map(|(m, _)| m.source.clone()).collect();
+        for (n, path) in listed.into_iter().enumerate() {
+            let (w, h) = (96u32, 64u32);
+            let rgba = (0..w * h).flat_map(|i| [(40 + n as u32 * 53 + i % w) as u8, (90 + i / w * 2) as u8, (200 - n as u32 * 37 % 160) as u8, 255]).collect();
+            app.thumbs.insert(path, Some(Image::new(w, h, rgba)));
+        }
         let mut h = Harness::new(app, Size::new(1080.0, 720.0)).expect("GPU");
         let path = dir.join(format!("{name}.png"));
         h.save_png(&path, 1.0).expect("write png");
@@ -1363,6 +1423,20 @@ mod tests {
         assert!(!titles(&a).is_empty() && a.shown.items.iter().all(|(m, _)| m.kind == Kind::Video));
         assert_eq!(titles(&a)[0], "Hike.mp4", "the one with a dog in it");
         a.update(Msg::Kind(None));
+        // The cloud is of the kind chosen: the videos' words, not the invoices'.
+        let everything = a.cloud.len();
+        a.update(Msg::Clear);
+        a.update(Msg::Kind(Some(Kind::Video)));
+        let words: Vec<&str> = a.cloud.iter().map(|w| w.word.as_str()).collect();
+        assert!(words.contains(&"hiking") && words.contains(&"screen recording") && !words.contains(&"invoice") && !words.contains(&"cat") && words.len() < everything, "{words:?}");
+        a.update(Msg::Word("dog".into()));
+        let round: Vec<&str> = a.graph[0].related.iter().map(|(w, _)| w.as_str()).collect();
+        assert!(round.contains(&"trail") && !round.contains(&"beach"), "and so are the words that go with one: {round:?}");
+        a.update(Msg::Kind(Some(Kind::Document)));
+        assert!(a.cloud.iter().any(|w| w.word == "invoice") && a.cloud.iter().all(|w| w.word != "hiking"));
+        a.update(Msg::Clear);
+        a.update(Msg::Kind(None));
+        assert_eq!(a.cloud.len(), everything);
         // A word from the cloud: what is about it.
         a.update(Msg::Word("invoice".into()));
         assert_eq!((a.shown.heading.as_str(), a.trail.as_slice(), a.query.as_str()), ("About “invoice”", ["invoice".to_owned()].as_slice(), ""));
@@ -1380,6 +1454,39 @@ mod tests {
         a.update(Msg::Forget(first));
         assert_eq!(a.stats.total(), before - 1);
         assert!(a.shown.items.iter().all(|(m, _)| m.id != first));
+    }
+
+    #[test]
+    fn photos_and_videos_in_the_list_show_small_pictures() {
+        use neo_apollo_core::store::New;
+        let (mut a, scratch) = app("thumbs");
+        let photo = scratch.0.join("red.png");
+        image::RgbImage::from_fn(300, 200, |x, y| image::Rgb([220, (x % 40) as u8, (y % 40) as u8])).save(&photo).unwrap();
+        {
+            let mut store = Store::open(&a.db, &a.key.unwrap(), a.dims).unwrap();
+            store.add(&New { kind: Kind::Photo, source: Some(&photo), title: "red.png", text: "A red picture.", part: 0, created: 1_800_000_000, words: &[] }, &neo_apollo_core::model::fake::vector("red")).unwrap();
+        }
+        a.update(Msg::Page(Page::Memory));
+        assert!(a.thumbs.is_empty(), "none while it is locked");
+        a.update(Msg::Unlock);
+        assert_eq!(a.shown.items[0].0.title, "red.png");
+        let small = a.thumbs.get(&photo).expect("asked for").as_ref().expect("and made");
+        assert_eq!((small.width(), small.height()), (THUMB_SIDE, THUMB_SIDE * 2 / 3));
+        // Those whose files are not there have none, and are not asked for twice.
+        let asked = a.thumbs.len();
+        assert!(asked > 1 && a.thumbs.values().filter(|t| t.is_some()).count() == 1);
+        assert!(a.thumbs.keys().all(|p| !p.to_string_lossy().ends_with(".md")), "documents have none to make");
+        a.update(Msg::Kind(Some(Kind::Photo)));
+        assert!(a.thumbs.len() <= asked);
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        let px = h.render(1.0);
+        // The first row's picture, at the left of the list, is the red of the file.
+        let red = (0..px.len() / 4).filter(|i| px[i * 4] > 200 && px[i * 4 + 1] < 60 && px[i * 4 + 2] < 60).count();
+        assert!(red > 1500, "the picture is drawn: {red} red pixels");
+        // A picture that arrives after locking is not kept, and locking lets go of the rest.
+        h.app_mut().update(Msg::Lock);
+        h.app_mut().update(Msg::Thumb(photo.clone(), Some((1, 1, vec![0; 4]))));
+        assert!(h.app().thumbs.is_empty());
     }
 
     #[test]

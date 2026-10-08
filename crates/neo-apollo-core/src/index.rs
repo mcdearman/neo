@@ -219,6 +219,24 @@ fn look_at(path: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A small picture of a photo, or of a moment early in a video, for a
+/// list: its width, its height, and its pixels as RGBA, the longest side
+/// no more than `side`. `None` for anything else, or if it cannot be read.
+pub fn thumbnail(path: &Path, side: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if !path.is_file() {
+        return None;
+    }
+    let jpeg = match classify(path)? {
+        What::Photo => look_at(path).ok()?,
+        // Not the very start, which is so often black.
+        What::Video => frame(path, duration(path).map_or(0.0, |d| (d * 0.15).min(10.0)))?,
+        What::Document => return None,
+    };
+    let small = image::load_from_memory(&jpeg).ok()?.thumbnail(side, side).into_rgba8();
+    let (w, h) = small.dimensions();
+    Some((w, h, small.into_raw()))
+}
+
 /// How long a video is, in seconds.
 fn duration(path: &Path) -> Option<f64> {
     let out = run_tool("ffprobe", &["-v".as_ref(), "error".as_ref(), "-show_entries".as_ref(), "format=duration".as_ref(), "-of".as_ref(), "csv=p=0".as_ref(), path.as_os_str()])?;
@@ -493,7 +511,7 @@ mod tests {
         assert_eq!((found[0].memory.title.as_str(), found[0].memory.kind, found[0].memory.text.as_str()), ("red.png", Kind::Photo, "A dog running on a beach."));
         assert_eq!(store.search(&ask("invoice payment"), 1, None).unwrap()[0].memory.title, "bill.md");
         assert_eq!(store.words_of(found[0].memory.id).unwrap(), ["beach", "dog"]);
-        assert!(store.cloud(20).unwrap().iter().any(|w| w.word == "invoice" || w.also.iter().any(|a| a == "invoice")), "a document's own words are in the cloud");
+        assert!(store.cloud(20, None).unwrap().iter().any(|w| w.word == "invoice" || w.also.iter().any(|a| a == "invoice")), "a document's own words are in the cloud");
         assert!(store.word_vector("dog").unwrap().is_some());
 
         // Nothing has changed: nothing is read.
@@ -511,10 +529,29 @@ mod tests {
         assert_eq!((p.read, p.forgotten, p.total), (1, 1, 2));
         assert_eq!(store.stats().unwrap().of(Kind::Photo), 1);
         assert_eq!(store.recent(1, Some(Kind::Photo)).unwrap()[0].text, "Waves on the sea.", "read afresh, not added to");
-        assert!(store.cloud(50).unwrap().iter().all(|w| w.word != "mountain"), "the words of what is gone go with it");
+        assert!(store.cloud(50, None).unwrap().iter().all(|w| w.word != "mountain"), "the words of what is gone go with it");
         // A folder no longer read is forgotten.
         let p = run(&mut store, &model, &[], &mut |_| true);
         assert_eq!((p.forgotten, store.stats().unwrap().total()), (2, 0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn photos_and_videos_have_small_pictures_for_lists() {
+        let dir = scratch("thumb");
+        picture(&dir.join("wide.png"), [220, 40, 40]);
+        let (w, h, rgba) = thumbnail(&dir.join("wide.png"), 120).expect("a photo has one");
+        assert_eq!((w, h, rgba.len()), (120, 80, 120 * 80 * 4), "the shape kept, the longest side brought down");
+        std::fs::write(dir.join("notes.txt"), "words").unwrap();
+        std::fs::write(dir.join("broken.png"), vec![0u8; 9000]).unwrap();
+        assert!(thumbnail(&dir.join("notes.txt"), 120).is_none() && thumbnail(&dir.join("gone.png"), 120).is_none() && thumbnail(&dir.join("broken.png"), 120).is_none());
+        if have("ffmpeg") && have("ffprobe") {
+            let clip = dir.join("clip.mp4");
+            assert!(Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-v", "error", "-f", "lavfi", "-i", "color=c=0x2828DC:s=320x180:d=3", "-pix_fmt", "yuv420p"]).arg(&clip).status().unwrap().success());
+            let (w, h, rgba) = thumbnail(&clip, 160).expect("a video has one");
+            assert_eq!((w, h), (160, 90));
+            assert!(rgba[2] > 150 && rgba[0] < 110, "a frame of the video itself: {:?}", &rgba[..4]);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

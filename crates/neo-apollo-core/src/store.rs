@@ -376,10 +376,14 @@ impl Store {
     /// A word's weight is how many memories are about it, tempered so that
     /// one in nearly every memory ("photo") does not drown the rest. Words
     /// whose embeddings are close are one word, under the commonest of them.
-    pub fn cloud(&self, most: usize) -> Result<Vec<Word>, String> {
-        let total: f32 = self.db.query_row("select count(*) from memories", [], |r| r.get::<_, i64>(0)).map_err(err)? as f32;
-        let mut st = self.db.prepare("select w.word, count(*) as n, (select embedding from word_vectors v where v.rowid = w.id) from words w join memory_words mw on mw.word = w.id group by w.id order by n desc, w.word limit ?1").map_err(err)?;
-        let pool: Vec<(String, u32, Option<Vec<f32>>)> = st.query_map([CLOUD_POOL as i64], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, Option<Vec<u8>>>(2)?.map(|b| floats(&b))))).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+    ///
+    /// With a `kind`, only that kind's memories are counted: the cloud of
+    /// the videos, say, and not of everything.
+    pub fn cloud(&self, most: usize, kind: Option<Kind>) -> Result<Vec<Word>, String> {
+        let kind = kind.map(Kind::name);
+        let total: f32 = self.db.query_row("select count(*) from memories where ?1 is null or kind = ?1", [kind], |r| r.get::<_, i64>(0)).map_err(err)? as f32;
+        let mut st = self.db.prepare("select w.word, count(*) as n, (select embedding from word_vectors v where v.rowid = w.id) from words w join memory_words mw on mw.word = w.id join memories m on m.id = mw.memory where ?2 is null or m.kind = ?2 group by w.id order by n desc, w.word limit ?1").map_err(err)?;
+        let pool: Vec<(String, u32, Option<Vec<f32>>)> = st.query_map(params![CLOUD_POOL as i64, kind], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, Option<Vec<u8>>>(2)?.map(|b| floats(&b))))).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
         // Commonest first, each either joining one already kept or kept itself.
         let mut kept: Vec<(Word, Option<Vec<f32>>)> = vec![];
         for (word, count, vector) in pool {
@@ -411,7 +415,9 @@ impl Store {
     /// (or about `also`, words folded into it) are about as well, the ones
     /// that share most memories first; and then, if there is room, words
     /// that are simply near it in meaning. At most `most`.
-    pub fn related(&self, word: &str, also: &[String], most: usize) -> Result<Vec<Related>, String> {
+    /// With a `kind`, only among memories of that kind.
+    pub fn related(&self, word: &str, also: &[String], most: usize, kind: Option<Kind>) -> Result<Vec<Related>, String> {
+        let of_kind = kind.map_or(String::new(), |k| format!(" and mw1.memory in (select id from memories where kind = '{}')", k.name()));
         let mut names: Vec<&str> = vec![word];
         names.extend(also.iter().map(String::as_str));
         let marks = vec!["?"; names.len()].join(", ");
@@ -419,7 +425,7 @@ impl Store {
             .db
             .prepare(&format!(
                 "select w2.word, count(distinct mw2.memory) as n from words w1 join memory_words mw1 on mw1.word = w1.id join memory_words mw2 on mw2.memory = mw1.memory join words w2 on w2.id = mw2.word
-                 where w1.word in ({marks}) and w2.word not in ({marks}) group by w2.id order by n desc, w2.word limit {most}"
+                 where w1.word in ({marks}) and w2.word not in ({marks}){of_kind} group by w2.id order by n desc, w2.word limit {most}"
             ))
             .map_err(err)?;
         let twice: Vec<&str> = names.iter().chain(names.iter()).copied().collect();
@@ -429,8 +435,15 @@ impl Store {
         {
             let mut near = self.db.prepare("select w.word, v.distance from word_vectors v join words w on w.id = v.rowid where v.embedding match ?1 and k = ?2 order by v.distance").map_err(err)?;
             let found: Vec<(String, f32)> = near.query_map(params![blob(&vector), (most * 2 + names.len()) as i64], |r| Ok((r.get(0)?, r.get::<_, f64>(1)? as f32))).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+            // Near in meaning, and with a kind chosen, a word that kind's memories use.
+            let used = |w: &str| -> Result<bool, String> {
+                match kind {
+                    None => Ok(true),
+                    Some(k) => self.db.prepare("select 1 from memory_words mw join words w on w.id = mw.word join memories m on m.id = mw.memory where w.word = ?1 and m.kind = ?2").and_then(|mut st| st.exists(params![w, k.name()])).map_err(err),
+                }
+            };
             for (w, distance) in found {
-                if out.len() < most && distance < NEAR_WORD && !names.contains(&w.as_str()) && !out.iter().any(|r| r.word == w) {
+                if out.len() < most && distance < NEAR_WORD && used(&w)? && !names.contains(&w.as_str()) && !out.iter().any(|r| r.word == w) {
                     out.push(Related { word: w, shared: 0, distance: Some(distance) });
                 }
             }
@@ -598,7 +611,7 @@ mod tests {
         add(&["invoice", "photo"]);
         // Before the words have embeddings, each stands for itself.
         assert_eq!(s.words_without_vectors(&words(&["dog", "dogs", "dog", "nothing"])).unwrap(), ["dog", "dogs", "nothing"]);
-        assert_eq!(s.cloud(10).unwrap().len(), 5);
+        assert_eq!(s.cloud(10, None).unwrap().len(), 5);
         s.set_word_vector("dog", &[1.0, 0.0, 0.0]).unwrap();
         s.set_word_vector("dogs", &[0.98, 0.1, 0.0]).unwrap();
         s.set_word_vector("beach", &[0.0, 1.0, 0.0]).unwrap();
@@ -607,14 +620,14 @@ mod tests {
         assert_eq!(s.words_without_vectors(&words(&["dog", "beach"])).unwrap(), Vec::<String>::new());
         assert_eq!(s.word_vector("beach").unwrap(), Some(vec![0.0, 1.0, 0.0]));
         assert_eq!(s.word_vector("nothing").unwrap(), None);
-        let cloud = s.cloud(10).unwrap();
+        let cloud = s.cloud(10, None).unwrap();
         let dog = cloud.iter().find(|w| w.word == "dog").unwrap();
         assert_eq!((dog.count, dog.also.as_slice()), (6, ["dogs".to_owned()].as_slice()), "dogs are counted with dog");
         assert!(cloud.iter().all(|w| w.word != "dogs"));
         assert_eq!((cloud[0].word.as_str(), cloud[0].weight), ("dog", 1.0), "the word in every memory does not come first");
         let weight = |word: &str| cloud.iter().find(|w| w.word == word).unwrap().weight;
         assert!(weight("photo") < weight("beach") && weight("beach") > weight("invoice"), "being in every memory counts against a word");
-        assert_eq!(s.cloud(2).unwrap().len(), 2);
+        assert_eq!(s.cloud(2, None).unwrap().len(), 2);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -660,15 +673,24 @@ mod tests {
             s.add(&new(Kind::Photo, None, "t", "x", &words(ws)), &[1.0, 0.0, 0.0]).unwrap();
         }
         let names = |r: Vec<Related>| r.into_iter().map(|r| (r.word, r.shared)).collect::<Vec<_>>();
-        assert_eq!(names(s.related("dog", &[], 10).unwrap()), [("beach".into(), 2), ("sea".into(), 1)], "those that share most memories first");
-        assert_eq!(names(s.related("dog", &words(&["dogs"]), 10).unwrap()), [("beach".into(), 2), ("park".into(), 1), ("sea".into(), 1)], "with the words folded into it");
-        assert_eq!(s.related("dog", &[], 1).unwrap().len(), 1);
-        assert_eq!(s.related("nothing", &[], 5).unwrap(), vec![]);
+        assert_eq!(names(s.related("dog", &[], 10, None).unwrap()), [("beach".into(), 2), ("sea".into(), 1)], "those that share most memories first");
+        assert_eq!(names(s.related("dog", &words(&["dogs"]), 10, None).unwrap()), [("beach".into(), 2), ("park".into(), 1), ("sea".into(), 1)], "with the words folded into it");
+        assert_eq!(s.related("dog", &[], 1, None).unwrap().len(), 1);
+        // Among one kind's memories only.
+        s.add(&new(Kind::Video, None, "t", "x", &words(&["dog", "trail"])), &[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(names(s.related("dog", &[], 10, Some(Kind::Video)).unwrap()), [("trail".into(), 1)]);
+        assert_eq!(s.cloud(10, Some(Kind::Video)).unwrap().iter().map(|w| w.word.as_str()).collect::<Vec<_>>(), ["dog", "trail"], "and the cloud of one kind is of its words");
+        assert!(s.cloud(10, Some(Kind::Note)).unwrap().is_empty());
+        assert_eq!(names(s.related("dog", &[], 10, None).unwrap())[0], ("beach".into(), 2));
+        let video = s.recent(1, Some(Kind::Video)).unwrap()[0].id;
+        s.forget(video).unwrap();
+        s.tidy_words().unwrap();
+        assert_eq!(s.related("nothing", &[], 5, None).unwrap(), vec![]);
         // With room left, words near in meaning that share no memory come after.
         s.set_word_vector("dog", &[1.0, 0.0, 0.0]).unwrap();
         s.set_word_vector("park", &[0.9, 0.3, 0.0]).unwrap();
         s.set_word_vector("invoice", &[0.0, 0.0, 1.0]).unwrap();
-        let with_near = s.related("dog", &[], 10).unwrap();
+        let with_near = s.related("dog", &[], 10, None).unwrap();
         assert_eq!(with_near.iter().map(|r| r.word.as_str()).collect::<Vec<_>>(), ["beach", "sea", "park"]);
         assert!(with_near[2].shared == 0 && with_near[2].distance.is_some_and(|d| d < 0.1) && with_near[0].distance.is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
