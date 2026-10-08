@@ -94,6 +94,11 @@ struct Files {
     /// How much each folder seen holds, kept while moving around so going
     /// back shows them at once, and measured again on each visit.
     sizes: std::collections::HashMap<PathBuf, FolderSize>,
+    /// Add folders up on the spot when there are no workers to do it:
+    /// for tests and pictures, which have none. A window being opened
+    /// waits for its workers instead, or it would not appear until every
+    /// folder in sight had been read to the bottom.
+    measure_now: bool,
     /// Folders waiting for the measuring workers, tagged like thumbnails.
     size_queue: Option<std::sync::mpsc::Sender<(u64, PathBuf)>>,
     /// The folders bookmarked in the sidebar, in order.
@@ -278,6 +283,7 @@ impl Files {
             thumb_queue: None,
             visit: Default::default(),
             sizes: Default::default(),
+            measure_now: cfg!(test),
             size_queue: None,
             bookmarks_file: (!cfg!(test)).then(folders::bookmarks_file),
             bookmarks: vec![],
@@ -353,11 +359,13 @@ impl Files {
                 Some(queue) => {
                     let _ = queue.send((visit, path));
                 }
-                // No workers, as in tests: measure now.
-                None => {
+                // No workers yet. They ask again when they start; only
+                // where there will be none is it done here.
+                None if self.measure_now => {
                     let size = folders::measure(&path, &|| true);
                     self.sizes.insert(path, size.map_or(FolderSize::Unknown, FolderSize::Known));
                 }
+                None => {}
             }
         }
     }
@@ -417,7 +425,9 @@ impl Files {
         let q = self.query.to_lowercase();
         let mut v: Vec<&Entry> = self.entries.iter().filter(|e| self.show_hidden || !e.hidden()).filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q)).collect();
         v.sort_by(|a, b| {
-            let dirs_first = b.dir.cmp(&a.dir);
+            // Folders come first, except by size: then it is the biggest
+            // thing that is wanted at the top, whatever it is.
+            let dirs_first = if self.sort == SortBy::Size { std::cmp::Ordering::Equal } else { b.dir.cmp(&a.dir) };
             let by = match self.sort {
                 SortBy::Name => natural_cmp(&a.name, &b.name),
                 SortBy::Size => self.size_of(a).cmp(&self.size_of(b)).then_with(|| natural_cmp(&a.name, &b.name)),
@@ -856,10 +866,11 @@ impl App for Files {
                                 Some(queue) => {
                                     let _ = queue.send((self.visit.load(std::sync::atomic::Ordering::Relaxed), path.clone()));
                                 }
-                                None => {
+                                None if self.measure_now => {
                                     let size = folders::measure(&path, &|| true);
                                     self.sizes.insert(path.clone(), size.map_or(FolderSize::Unknown, FolderSize::Known));
                                 }
+                                None => {}
                             }
                         }
                         if self.props.is_none() {
@@ -1357,6 +1368,8 @@ fn snapshots(dir: PathBuf) {
     let root = std::path::absolute(".").expect("cwd");
     for (name, scheme) in [("files-light", neo_desktop::SchemePref::Light), ("files-dark", neo_desktop::SchemePref::Dark)] {
         let mut app = Files::new(root.clone());
+        app.measure_now = true;
+        app.request_sizes();
         app.desktop.appearance.scheme = scheme;
         app.selected = vec![root.join("Cargo.toml")];
         // Two folders in the sidebar's Bookmarks.
@@ -1407,12 +1420,25 @@ mod tests {
         let mut f = Files::new(root.clone());
         let size = |f: &Files, name: &str| f.entries.iter().find(|e| e.name == name).and_then(|e| f.size_of(e));
         assert_eq!((size(&f, "big"), size(&f, "alpha"), size(&f, "notes.txt")), (Some(6000), Some(300), Some(2)), "everything under a folder, however deep");
-        // Sorting by size puts the bigger folder first, folders still before files.
+        // Sorting by size puts the biggest thing first, folder or file:
+        // a file bigger than a folder goes above it.
+        std::fs::write(root.join("middling.bin"), vec![0u8; 2000]).unwrap();
+        f.reload();
         f.update(Msg::Sort(SortBy::Size));
-        if !f.descending {
-            f.update(Msg::Sort(SortBy::Size));
-        }
-        assert_eq!(f.visible().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["big", "alpha", "notes.txt"]);
+        assert!(f.descending, "the biggest first, to begin with");
+        assert_eq!(f.visible().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["big", "middling.bin", "alpha", "notes.txt"]);
+        // Again, the smallest first.
+        f.update(Msg::Sort(SortBy::Size));
+        assert_eq!(f.visible().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["notes.txt", "alpha", "middling.bin", "big"]);
+        f.update(Msg::Sort(SortBy::Size));
+        // A folder still being added up waits at the bottom, not the top.
+        f.sizes.insert(root.join("alpha"), FolderSize::Measuring);
+        assert_eq!(f.visible().last().map(|e| e.name.as_str()), Some("alpha"));
+        f.sizes.insert(root.join("alpha"), FolderSize::Known(300));
+        // By name, folders are back on top.
+        f.update(Msg::Sort(SortBy::Name));
+        assert_eq!(f.visible().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["alpha", "big", "middling.bin", "notes.txt"]);
+        f.update(Msg::Sort(SortBy::Size));
         // A selection's size counts the folders in it.
         f.update(Msg::Click(root.join("big"), Modifiers::default()));
         f.update(Msg::Click(root.join("notes.txt"), Modifiers { shift: true, ..Default::default() }));
@@ -1562,6 +1588,41 @@ mod tests {
         f.update(Msg::Choose(Choice::Properties));
         assert!(f.props.is_none() && f.status.as_ref().is_some_and(|(tone, _)| *tone == Tone::Bad));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_a_window_does_not_wait_for_folders_to_be_added_up() {
+        let root = temp_dir("opening");
+        std::fs::write(root.join("alpha/inner.txt"), vec![0u8; 700]).unwrap();
+        // As the app itself starts, with workers still to come: the folder
+        // is listed at once, its size left to be filled in.
+        let mut f = Files::new(root.clone());
+        f.sizes.clear();
+        f.measure_now = false;
+        f.request_sizes();
+        assert_eq!(f.sizes[&root.join("alpha")], FolderSize::Measuring, "nothing was read to the bottom to show the window");
+        let alpha = f.entries.iter().find(|e| e.name == "alpha").unwrap().clone();
+        assert_eq!(f.size_of(&alpha), None);
+        // The worker's answer fills it in.
+        f.update(Msg::Measured(root.join("alpha"), Some(700)));
+        assert_eq!(f.size_of(&alpha), Some(700));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// How long the home folder takes to list, as a window opening would,
+    /// and how long adding its folders up would have held it. By hand:
+    /// `cargo test --release -p neo-files -- --ignored --nocapture time_to_open`.
+    #[test]
+    #[ignore]
+    fn time_to_open_the_home_folder() {
+        let began = Instant::now();
+        let mut f = Files::new(home_dir());
+        f.sizes.clear();
+        println!("listed {} entries in {:?}", f.entries.len(), began.elapsed());
+        let began = Instant::now();
+        f.measure_now = true;
+        f.request_sizes();
+        println!("adding up its {} folders took {:?}", f.entries.iter().filter(|e| e.dir).count(), began.elapsed());
     }
 
     #[test]
