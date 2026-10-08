@@ -90,17 +90,24 @@ pub fn frame_name(video: &Path, meta: &std::fs::Metadata) -> String {
 pub fn frame_commands(video: &Path, out_dir: &Path, out: &Path, side: u32) -> Vec<std::process::Command> {
     let mut commands = vec![];
     if cfg!(target_os = "macos") {
-        // Quick Look writes `<name>.png` into the folder it is given.
-        let mut c = std::process::Command::new("qlmanage");
-        c.args(["-t", "-s", &side.to_string(), "-o"]).arg(out_dir).arg(video);
-        commands.push(c);
+        // Quick Look writes `<name>.png` into the folder it is given. It
+        // is asked only for the kinds macOS can read: given any other, it
+        // does not say no, it just never answers.
+        if neo_desktop::fs::has_extension(video, &["mov", "mp4", "m4v", "3gp"]) {
+            let mut c = std::process::Command::new("qlmanage");
+            c.args(["-t", "-s", &side.to_string(), "-o"]).arg(out_dir).arg(video);
+            commands.push(c);
+        }
     } else {
         let mut c = std::process::Command::new("ffmpegthumbnailer");
         c.arg("-i").arg(video).arg("-o").arg(out).args(["-s", &side.to_string()]);
         commands.push(c);
     }
     // A second in, past any black first frame; scaled to fit the side.
-    let mut c = std::process::Command::new("ffmpeg");
+    // Found where it is usually put, since an app started from the Dock
+    // is not told where the user's own programs are.
+    let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].into_iter().find(|p| Path::new(p).is_file()).unwrap_or("ffmpeg");
+    let mut c = std::process::Command::new(ffmpeg);
     c.args(["-y", "-loglevel", "error", "-ss", "1", "-i"]).arg(video).args(["-frames:v", "1", "-vf", &format!("scale={side}:{side}:force_original_aspect_ratio=decrease")]).arg(out);
     commands.push(c);
     commands
@@ -108,24 +115,51 @@ pub fn frame_commands(video: &Path, out_dir: &Path, out: &Path, side: u32) -> Ve
 
 /// How long a tool gets to make one picture. The system's own never
 /// answers at all for a file that is not the video its name says it is.
-const FRAME_PATIENCE: std::time::Duration = std::time::Duration::from_secs(12);
+const FRAME_PATIENCE: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Runs a command, and says whether it ended well within `patience`. One
-/// that is still going then is stopped.
-fn finished_in_time(command: &mut std::process::Command, patience: std::time::Duration) -> bool {
-    let Ok(mut child) = command.spawn() else { return false };
+/// that is still going then is stopped. `None` if there is no such
+/// program here to run.
+fn finished_in_time(command: &mut std::process::Command, patience: std::time::Duration) -> Option<bool> {
+    let mut child = command.spawn().ok()?;
     let until = std::time::Instant::now() + patience;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return Some(status.success()),
             Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(25)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Some(false);
             }
         }
     }
+}
+
+/// Clears away what was left half-made when the app was closed while a
+/// picture was being made.
+pub fn tidy_frames(cache: &Path) {
+    for left in std::fs::read_dir(cache).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("making-")) {
+        let _ = std::fs::remove_dir_all(left.path());
+    }
+}
+
+/// How each folder is shown, kept between runs: a line a folder, the view
+/// and then the path.
+pub fn views_file() -> PathBuf {
+    neo_desktop::config_dir().join("apps").join("files-views")
+}
+
+pub fn load_views(file: &Path) -> Vec<(PathBuf, String)> {
+    std::fs::read_to_string(file).map(|text| text.lines().filter_map(|l| l.split_once('\t')).map(|(view, path)| (PathBuf::from(path), view.to_owned())).collect()).unwrap_or_default()
+}
+
+pub fn save_views(file: &Path, views: &[(PathBuf, String)]) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text: String = views.iter().map(|(path, view)| format!("{view}\t{}\n", path.display())).collect();
+    std::fs::write(file, text)
 }
 
 /// A picture of a video, as a file: from the cache if it has been made
@@ -137,16 +171,29 @@ pub fn video_frame(video: &Path, cache: &Path, side: u32) -> Option<PathBuf> {
     if kept.is_file() {
         return Some(kept);
     }
+    // Tried before and nothing could make one: not tried again each visit.
+    let none = kept.with_extension("none");
+    if none.is_file() {
+        return None;
+    }
     // Made in a folder of its own, since one tool names the file itself.
     let work = cache.join(format!("making-{}-{}", std::process::id(), frame_name(video, &meta)));
     std::fs::create_dir_all(&work).ok()?;
     let out = work.join("frame.png");
+    // Whether anything here could even try: if not, it is worth asking
+    // again another day, when something that can may have been installed.
+    let mut tried = false;
     let made = frame_commands(video, &work, &out, side).into_iter().any(|mut c| {
         let ran = finished_in_time(c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()), FRAME_PATIENCE);
+        tried |= ran.is_some();
+        let ran = ran == Some(true);
         // Whatever picture it left, under whatever name.
         ran && std::fs::read_dir(&work).ok().and_then(|mut d| d.find_map(|e| e.ok().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "png")))).is_some_and(|p| std::fs::rename(p, &kept).is_ok())
     });
     let _ = std::fs::remove_dir_all(&work);
+    if !made && tried {
+        let _ = std::fs::write(&none, b"");
+    }
     made.then_some(kept)
 }
 
@@ -235,15 +282,40 @@ mod tests {
         // A file that is not there gives nothing.
         let cache = dir.join("cache");
         assert_eq!(video_frame(&dir.join("missing.mov"), &cache, 256), None);
+        // A kind the system's tool cannot read is not given to it, since it
+        // would never answer; and what could not be made is not tried twice.
+        let mkv = dir.join("clip.mkv");
+        std::fs::write(&mkv, b"not really").unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(frame_commands(&mkv, &dir, &dir.join("o.png"), 256).iter().all(|c| c.get_program() != "qlmanage"));
+            assert!(frame_commands(&a, &dir, &dir.join("o.png"), 256).iter().any(|c| c.get_program() == "qlmanage"));
+        }
+        let began = std::time::Instant::now();
+        assert_eq!(video_frame(&mkv, &cache, 256), None);
+        assert!(began.elapsed() < std::time::Duration::from_secs(4), "said no quickly: {:?}", began.elapsed());
+        // Noted as not to be tried again only if something did try: with
+        // nothing here that could, it is worth asking another day.
+        let kept: Vec<String> = std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(kept.iter().all(|k| k.ends_with(".none")) && kept.len() <= 1, "{kept:?}");
+        // What a closed app left half-made is cleared away.
+        std::fs::create_dir_all(cache.join("making-1-x.png")).unwrap();
+        tidy_frames(&cache);
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), kept.len());
+        // Views are kept a line each, paths with spaces and all.
+        let file = dir.join("apps/files-views");
+        let views = vec![(PathBuf::from("/Users/sam/My Pictures"), "grid".to_owned()), (PathBuf::from("/work"), "compact".to_owned())];
+        save_views(&file, &views).unwrap();
+        assert_eq!(load_views(&file), views);
+        assert!(load_views(&dir.join("none")).is_empty());
         // A tool that never answers is stopped, not waited on for ever.
         #[cfg(unix)]
         {
             let began = std::time::Instant::now();
-            assert!(!finished_in_time(std::process::Command::new("sleep").arg("30"), std::time::Duration::from_millis(200)));
+            assert_eq!(finished_in_time(std::process::Command::new("sleep").arg("30"), std::time::Duration::from_millis(200)), Some(false));
             assert!(began.elapsed() < std::time::Duration::from_secs(5));
-            assert!(finished_in_time(&mut std::process::Command::new("true"), std::time::Duration::from_secs(5)));
-            assert!(!finished_in_time(&mut std::process::Command::new("false"), std::time::Duration::from_secs(5)));
-            assert!(!finished_in_time(&mut std::process::Command::new("neo-files-no-such-tool"), std::time::Duration::from_secs(5)));
+            assert_eq!(finished_in_time(&mut std::process::Command::new("true"), std::time::Duration::from_secs(5)), Some(true));
+            assert_eq!(finished_in_time(&mut std::process::Command::new("false"), std::time::Duration::from_secs(5)), Some(false));
+            assert_eq!(finished_in_time(&mut std::process::Command::new("neo-files-no-such-tool"), std::time::Duration::from_secs(5)), None);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

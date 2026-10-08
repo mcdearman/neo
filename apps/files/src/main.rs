@@ -107,6 +107,10 @@ struct Files {
     bookmarks_file: Option<PathBuf>,
     /// The menu open on a bookmark, and where.
     bookmark_menu: Option<(PathBuf, Point)>,
+    /// How folders were last shown, for coming back to them, and where
+    /// that is kept. Tests keep it nowhere unless they say where.
+    views: Vec<(PathBuf, ViewMode)>,
+    views_file: Option<PathBuf>,
     /// The file or folder whose Properties are showing.
     props: Option<props::Properties>,
     /// Raised to bring the selection into view, when it has moved without
@@ -185,6 +189,21 @@ enum ViewMode {
 }
 
 /// A picture's thumbnail for the grid.
+impl ViewMode {
+    /// The word the view is written down as.
+    fn name(self) -> &'static str {
+        match self {
+            ViewMode::List => "list",
+            ViewMode::Compact => "compact",
+            ViewMode::Grid => "grid",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [ViewMode::List, ViewMode::Compact, ViewMode::Grid].into_iter().find(|v| v.name() == name)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Thumb {
     /// Asked for; the worker has not answered yet.
@@ -294,11 +313,18 @@ impl Files {
             bookmarks_file: (!cfg!(test)).then(folders::bookmarks_file),
             bookmarks: vec![],
             bookmark_menu: None,
+            views: vec![],
+            views_file: (!cfg!(test)).then(folders::views_file),
             props: None,
             reveal: 0,
         };
         if let Some(file) = &f.bookmarks_file {
             f.bookmarks = folders::load_bookmarks(file);
+        }
+        if let Some(file) = &f.views_file {
+            f.views = folders::load_views(file).into_iter().filter_map(|(path, view)| Some((path, ViewMode::from_name(&view)?))).collect();
+            // What a closed window left half-made, cleared in passing.
+            std::thread::spawn(|| folders::tidy_frames(&folders::frames_dir()));
         }
         f.load(dir);
         f
@@ -311,6 +337,9 @@ impl Files {
                 self.stamp = dir_stamp(&dir);
                 self.entries = entries;
                 if self.dir != dir {
+                    // Shown the way it was last time, or the way the
+                    // folder it is in was.
+                    self.view = self.view_for(&dir);
                     // Thumbnails belong to the folder; drop them and any still queued.
                     self.thumbs.clear();
                     self.visit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -352,6 +381,12 @@ impl Files {
             self.thumbs.insert(path.clone(), Thumb::Loading);
             let _ = queue.send((visit, path));
         }
+    }
+
+    /// How a folder is to be shown: the way it was last set, or failing
+    /// that the way the nearest folder above it was, or as a list.
+    fn view_for(&self, dir: &Path) -> ViewMode {
+        dir.ancestors().find_map(|d| self.views.iter().find(|(path, _)| path == d).map(|(_, view)| *view)).unwrap_or(ViewMode::List)
     }
 
     /// Asks for each folder shown to be measured. What was known from an
@@ -761,6 +796,17 @@ impl App for Files {
             }
             Msg::View(mode) => {
                 self.view = mode;
+                // Remembered for this folder, and for those inside it that
+                // have no view of their own.
+                let dir = self.dir.clone();
+                self.views.retain(|(path, _)| *path != dir);
+                self.views.push((dir, mode));
+                if let Some(file) = &self.views_file {
+                    let lines: Vec<(PathBuf, String)> = self.views.iter().map(|(path, view)| (path.clone(), view.name().to_owned())).collect();
+                    if let Err(e) = folders::save_views(file, &lines) {
+                        self.status = Some((Tone::Bad, format!("Could not remember the view: {e}")));
+                    }
+                }
                 self.request_thumbs();
             }
             Msg::Geometry(g) => self.width = g.frame.w,
@@ -1615,6 +1661,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A real video's thumbnail, made as the grid's worker makes it:
+    /// `NEO_VIDEO=/path/clip.mov cargo test -p neo-files -- --ignored --nocapture a_real_video_thumbnail`.
+    #[test]
+    #[ignore]
+    fn a_real_video_thumbnail() {
+        let video = PathBuf::from(std::env::var("NEO_VIDEO").expect("set NEO_VIDEO"));
+        println!("frames kept in {}", folders::frames_dir().display());
+        println!("thumbnail made: {}", thumbnail(&video).is_some());
+        let mut f = Files::new(video.parent().unwrap().to_path_buf());
+        f.view = ViewMode::Grid;
+        // Every video in the folder, in the order the worker takes them.
+        let began = Instant::now();
+        for e in f.visible().iter().filter(|e| neo_desktop::fs::has_extension(&e.path, neo_desktop::fs::VIDEO_EXTENSIONS)) {
+            let one = Instant::now();
+            let made = thumbnail(&e.path).is_some();
+            println!("  {:<48} {} in {:?}", e.name, if made { "made" } else { "none" }, one.elapsed());
+        }
+        println!("the whole folder took {:?}", began.elapsed());
+    }
+
     /// How long the home folder takes to list, as a window opening would,
     /// and how long adding its folders up would have held it. By hand:
     /// `cargo test --release -p neo-files -- --ignored --nocapture time_to_open`.
@@ -1629,6 +1695,53 @@ mod tests {
         f.measure_now = true;
         f.request_sizes();
         println!("adding up its {} folders took {:?}", f.entries.iter().filter(|e| e.dir).count(), began.elapsed());
+    }
+
+    #[test]
+    fn each_folder_comes_back_in_the_view_it_was_left_in() {
+        let root = temp_dir("views");
+        std::fs::create_dir_all(root.join("alpha/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        let file = root.join("kept/files-views");
+        let mut f = Files::new(root.clone());
+        assert!(f.views_file.is_none(), "tests keep nothing unless they say where");
+        f.views_file = Some(file.clone());
+        assert_eq!(f.view, ViewMode::List);
+        // Set the grid in one folder: it is that folder's, and the ones inside it.
+        f.update(Msg::Go(root.join("alpha")));
+        f.update(Msg::View(ViewMode::Grid));
+        f.update(Msg::Go(root.join("alpha/deeper")));
+        assert_eq!(f.view, ViewMode::Grid, "a folder inside, with no view of its own, follows");
+        f.update(Msg::View(ViewMode::Compact));
+        // Its neighbour and the folder above are as they were.
+        f.update(Msg::Go(root.join("beta")));
+        assert_eq!(f.view, ViewMode::List);
+        f.update(Msg::Go(root.clone()));
+        assert_eq!(f.view, ViewMode::List);
+        // Going back and forth, each is as it was left.
+        f.update(Msg::Go(root.join("alpha")));
+        assert_eq!(f.view, ViewMode::Grid);
+        f.update(Msg::Go(root.join("alpha/deeper")));
+        assert_eq!(f.view, ViewMode::Compact);
+        f.update(Msg::Back);
+        assert_eq!(f.view, ViewMode::Grid);
+        // Another run of the app, opened straight on a folder: the same.
+        let lines = folders::load_views(&file);
+        assert_eq!(lines.len(), 2);
+        let mut again = Files::new(root.clone());
+        again.views = lines.into_iter().filter_map(|(path, view)| Some((path, ViewMode::from_name(&view)?))).collect();
+        again.update(Msg::Go(root.join("alpha/deeper")));
+        assert_eq!(again.view, ViewMode::Compact);
+        again.update(Msg::Up);
+        assert_eq!(again.view, ViewMode::Grid);
+        // Changing a folder's view again replaces what was kept for it.
+        f.update(Msg::View(ViewMode::List));
+        assert_eq!(folders::load_views(&file).len(), 2);
+        for view in [ViewMode::List, ViewMode::Compact, ViewMode::Grid] {
+            assert_eq!(ViewMode::from_name(view.name()), Some(view));
+        }
+        assert_eq!(ViewMode::from_name("tiles"), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
