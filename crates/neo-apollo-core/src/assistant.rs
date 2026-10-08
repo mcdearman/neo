@@ -236,7 +236,11 @@ fn recall_of(store: &Store, model: &dyn Model, question: &str, kind: Option<Kind
         let text = format!("{} {}", h.memory.title, h.memory.text).to_lowercase();
         terms.iter().filter(|t| text.contains(t.as_str())).count()
     };
-    let mut found: Vec<Hit> = store.search_for(&asked, &terms, RECALLED, kind)?.into_iter().filter(|h| h.distance < NEAR || (!terms.is_empty() && said(h) == terms.len() && h.distance < NEAR + crate::store::SAID)).collect();
+    // What was asked before reads more like this question than anything
+    // that answers it, and says only what was known then: it is left out
+    // unless the question is about what was said.
+    let about_talk = ["ask", "asked", "said", "told", "talked", "conversation", "conversations", "earlier", "before"].iter().any(|w| terms.iter().any(|t| t == w)) || question.to_lowercase().contains("last time");
+    let mut found: Vec<Hit> = store.search_for(&asked, &terms, RECALLED + 4, kind)?.into_iter().filter(|h| about_talk || kind.is_some() || h.memory.kind != Kind::Conversation).take(RECALLED).filter(|h| h.distance < NEAR || (!terms.is_empty() && said(h) == terms.len() && h.distance < NEAR + crate::store::SAID)).collect();
     // With something found that says every word asked for, what says none
     // of them is only near by the shape of its words, as one folder's
     // description is near any other's: it is left out.
@@ -370,7 +374,25 @@ pub fn ask(mut store: Option<&mut Store>, model: &dyn Model, earlier: &[Turn], q
     turns.extend(said[said.len().saturating_sub(EARLIER)..].iter().map(|t| (*t).clone()));
     turns.push(Turn::new(Role::User, put(question, &recalled, (store.is_some() && asks.any()).then_some((&asks, listed.as_slice(), total)))));
     let text = model.chat(&turns, piece)?;
-    Ok(Answer { text: text.trim().to_owned(), recalled, listed })
+    // A small model now and then gives back a stray mark and nothing else.
+    // What was found is still found: it is said plainly in the model's place.
+    let text = if says_something(&text) { text.trim().to_owned() } else { said_plainly(&listed, &recalled) };
+    Ok(Answer { text, recalled, listed })
+}
+
+/// Whether an answer has words in it, and is not only marks or nothing.
+fn says_something(answer: &str) -> bool {
+    answer.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count() >= 2
+}
+
+/// What was found, in its own words, for when the model gave no answer.
+fn said_plainly(listed: &[Memory], recalled: &[Hit]) -> String {
+    let found: Vec<&Memory> = listed.iter().chain(recalled.iter().map(|h| &h.memory)).take(3).collect();
+    match found.as_slice() {
+        [] => "I could not put an answer together that time. Ask again.".to_owned(),
+        [one] => format!("Here is what I found. {}", one.text.lines().next().unwrap_or_default()),
+        several => format!("Here is what I found. {}", several.iter().map(|m| m.text.lines().next().unwrap_or_default()).collect::<Vec<_>>().join(" ")),
+    }
 }
 
 /// The numbers an answer marks its sources with: "[2]", "[1, 3]".
@@ -526,6 +548,16 @@ mod tests {
     }
 
     #[test]
+    fn a_model_that_answers_with_nothing_is_stood_in_for() {
+        assert!(says_something("It is in Documents.") && says_something("Paris, France"));
+        assert!(!says_something("```") && !says_something("") && !says_something(" . \n ") && !says_something("[1]") && !says_something("Ok"));
+        let m = |text: &str| Memory { id: 1, kind: Kind::Folder, source: Some("/d/v".into()), title: "v".into(), text: text.into(), part: 0, created: 0, light: false };
+        assert_eq!(said_plainly(&[], &[Hit { memory: m("A folder that is an Obsidian vault, called v, in ~/Documents."), distance: 0.3 }]), "Here is what I found. A folder that is an Obsidian vault, called v, in ~/Documents.");
+        assert_eq!(said_plainly(&[m("One."), m("Two.\nMore.")], &[]), "Here is what I found. One. Two.");
+        assert_eq!(said_plainly(&[], &[]), "I could not put an answer together that time. Ask again.");
+    }
+
+    #[test]
     fn where_a_thing_is_can_be_asked() {
         let now = Local.with_ymd_and_hms(2026, 10, 8, 11, 30, 0).unwrap();
         let w = wanted("where is my obsidian vault", now);
@@ -636,9 +668,13 @@ mod tests {
         let model = Fake::default();
         keep_note(&mut s, &model, "My dog Rex is a retriever").unwrap();
         keep_exchange(&mut s, &model, "How much was the invoice from the supplier?", "It was 40 pounds.").unwrap();
+        // What was asked before is not what answers a question, unless the question is about that.
+        keep_exchange(&mut s, &model, "what breed is my dog", "I have nothing on that.").unwrap();
+        assert!(recall(&s, &model, "what breed is my dog").unwrap().iter().all(|h| h.memory.kind != Kind::Conversation));
+        assert!(recall(&s, &model, "what did I ask about my dog last time?").unwrap().iter().any(|h| h.memory.kind == Kind::Conversation));
         let recalled = recall(&s, &model, "what breed is my dog").unwrap();
         assert_eq!((recalled[0].memory.kind, recalled[0].memory.text.as_str()), (Kind::Note, "My dog Rex is a retriever"));
-        let talk = &s.recent(1, Some(Kind::Conversation)).unwrap()[0];
+        let talk = &s.recent(5, Some(Kind::Conversation)).unwrap().into_iter().find(|m| m.title.starts_with("How much")).unwrap();
         assert_eq!((talk.title.as_str(), talk.text.as_str()), ("How much was the invoice from the supplier?", "Asked: How much was the invoice from the supplier?\nAnswered: It was 40 pounds."));
         assert_eq!(headline(&"long ".repeat(40)).chars().count(), 80);
         std::fs::remove_dir_all(dir).unwrap();
@@ -663,6 +699,12 @@ mod probe {
         println!("{:?}", store.stats().unwrap());
         for (i, h) in hits.iter().take(6).enumerate() {
             println!("#{} {:.3} {} :: {}", i + 1, h.distance, h.memory.title, h.memory.text);
+        }
+        if std::env::var("NEO_APOLLO_ANSWER").is_ok() {
+            let mut store = store;
+            let answer = ask(Some(&mut store), &model, &[], &query, &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
+            println!("ANSWER: {}\n  shown beneath: {:?}", plain(&answer.text), sources(&answer.listed, &answer.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>());
+            return;
         }
         for title in std::env::var("NEO_APOLLO_TITLES").unwrap_or_default().split('|').filter(|t| !t.is_empty()) {
             match hits.iter().position(|h| h.memory.title == title) {
