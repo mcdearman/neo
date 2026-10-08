@@ -14,13 +14,16 @@ use crate::store::{Hit, Kind, Memory, New, Stats, Store};
 /// How many memories are put before the model, and how near they must be.
 const RECALLED: usize = 6;
 /// Further than this from the question, a memory is about something else.
-pub const NEAR: f32 = 0.48;
+/// What is nearer is shown to the model, and shown to the user beneath
+/// the answer, so it is set where what does bear on a question mostly
+/// falls inside and what merely reads a little like it mostly falls out.
+pub const NEAR: f32 = 0.42;
 /// How many things are listed for a question about a kind or a time.
 const LISTED: usize = 15;
 /// How much of the conversation so far the model is shown.
 const EARLIER: usize = 8;
 
-const WHO: &str = "You are Apollo, the assistant built into the Neo desktop. You run on this computer and nothing said to you leaves it. Answer plainly and briefly, in ordinary sentences. You keep a memory of the user's pictures, videos and documents: you read the folders listed in the Sources page by yourself, describing each picture, looking at each video in a few places along its length, and reading each document. You cannot read a file on request in this conversation; a folder is added in Sources, and Read Now there starts a reading.";
+const WHO: &str = "You are Apollo, the assistant built into the Neo desktop, running on this computer. Answer plainly and briefly, in full sentences. You keep a memory of the user's pictures, videos and documents, made by reading the folders chosen in the Sources page; you cannot read a file on request in this conversation. Any files you draw on are shown to the user as pictures under your answer, so never write file names, paths or entry numbers.";
 
 /// An answer, and the memories it was given to draw on.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,12 +47,18 @@ pub struct Wanted {
     pub span: Option<String>,
     /// The newest are asked for, whenever they are from.
     pub newest: bool,
+    /// The question also says what the things should be of: "photos of a
+    /// girl with pink hair" does, "what photos do I have" does not.
+    pub about: bool,
 }
 
 impl Wanted {
-    /// Whether the question asks for a list of things at all.
+    /// Whether the question asks for a list of things: everything from a
+    /// stretch of time, the newest of a kind, or all of a kind. One that
+    /// says what the things should be of is a search among that kind
+    /// instead, not a list of every one of them.
     pub fn any(&self) -> bool {
-        self.kind.is_some() || self.span.is_some()
+        self.span.is_some() || (self.kind.is_some() && (self.newest || !self.about))
     }
 
     /// What is asked for, in words: "videos from this month", "photos".
@@ -80,8 +89,7 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
     let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let has = |any: &[&str]| words.iter().any(|w| any.contains(w));
     let phrase = |p: &str| lower.contains(p);
-    let mut w = Wanted::default();
-    w.kind = if has(&["video", "videos", "movie", "movies", "recording", "recordings", "clip", "clips", "footage"]) {
+    let kind = if has(&["video", "videos", "movie", "movies", "recording", "recordings", "clip", "clips", "footage"]) {
         Some(Kind::Video)
     } else if has(&["photo", "photos", "picture", "pictures", "image", "images", "screenshot", "screenshots", "pics"]) {
         Some(Kind::Photo)
@@ -90,6 +98,71 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
     } else {
         None
     };
+    let mut w = Wanted { kind, ..Wanted::default() };
+    // What is left when the words for kinds, times and asking are taken out.
+    const ASKING: &[&str] = &[
+        "video",
+        "videos",
+        "movie",
+        "movies",
+        "recording",
+        "recordings",
+        "clip",
+        "clips",
+        "footage",
+        "photo",
+        "photos",
+        "picture",
+        "pictures",
+        "image",
+        "images",
+        "screenshot",
+        "screenshots",
+        "pics",
+        "document",
+        "documents",
+        "docs",
+        "pdf",
+        "pdfs",
+        "papers",
+        "file",
+        "files",
+        "show",
+        "shows",
+        "showing",
+        "list",
+        "find",
+        "tell",
+        "give",
+        "look",
+        "count",
+        "number",
+        "got",
+        "mine",
+        "please",
+        "apollo",
+        "taken",
+        "saved",
+        "today",
+        "yesterday",
+        "week",
+        "month",
+        "year",
+        "latest",
+        "newest",
+        "recent",
+        "recently",
+        "last",
+        "ago",
+        "since",
+        "ones",
+        "anything",
+        "everything",
+        "something",
+        "things",
+        "stuff",
+    ];
+    w.about = crate::words::terms(question).iter().any(|t| !ASKING.contains(&t.as_str()) && !MONTHS.contains(&t.as_str()) && t.parse::<u32>().is_err());
     w.newest = has(&["latest", "newest", "recent", "recently", "last"]) && w.kind.is_some();
     let today = now.date_naive();
     let first = |d: NaiveDate| d.with_day(1).unwrap_or(d);
@@ -147,7 +220,10 @@ pub fn recall(store: &Store, model: &dyn Model, question: &str) -> Result<Vec<Hi
 
 fn recall_of(store: &Store, model: &dyn Model, question: &str, kind: Option<Kind>) -> Result<Vec<Hit>, String> {
     let asked = model.embed(&[question.to_owned()], true)?.pop().ok_or("no embedding")?;
-    Ok(store.search(&asked, RECALLED, kind)?.into_iter().filter(|h| h.distance < NEAR).collect())
+    // One that says the question's own words is let in from a little further off.
+    let terms = crate::words::terms(question);
+    let says = |h: &Hit| !terms.is_empty() && terms.iter().all(|t| format!("{} {}", h.memory.title, h.memory.text).to_lowercase().contains(t.as_str()));
+    Ok(store.search_for(&asked, &terms, RECALLED, kind)?.into_iter().filter(|h| h.distance < NEAR || (says(h) && h.distance < NEAR + crate::store::SAID)).collect())
 }
 
 /// What is in the memory and how the reading stands, for the model to know.
@@ -160,50 +236,70 @@ fn overview(stats: &Stats, aware: &Aware) -> String {
     out
 }
 
+/// A memory as the model is shown it: numbered, with what it is and when
+/// it is from. A photo or a video goes without its file's name, which
+/// says little and which the model is not to repeat; a document's name
+/// is what it is known by.
 fn entry(n: usize, m: &Memory) -> String {
-    let of = m.source.as_ref().map(|p| format!(" ({})", p.display())).unwrap_or_default();
     let when = neo_desktop::fs::full_time(UNIX_EPOCH + std::time::Duration::from_secs(m.created));
-    format!("\n[{n}] {} · {}{of} · {when}\n{}\n", m.kind.name(), m.title, m.text)
+    let what = match m.kind {
+        Kind::Photo => "A photo".to_owned(),
+        Kind::Video => "A video".to_owned(),
+        Kind::Document => format!("A document called \"{}\"", m.title),
+        Kind::Conversation => "An earlier conversation".to_owned(),
+        Kind::Note => "A note the user asked you to keep".to_owned(),
+    };
+    format!("{n}. {what}, from {when}: {}\n", m.text)
 }
 
-/// What the model is told before the conversation: who it is, what its
-/// memory holds, the list the question asked for if it asked for one, and
-/// what else it remembers that may bear on the question. `memory` is
-/// `None` while the memory is locked.
-pub fn briefing(recalled: &[Hit], listing: Option<(&Wanted, &[Memory], u32)>, memory: Option<(&Stats, &Aware)>) -> String {
+/// What the model is told before the conversation: who it is, and how
+/// its memory stands. `memory` is `None` while the memory is locked.
+pub fn briefing(memory: Option<(&Stats, &Aware)>) -> String {
     let today = neo_desktop::fs::full_time(SystemTime::now());
     let mut out = format!("{WHO} It is {today}.");
-    let Some((stats, aware)) = memory else {
-        out.push_str(" Your memory of the user's files is locked just now, so you cannot look anything up in it; if asked about their files, say that it needs unlocking in the Memory page.");
-        return out;
-    };
-    out.push_str(&overview(stats, aware));
+    match memory {
+        Some((stats, aware)) => out.push_str(&overview(stats, aware)),
+        None => out.push_str(" Your memory of the user's files is locked just now, so you cannot look anything up in it; if asked about their files, say that it needs unlocking in the Memory page."),
+    }
+    out
+}
+
+/// The question as it is put to the model: with what the memory holds
+/// that bears on it set out first, and what to make of that after.
+///
+/// It is put this way, in the question's own turn and in few words,
+/// because the model that answers is a small one: it is held in memory
+/// only briefly and is back in a second or two, which is what lets Apollo
+/// wait to be asked while holding next to nothing. The finding is done by
+/// the index, not by the model; the model only has to say what was found.
+pub fn put(question: &str, recalled: &[Hit], listing: Option<(&Wanted, &[Memory], u32)>) -> String {
+    let more: Vec<&Memory> = recalled.iter().map(|h| &h.memory).filter(|m| !listing.is_some_and(|(_, listed, _)| listed.iter().any(|l| l.source.is_some() && l.source == m.source))).collect();
+    let mut out = String::new();
     let mut n = 0;
-    if let Some((wanted, listed, total)) = listing {
-        let what = wanted.what();
-        if listed.is_empty() {
-            out.push_str(&format!(" The user asks about {what}: there are none in your memory. Say so plainly, and do not offer other files in their place."));
-        } else {
-            let all = if total as usize > listed.len() { format!("the newest {} of {total}", listed.len()) } else { format!("all {total}") };
-            out.push_str(&format!(" The user asks about {what}. Here are {all} in your memory, newest first; answer from this list, naming the files and saying briefly what each shows.\n"));
+    match listing {
+        Some((wanted, [], _)) => return format!("{question}\n\n(There are no {} in your memory. Say so in one sentence, and do not offer other files in their place.)", wanted.what()),
+        Some((wanted, listed, total)) => {
+            let how_many = if total as usize > listed.len() {
+                format!("There are {total}; the newest {} are below.", listed.len())
+            } else if total == 1 {
+                "There is 1, below.".to_owned()
+            } else {
+                format!("There are {total}, below.")
+            };
+            out.push_str(&format!("The user asks about {}. {how_many}\n\n", wanted.what()));
             for m in listed {
                 n += 1;
                 out.push_str(&entry(n, m));
             }
         }
+        None if more.is_empty() => return question.to_owned(),
+        None => out.push_str("From your memory of the user's files:\n\n"),
     }
-    let more: Vec<&Hit> = recalled.iter().filter(|h| !listing.is_some_and(|(_, listed, _)| listed.iter().any(|m| m.source.is_some() && m.source == h.memory.source))).collect();
-    if more.is_empty() {
-        if listing.is_none() {
-            out.push_str(" Nothing in your memory bears on this question. If it is about the user's files, say you have nothing on it rather than guessing.");
-        }
-        return out;
-    }
-    out.push_str(if listing.is_some() { " These may bear on the question too:\n" } else { " Below is what you remember that may bear on the question, each with the file it is of. Use what helps and name the file; if none of it answers the question, say so rather than guessing.\n" });
-    for hit in more {
+    for m in more {
         n += 1;
-        out.push_str(&entry(n, &hit.memory));
+        out.push_str(&entry(n, m));
     }
+    out.push_str(&format!("\nQuestion: {question}\n\nAnswer in one to three sentences, using only what is above. Say what was found and what it shows, in your own words; do not copy the entries out, and do not give their numbers or dates unless asked. If what is above does not answer the question, say that you have nothing on it."));
     out
 }
 
@@ -223,23 +319,52 @@ pub fn ask(store: Option<&Store>, model: &dyn Model, earlier: &[Turn], question:
         recalled = recall_of(store, model, question, asks.kind)?;
         stats = Some(store.stats()?);
     }
-    let told = briefing(&recalled, asks.any().then_some((&asks, listed.as_slice(), total)), stats.as_ref().map(|s| (s, aware)));
-    let mut turns = vec![Turn::new(Role::System, told)];
+    let mut turns = vec![Turn::new(Role::System, briefing(stats.as_ref().map(|s| (s, aware))))];
     let said: Vec<&Turn> = earlier.iter().filter(|t| t.role != Role::System).collect();
     turns.extend(said[said.len().saturating_sub(EARLIER)..].iter().map(|t| (*t).clone()));
-    turns.push(Turn::new(Role::User, question));
+    turns.push(Turn::new(Role::User, put(question, &recalled, (store.is_some() && asks.any()).then_some((&asks, listed.as_slice(), total)))));
     let text = model.chat(&turns, piece)?;
     Ok(Answer { text: text.trim().to_owned(), recalled, listed })
 }
 
-/// The files an answer names, of those it was given to draw on: each
-/// once, in the order given. What it was shown and did not use is left out.
-pub fn named<'a>(answer: &str, listed: &'a [Memory], recalled: &'a [Hit]) -> Vec<&'a Memory> {
-    let lower = answer.to_lowercase();
+/// The numbers an answer marks its sources with: "[2]", "[1, 3]".
+fn marks(answer: &str) -> Vec<(std::ops::Range<usize>, Vec<usize>)> {
+    let mut out = vec![];
+    let mut from = 0;
+    while let Some(open) = answer[from..].find('[').map(|i| i + from) {
+        let Some(close) = answer[open..].find(']').map(|i| i + open) else { break };
+        let inside = &answer[open + 1..close];
+        let numbers: Vec<usize> = inside.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+        if !numbers.is_empty() && inside.chars().all(|c| c.is_ascii_digit() || c == ',' || c == ' ') {
+            out.push((open..close + 1, numbers));
+        }
+        from = close + 1;
+    }
+    out
+}
+
+/// An answer as it is shown: without the numbers it marks its sources
+/// with, which are for [`cited`] and mean nothing to the reader.
+pub fn plain(answer: &str) -> String {
+    let mut out = String::with_capacity(answer.len());
+    let mut from = 0;
+    for (range, _) in marks(answer) {
+        // The space before a mark goes with it, so none is left before a full stop.
+        out.push_str(answer[from..range.start].trim_end_matches(' '));
+        from = range.end;
+    }
+    out.push_str(&answer[from..]);
+    out.trim().to_owned()
+}
+
+/// The files an answer was given to draw on, to show beneath it: those
+/// listed for a question about a kind or a time, then what else bore on
+/// it, each once. Which they are is the index's finding, not the model's
+/// say-so, so they are right whatever the model makes of them.
+pub fn sources<'a>(listed: &'a [Memory], recalled: &'a [Hit]) -> Vec<&'a Memory> {
     let mut out: Vec<&Memory> = vec![];
     for m in listed.iter().chain(recalled.iter().map(|h| &h.memory)) {
-        let stem = std::path::Path::new(&m.title).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if m.source.is_some() && stem.chars().count() >= 3 && lower.contains(&stem) && !out.iter().any(|have| have.source == m.source) {
+        if m.source.is_some() && !out.iter().any(|have| have.source == m.source) {
             out.push(m);
         }
     }
@@ -300,19 +425,22 @@ mod tests {
         .unwrap();
         assert_eq!(answer.recalled.iter().map(|h| h.memory.title.as_str()).collect::<Vec<_>>(), ["rex.jpg"], "the invoice is about something else");
         assert_eq!(answer.text, "You asked: Where is my dog? I looked at 1 memories.");
+        assert_eq!(sources(&answer.listed, &answer.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["rex.jpg"], "and that is what is shown beneath the answer");
         assert_eq!(heard.trim(), answer.text, "heard as it came");
-        let told = briefing(&answer.recalled, None, Some((&s.stats().unwrap(), &Aware::default())));
-        assert!(told.contains("[1] photo · rex.jpg (/p/rex.jpg) · ") && told.contains("A dog, a retriever puppy.") && told.contains("Your memory holds 1 photos, 1 documents"), "{told}");
+        let told = put("Where is my dog?", &answer.recalled, None);
+        assert!(told.starts_with("From your memory of the user's files:\n\n1. A photo, from ") && !told.contains("rex.jpg") && told.contains(": A dog, a retriever puppy.\n\nQuestion: Where is my dog?\n\nAnswer in"), "{told}");
+        assert!(briefing(Some((&s.stats().unwrap(), &Aware::default()))).contains("Your memory holds 1 photos, 1 documents"));
+        // A document goes by its name, and a question nothing bears on is put as it was asked.
+        let bill = recall(&s, &model, "the invoice payment").unwrap();
+        assert!(put("How much?", &bill, None).contains("1. A document called \"bill.md\", from "));
+        assert_eq!(put("What is the capital of France?", &[], None), "What is the capital of France?");
         // Stopped part-way, what was said so far is the answer.
         let cut = ask(Some(&s), &model, &[], "dog", &Aware::default(), &mut |_| false).unwrap();
         assert_eq!(cut.text, "You");
         // Locked, it is told so and shown nothing.
         let locked = ask(None, &model, &[], "Where is my dog?", &Aware::default(), &mut |_| true).unwrap();
         assert!(locked.recalled.is_empty() && locked.text.ends_with("0 memories."));
-        assert!(briefing(&[], None, None).contains("locked") && briefing(&[], None, Some((&Stats::default(), &Aware::default()))).contains("Nothing in your memory bears"));
-        // Only what an answer names is offered with it.
-        assert_eq!(named("It is in rex.jpg.", &[], &answer.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["rex.jpg"]);
-        assert!(named("I have nothing on that.", &[], &answer.recalled).is_empty());
+        assert!(briefing(None).contains("locked") && briefing(Some((&Stats::default(), &Aware::default()))).contains("Your memory is empty so far"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -338,6 +466,12 @@ mod tests {
         assert_eq!(wanted("photos from 2023", now).since, day(2023, 1, 1));
         let w = wanted("my latest videos", now);
         assert!(w.newest && w.since.is_none() && w.any());
+        // Saying what they should be of makes it a search among that kind, not a list of them all.
+        let w = wanted("Which pictures show a girl with pink hair?", now);
+        assert!(w.kind == Some(Kind::Photo) && w.about && !w.any());
+        assert!(!wanted("What photos do I have?", now).about && wanted("What photos do I have?", now).any());
+        assert!(wanted("photos of the dog from last month", now).any(), "a stretch of time is still a list");
+        assert!(!wanted("show me my videos from March 2026 please", now).about);
         // An ordinary question asks for no list.
         for q in ["Where is the spare key?", "What may I do about it?", "How do I record the screen?"] {
             assert!(!wanted(q, now).any() || q.contains("record"), "{q}");
@@ -358,15 +492,31 @@ mod tests {
         assert_eq!(answer.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["hike.mp4"], "the video from this year, not the old one, and not the document that talks of videos");
         assert!(answer.recalled.iter().all(|h| h.memory.kind == Kind::Video));
         let wants = wanted("What videos do I have from this year?", Local::now());
-        let told = briefing(&answer.recalled, Some((&wants, &answer.listed, 1)), Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)) })));
-        assert!(told.contains("The user asks about videos from this year. Here are all 1 in your memory") && told.contains("[1] video · hike.mp4 (/m/hike.mp4)"), "{told}");
-        assert!(told.contains("40 of 900 files so far") && told.contains("Your memory holds 2 videos, 1 documents"), "{told}");
-        assert_eq!(told.matches("hike.mp4 (").count(), 1, "not listed twice for being near in meaning as well");
+        let told = put("What videos do I have from this year?", &answer.recalled, Some((&wants, &answer.listed, 1)));
+        assert!(told.starts_with("The user asks about videos from this year. There is 1, below.\n\n1. A video, from ") && !told.contains("hike.mp4"), "{told}");
+        assert_eq!(told.matches("A video of a mountain hiking trail.").count(), 1, "not listed twice for being near in meaning as well");
+        assert!(put("q", &[], Some((&wants, &answer.listed, 40))).contains("There are 40; the newest 1 are below."));
+        let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)) })));
+        assert!(knows.contains("40 of 900 files so far") && knows.contains("Your memory holds 2 videos, 1 documents"), "{knows}");
+        assert_eq!(sources(&answer.listed, &answer.recalled).len(), 1);
         // None of that kind and time: said, and nothing offered in its place.
         let none = ask(Some(&s), &model, &[], "photos from yesterday", &Aware::default(), &mut |_| true).unwrap();
         assert!(none.listed.is_empty() && none.recalled.is_empty());
-        assert!(briefing(&[], Some((&wanted("photos from yesterday", Local::now()), &[], 0)), Some((&s.stats().unwrap(), &Aware::default()))).contains("there are none in your memory"));
+        assert_eq!(put("photos from yesterday", &[], Some((&wanted("photos from yesterday", Local::now()), &[], 0))), "photos from yesterday\n\n(There are no photos from yesterday in your memory. Say so in one sentence, and do not offer other files in their place.)");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_answer_is_shown_without_marks_and_with_the_files_it_was_given() {
+        assert_eq!(plain("A dog on a beach [1], and a hike [2, 3]. Nothing else [x] costs 3 [pounds]."), "A dog on a beach, and a hike. Nothing else [x] costs 3 [pounds].");
+        assert_eq!(plain("[1] A dog.  "), "A dog.");
+        assert_eq!((plain("No marks here."), plain("An open [ bracket")), ("No marks here.".to_owned(), "An open [ bracket".to_owned()));
+        let m = |id, file: &str| Memory { id, kind: Kind::Video, source: Some(file.into()), title: Path::new(file).file_name().unwrap().to_string_lossy().into_owned(), text: String::new(), part: 0, created: 0 };
+        let listed = [m(1, "/v/a.mp4"), m(2, "/v/b.mp4")];
+        let note = Memory { source: None, ..m(4, "/none") };
+        let recalled = [Hit { memory: m(3, "/v/c.mp4"), distance: 0.3 }, Hit { memory: m(1, "/v/a.mp4"), distance: 0.35 }, Hit { memory: note, distance: 0.36 }];
+        assert_eq!(sources(&listed, &recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["a.mp4", "b.mp4", "c.mp4"], "the list, then what else bore on it, each file once, and nothing that is of no file");
+        assert!(sources(&[], &[]).is_empty());
     }
 
     #[test]
@@ -384,5 +534,33 @@ mod tests {
         assert_eq!((talk.title.as_str(), talk.text.as_str()), ("How much was the invoice from the supplier?", "Asked: How much was the invoice from the supplier?\nAnswered: It was 40 pounds."));
         assert_eq!(headline(&"long ".repeat(40)).chars().count(), 80);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    /// By hand, against the real memory, to see why a search ranks as it
+    /// does: `NEO_APOLLO_QUERY="…" NEO_APOLLO_TITLES="a.gif|b.png" cargo test -p neo-apollo-core real_search -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn the_real_search_is_explained() {
+        let settings = crate::settings::Settings::load();
+        let model = crate::model::Ollama::from_settings(&settings);
+        let store = Store::open_for(&crate::dir().join("memory.db"), &crate::key::database_key().unwrap(), &model).unwrap();
+        let query = std::env::var("NEO_APOLLO_QUERY").unwrap();
+        let asked = model.embed(std::slice::from_ref(&query), true).unwrap().pop().unwrap();
+        let hits = store.search_for(&asked, &crate::words::terms(&query), 400, None).unwrap();
+        println!("{:?}", store.stats().unwrap());
+        for (i, h) in hits.iter().take(6).enumerate() {
+            println!("#{} {:.3} {} :: {}", i + 1, h.distance, h.memory.title, h.memory.text);
+        }
+        for title in std::env::var("NEO_APOLLO_TITLES").unwrap_or_default().split('|').filter(|t| !t.is_empty()) {
+            match hits.iter().position(|h| h.memory.title == title) {
+                Some(i) => println!("{title}: #{} {:.3} :: {} :: {:?}", i + 1, hits[i].distance, hits[i].memory.text, store.words_of(hits[i].memory.id).unwrap()),
+                None => println!("{title}: not among the nearest {}", hits.len()),
+            }
+        }
     }
 }

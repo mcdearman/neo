@@ -65,6 +65,19 @@ pub fn stamp(meta: &std::fs::Metadata) -> String {
     format!("{}-{}", meta.len(), modified(meta))
 }
 
+/// Counts up when pictures come to be described differently, so that
+/// those described the old way are read again.
+const DESCRIBED: u32 = 2;
+
+/// A file's stamp, with how it was read: a photo or a video described an
+/// older way does not count as read.
+fn stamp_of(path: &Path, meta: &std::fs::Metadata) -> String {
+    match classify(path) {
+        Some(What::Photo | What::Video) => format!("{}-d{DESCRIBED}", stamp(meta)),
+        _ => stamp(meta),
+    }
+}
+
 fn modified(meta: &std::fs::Metadata) -> u64 {
     meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
 }
@@ -348,7 +361,7 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
             parts.len() as u32
         }
     };
-    store.set_file(path, &stamp(&meta), made)?;
+    store.set_file(path, &stamp_of(path, &meta), made)?;
     Ok(Outcome::Read(made))
 }
 
@@ -399,7 +412,7 @@ pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], report: &mut
     let files = walk(roots);
     p.total = files.len();
     for file in files {
-        let unchanged = std::fs::metadata(&file).ok().map(|m| stamp(&m)).is_some_and(|s| store.file_stamp(&file).ok().flatten().as_deref() == Some(s.as_str()));
+        let unchanged = std::fs::metadata(&file).ok().map(|m| stamp_of(&file, &m)).is_some_and(|s| store.file_stamp(&file).ok().flatten().as_deref() == Some(s.as_str()));
         if !unchanged {
             p.now = Some(file.clone());
             if !report(&p) {

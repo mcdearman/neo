@@ -13,9 +13,11 @@ pub struct Folder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub folders: Vec<Folder>,
-    /// The model that answers.
+    /// The model that answers: a small one, so that Apollo can wait to be
+    /// asked without holding much, and be ready in a second or two.
     pub chat_model: String,
-    /// The model that describes pictures: one that can see.
+    /// The model that describes pictures: one that can see. Larger, and in
+    /// memory only while the folders are being read.
     pub vision_model: String,
     /// The model that turns text into embeddings.
     pub embed_model: String,
@@ -32,7 +34,7 @@ impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
         let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
-        Self { folders, chat_model: "gemma3:4b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remember_conversations: true, read_automatically: true }
+        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remember_conversations: true, read_automatically: true }
     }
 }
 

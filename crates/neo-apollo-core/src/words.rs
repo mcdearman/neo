@@ -40,6 +40,19 @@ pub fn clean_all(words: impl IntoIterator<Item = impl AsRef<str>>, most: usize) 
     out
 }
 
+/// The words of a question that say what is being looked for: "girl with
+/// pink hair" gives girl, pink and hair. Lower case, each once.
+pub fn terms(question: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for word in question.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if word.chars().count() >= 3 && !COMMON.contains(&word.as_str()) && !out.contains(&word) {
+            out.push(word);
+        }
+    }
+    out
+}
+
 /// The `most` words a text uses most that say something about it, most
 /// used first, and of those used equally, the first to appear.
 pub fn keywords(text: &str, most: usize) -> Vec<String> {
@@ -79,5 +92,7 @@ mod tests {
         assert_eq!(keywords(text, 3), ["invoice", "supplier", "march"]);
         assert_eq!(keywords("and the of to", 5), Vec::<String>::new());
         assert_eq!(keywords("", 5), Vec::<String>::new());
+        assert_eq!(terms("Girl with PINK hair, the girl!"), ["girl", "pink", "hair"]);
+        assert_eq!(terms("what is it"), Vec::<String>::new());
     }
 }

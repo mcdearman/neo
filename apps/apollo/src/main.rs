@@ -41,6 +41,9 @@ const THUMB_SIDE: u32 = 192;
 const THUMB: (f32, f32) = (72.0, 48.0);
 /// How many small pictures are kept before the oldest listing's are let go.
 const THUMBS_KEPT: usize = 400;
+/// The pictures under an answer: how large, and how many at most.
+const TILE: (f32, f32) = (108.0, 72.0);
+const TILES: usize = 6;
 /// How tall the cloud is, and the graph that takes its place.
 const CLOUD_H: f32 = 300.0;
 /// How many picked words the graph shows at once, and how many words go round each.
@@ -133,6 +136,10 @@ struct Apollo {
     /// memories are listed, and together they are the graph.
     trail: Vec<String>,
     graph: Rc<Vec<Hub>>,
+    /// The trails there have been, to step back and forward through, and
+    /// which of them is showing. The first is the cloud, with no word picked.
+    history: Vec<Vec<String>>,
+    at: usize,
     shown: Shown,
     /// Small pictures of the photos and videos listed. `None` for one being
     /// made, or that could not be. Kept only in memory, and only while the
@@ -189,6 +196,9 @@ enum Msg {
     Kind(Option<Kind>),
     Word(String),
     Clear,
+    /// One step back through the words picked, or forward again.
+    Back,
+    Forward,
     Open(PathBuf),
     Reveal(PathBuf),
     Forget(i64),
@@ -299,6 +309,8 @@ impl Apollo {
             kind: None,
             trail: vec![],
             graph: Rc::default(),
+            history: vec![vec![]],
+            at: 0,
             shown: Shown::default(),
             thumbs: HashMap::new(),
             cloud: Rc::default(),
@@ -504,8 +516,24 @@ impl Apollo {
         self.store = None;
         (self.shown, self.cloud, self.graph, self.stats, self.asked) = (Shown::default(), Rc::default(), Rc::default(), Stats::default(), None);
         self.trail.clear();
+        (self.history, self.at) = (vec![vec![]], 0);
         self.thumbs.clear();
         self.query.clear();
+    }
+
+    /// Moves to a trail of picked words, noting it as a step that can be
+    /// gone back to. Whatever was ahead, after stepping back, is dropped.
+    fn go(&mut self, trail: Vec<String>) {
+        if trail != self.trail {
+            self.history.truncate(self.at + 1);
+            self.history.push(trail.clone());
+            // Far more steps than anyone goes back through.
+            if self.history.len() > 200 {
+                self.history.remove(0);
+            }
+            self.at = self.history.len() - 1;
+        }
+        self.trail = trail;
     }
 
     /// The words folded into `word` in the cloud.
@@ -537,7 +565,7 @@ impl Apollo {
             return Ok(Shown { heading: format!("About “{word}”"), items });
         }
         if let Some((question, vector)) = &self.asked {
-            let items = store.search(vector, LISTED, self.kind)?.into_iter().map(|h| (h.memory, Some(h.distance))).collect();
+            let items = store.search_for(vector, &neo_apollo_core::words::terms(question), LISTED, self.kind)?.into_iter().map(|h| (h.memory, Some(h.distance))).collect();
             return Ok(Shown { heading: format!("Nearest to “{question}”"), items });
         }
         Ok(Shown { heading: "Newest".into(), items: store.recent(LISTED, self.kind)?.into_iter().map(|m| (m, None)).collect() })
@@ -584,7 +612,19 @@ impl Apollo {
             let listed: Vec<&PathBuf> = self.shown.items.iter().filter_map(|(m, _)| m.source.as_ref()).collect();
             self.thumbs.retain(|path, _| listed.contains(&path));
         }
-        let wanted: Vec<PathBuf> = self.shown.items.iter().filter(|(m, _)| matches!(m.kind, Kind::Photo | Kind::Video)).filter_map(|(m, _)| m.source.clone()).filter(|p| !self.thumbs.contains_key(p)).collect();
+        let wanted = self.shown.items.iter().filter(|(m, _)| matches!(m.kind, Kind::Photo | Kind::Video)).filter_map(|(m, _)| m.source.clone()).collect();
+        self.picture(wanted);
+    }
+
+    /// Has small pictures made of those of `files` that have none yet, off
+    /// the main thread.
+    fn picture(&mut self, files: Vec<PathBuf>) {
+        let mut wanted: Vec<PathBuf> = vec![];
+        for path in files {
+            if !self.thumbs.contains_key(&path) && !wanted.contains(&path) {
+                wanted.push(path);
+            }
+        }
         if wanted.is_empty() {
             return;
         }
@@ -642,7 +682,7 @@ impl Apollo {
                 }),
                 Err(e) => Progress { trouble: Some(e), ..Progress::default() },
             };
-            // Done for now: give the model's memory back.
+            // Done for now: give the memory of the model that sees back.
             model.rest();
             send(Msg::ReadDone(done));
         });
@@ -692,7 +732,12 @@ impl App for Apollo {
         vec![
             Menu::new("File").push(MenuEntry::new("New Conversation", Msg::NewTalk).shortcut(Shortcut::command("n")).enabled(!self.talk.is_empty() && !self.answering)).separator().push(MenuEntry::new("Add Folder…", Msg::AddFolder)).push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading)),
             Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))),
-            Menu::new("Memory").push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking)).push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some())),
+            Menu::new("Memory")
+                .push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking))
+                .push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some()))
+                .separator()
+                .push(MenuEntry::new("Back", Msg::Back).shortcut(Shortcut::command("[")).enabled(self.at > 0))
+                .push(MenuEntry::new("Forward", Msg::Forward).shortcut(Shortcut::command("]")).enabled(self.at + 1 < self.history.len())),
         ]
     }
 
@@ -724,7 +769,7 @@ impl App for Apollo {
         self.stop_answer.store(true, Ordering::Relaxed);
         // And the model's few gigabytes are given back at once.
         if !cfg!(test) {
-            self.model.rest();
+            self.model.rest_all();
         }
     }
 
@@ -772,7 +817,12 @@ impl App for Apollo {
                 self.said += 1;
                 let Some(last) = self.talk.last_mut() else { return };
                 match answer {
-                    Ok(a) => (last.text, last.recalled, last.listed) = (a.text, a.recalled, a.listed),
+                    Ok(a) => {
+                        // Pictures of the photos and videos it drew on, to show beneath it.
+                        let files = if self.store.is_some() { assistant::sources(&a.listed, &a.recalled).into_iter().filter(|m| matches!(m.kind, Kind::Photo | Kind::Video)).filter_map(|m| m.source.clone()).take(TILES).collect() } else { vec![] };
+                        (last.text, last.recalled, last.listed) = (a.text, a.recalled, a.listed);
+                        self.picture(files);
+                    }
                     Err(e) => {
                         // What could not be answered is put back to be asked again.
                         self.talk.pop();
@@ -808,7 +858,7 @@ impl App for Apollo {
                 match vector {
                     Ok(vector) => {
                         self.asked = Some((question, vector));
-                        self.trail.clear();
+                        self.go(vec![]);
                         self.show();
                     }
                     Err(e) => self.trouble = Some(e),
@@ -820,16 +870,27 @@ impl App for Apollo {
             }
             Msg::Word(word) => {
                 // A picked word again goes back to it; a new one is picked too.
-                match self.trail.iter().position(|w| *w == word) {
-                    Some(i) => self.trail.truncate(i + 1),
-                    None => self.trail.push(word),
+                let mut trail = self.trail.clone();
+                match trail.iter().position(|w| *w == word) {
+                    Some(i) => trail.truncate(i + 1),
+                    None => trail.push(word),
                 }
+                self.go(trail);
                 self.asked = None;
                 self.query.clear();
                 self.show();
             }
+            Msg::Back | Msg::Forward => {
+                let to = if matches!(m, Msg::Back) { self.at.checked_sub(1) } else { Some(self.at + 1).filter(|i| *i < self.history.len()) };
+                if let Some(to) = to {
+                    (self.at, self.trail) = (to, self.history[to].clone());
+                    self.asked = None;
+                    self.query.clear();
+                    self.show();
+                }
+            }
             Msg::Clear => {
-                self.trail.clear();
+                self.go(vec![]);
                 self.asked = None;
                 self.query.clear();
                 self.show();
@@ -1041,16 +1102,20 @@ impl Apollo {
             return row().width(Length::Fill).push(Space::new(Length::Fill, 0.0)).push(bubble).into();
         }
         let waiting = s.text.is_empty() && self.answering;
-        let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { "Thinking…".to_owned() } else { s.text.clone() }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
-        // The files the answer names, of those it was given to draw on.
-        let files = assistant::named(&s.text, &s.listed, &s.recalled);
-        if !files.is_empty() {
-            let mut chips = row().spacing(6.0);
-            for m in files.into_iter().take(5) {
-                let chip = row().spacing(6.0).align(Align::Center).push(icon(kind_icon(m.kind)).size(13.0)).push(text(snippet(&m.title, 26)).role(TextRole::Caption).no_wrap());
-                chips = chips.push(Button::new(chip).padding([10.0, 5.0]).radius(12.0).on_press_maybe(m.source.clone().map(Msg::Open)));
+        let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { "Thinking…".to_owned() } else { assistant::plain(&s.text) }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
+        // The files the answer was given to draw on, each a picture that shows it in Files.
+        let files = assistant::sources(&s.listed, &s.recalled);
+        if !files.is_empty() && !(self.answering && std::ptr::eq(s, self.talk.last().unwrap_or(s))) {
+            let mut tiles = row().spacing(8.0);
+            for m in files.into_iter().take(TILES) {
+                let Some(path) = m.source.clone() else { continue };
+                let tile: Element<Msg> = match self.thumbs.get(&path).and_then(Option::as_ref) {
+                    Some(small) => container(picture(small).fit(Fit::Cover).width(TILE.0).height(TILE.1)).width(TILE.0).height(TILE.1).into(),
+                    None => container(icon(kind_icon(m.kind)).size(22.0).tone(Tone::Accent)).surface(Surface::Well).radius(8.0).width(TILE.0).height(TILE.1).center().into(),
+                };
+                tiles = tiles.push(mouse_area(tile).on_press(move || Msg::Reveal(path.clone())));
             }
-            answer = answer.push(chips);
+            answer = answer.push(tiles);
         }
         row().spacing(12.0).width(Length::Fill).push(container(icon(icons::SPARKLES).size(16.0).tone(Tone::Accent)).padding([0.0, 2.0, 0.0, 0.0])).push(answer).into()
     }
@@ -1078,7 +1143,8 @@ impl Apollo {
             Element::new(Graph::new(self.graph.clone()).height(CLOUD_H).on_pick(Msg::Word))
         };
         let summary = format!("{} · {} from {}", count(self.stats.total(), "memory", "memories"), count(self.stats.words, "word", "words"), count(self.stats.files, "file", "files"));
-        let mut heading = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(text(self.shown.heading.clone()).role(TextRole::Title)).push(text(if self.searching { "Searching…".to_owned() } else { summary }).role(TextRole::Caption).tone(Tone::Muted)).push(Space::new(Length::Fill, 0.0));
+        let steps = row().spacing(2.0).push(icon_button(icons::ARROW_LEFT, 28.0).kind(ButtonKind::Ghost).on_press_maybe((self.at > 0).then_some(Msg::Back))).push(icon_button(icons::ARROW_RIGHT, 28.0).kind(ButtonKind::Ghost).on_press_maybe((self.at + 1 < self.history.len()).then_some(Msg::Forward)));
+        let mut heading = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(steps).push(text(self.shown.heading.clone()).role(TextRole::Title)).push(text(if self.searching { "Searching…".to_owned() } else { summary }).role(TextRole::Caption).tone(Tone::Muted)).push(Space::new(Length::Fill, 0.0));
         if !self.trail.is_empty() || self.asked.is_some() {
             heading = heading.push(Button::new(text(if self.trail.is_empty() { "Clear" } else { "Back to the Cloud" }).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([10.0, 4.0]).on_press(Msg::Clear));
         }
@@ -1531,6 +1597,30 @@ mod tests {
         a.update(Msg::Word("picnic".into()));
         a.update(Msg::Word("kite".into()));
         assert_eq!((a.trail.len(), a.graph.len(), a.graph[0].word.as_str()), (4, HUBS, "beach"), "the graph keeps to the last few");
+        // One step back at a time, and forward again.
+        a.update(Msg::Back);
+        assert_eq!((a.trail.len(), a.shown.heading.as_str()), (3, "About “picnic”"));
+        a.update(Msg::Back);
+        a.update(Msg::Back);
+        assert_eq!(a.trail, ["dog".to_owned()]);
+        a.update(Msg::Back);
+        assert!(a.trail.is_empty() && a.graph.is_empty() && a.shown.heading == "Newest", "back to the cloud it began from");
+        a.update(Msg::Back);
+        assert_eq!(a.at, 0, "and no further");
+        a.update(Msg::Forward);
+        a.update(Msg::Forward);
+        assert_eq!((a.trail.clone(), a.shown.heading.as_str()), (vec!["dog".to_owned(), "beach".to_owned()], "About “beach”"));
+        // Picking from here drops what was ahead.
+        a.update(Msg::Word("sea".into()));
+        assert_eq!((a.history.len(), a.at), (4, 3));
+        a.update(Msg::Forward);
+        assert_eq!(a.trail.last().map(String::as_str), Some("sea"), "nothing ahead to go to");
+        a.update(Msg::Back);
+        a.update(Msg::Forward);
+        a.update(Msg::Forward);
+        a.update(Msg::Back);
+        a.update(Msg::Word("picnic".into()));
+        a.update(Msg::Word("kite".into()));
         // A picked word again goes back to it.
         a.update(Msg::Word("beach".into()));
         assert_eq!((a.trail.clone(), a.shown.heading.as_str()), (vec!["dog".to_owned(), "beach".to_owned()], "About “beach”"));
@@ -1545,6 +1635,11 @@ mod tests {
         assert_eq!(h.app().trail, ["dog".to_owned()]);
         h.app_mut().update(Msg::Clear);
         assert!(h.app().graph.is_empty() && h.app().trail.is_empty(), "and back to the cloud");
+        // Which is itself a step: back from it is the graph again.
+        h.app_mut().update(Msg::Back);
+        assert_eq!(h.app().trail, ["dog".to_owned()]);
+        h.app_mut().update(Msg::Lock);
+        assert_eq!((h.app().history.len(), h.app().at), (1, 0));
         h.render(1.0);
     }
 
@@ -1563,6 +1658,9 @@ mod tests {
         let answer = a.talk.last().unwrap();
         assert!(!answer.recalled.is_empty() && answer.text.ends_with("memories.") && !answer.text.contains(" 0 memories"));
         assert!(answer.recalled[0].memory.title.starts_with("IMG_20"));
+        // The photos it listed are to be shown beneath it as pictures, not named.
+        let drawn_on = assistant::sources(&answer.listed, &answer.recalled);
+        assert!(!drawn_on.is_empty() && drawn_on.iter().all(|m| m.kind == Kind::Photo && a.thumbs.contains_key(m.source.as_ref().unwrap())), "pictures of them were asked for");
         assert_eq!(a.stats.total(), before, "with remembering off, what was asked is not kept");
         // With it on, it is, and what Apollo is told goes in as a note.
         a.settings.remember_conversations = true;
@@ -1719,8 +1817,9 @@ mod tests {
             a.update(Msg::Suggest(q));
             let said = a.talk.last().unwrap();
             println!("answered in {:?}: {}\n  from {:?}; trouble {:?}", began.elapsed(), said.text, said.recalled.iter().map(|h| (h.memory.title.as_str(), h.distance)).collect::<Vec<_>>(), a.trouble);
-            println!("  listed {:?}; named {:?}", said.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), assistant::named(&said.text, &said.listed, &said.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>());
-            a.model.rest();
+            println!("  shown as: {}", assistant::plain(&said.text));
+            println!("  listed {:?}; named {:?}", said.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), assistant::sources(&said.listed, &said.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>());
+            a.model.rest_all();
             shoot(a, "probe-ask");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -1753,12 +1852,12 @@ mod tests {
         let (mut a, scratch) = app("models");
         let file = scratch.0.join("settings");
         a.settings_file = Some(file.clone());
-        assert_eq!(a.drafts, ["gemma3:4b".to_owned(), "gemma3:4b".to_owned(), "nomic-embed-text".to_owned()]);
+        assert_eq!(a.drafts, ["gemma3:1b".to_owned(), "gemma3:4b".to_owned(), "nomic-embed-text".to_owned()]);
         // Typed and put to use, the choice is saved; one left empty is not taken.
         a.update(Msg::ModelDraft(0, " qwen3:8b ".into()));
         a.update(Msg::ModelDraft(1, "   ".into()));
         a.update(Msg::UseModels);
-        assert_eq!(a.settings.chat_model, "gemma3:4b", "not with one of them empty");
+        assert_eq!(a.settings.chat_model, "gemma3:1b", "not with one of them empty");
         a.update(Msg::ModelDraft(1, "qwen3-vl:8b".into()));
         a.update(Msg::UseModels);
         assert_eq!((a.settings.chat_model.as_str(), a.settings.vision_model.as_str(), a.settings.embed_model.as_str()), ("qwen3:8b", "qwen3-vl:8b", "nomic-embed-text"));

@@ -145,6 +145,13 @@ pub const OTHER_MODEL: &str = "The memory was made with";
 /// Words closer than this mean the same for the cloud's purposes: "dog"
 /// and "dogs", "beach" and "seaside".
 const SAME_WORD: f32 = 0.1;
+/// How much nearer a memory counts as being for saying every word of the
+/// question. Distances between a question and what answers it run from
+/// about 0.25 to 0.55, so this is enough to lift one that says the words
+/// over those that only sound alike, and not enough to lift one that is
+/// about something else altogether.
+pub const SAID: f32 = 0.12;
+
 /// Words closer than this are near enough in meaning to go together.
 const NEAR_WORD: f32 = 0.3;
 /// How many of the commonest words are weighed for the cloud.
@@ -337,6 +344,40 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// As [`search`](Self::search), for a question whose own words are
+    /// known as well as its embedding. Nearness in meaning alone ranks a
+    /// picture described as "a woman in a bright pink wig" hardly above any
+    /// other picture of a woman; one that says the very words asked for is
+    /// moved up, by up to [`SAID`] for saying all of them. Memories that
+    /// say every word but are not among the nearest are brought in too.
+    pub fn search_for(&self, embedding: &[f32], terms: &[String], most: usize, kind: Option<Kind>) -> Result<Vec<Hit>, String> {
+        if terms.is_empty() {
+            return self.search(embedding, most, kind);
+        }
+        let mut hits = self.search(embedding, (most * 4).max(80), kind)?;
+        // Those that say every word, wherever they stand by meaning.
+        let says_all = (1..=terms.len()).map(|i| format!("(lower(m.title || ' ' || m.text) like ?{i} or exists (select 1 from memory_words mw join words w on w.id = mw.word where mw.memory = m.id and w.word like ?{i}))")).collect::<Vec<_>>().join(" and ");
+        let mut st = self.db.prepare(&format!("select {}, (select embedding from memory_vectors v where v.rowid = m.id) from memories m where {says_all} order by m.created desc limit 60", MEMORY.split(", ").map(|c| format!("m.{c}")).collect::<Vec<_>>().join(", "))).map_err(err)?;
+        let like: Vec<String> = terms.iter().map(|t| format!("%{}%", t.replace(['%', '_'], ""))).collect();
+        let said = st.query_map(rusqlite::params_from_iter(&like), |r| Ok((memory(r)?, r.get::<_, Option<Vec<u8>>>(7)?))).map_err(err)?;
+        for row in said {
+            let (m, vector) = row.map_err(err)?;
+            if kind.is_none_or(|k| k == m.kind) && !hits.iter().any(|h| h.memory.id == m.id) {
+                let far = vector.map_or(1.0, |v| distance(embedding, &floats(&v)));
+                hits.push(Hit { memory: m, distance: far });
+            }
+        }
+        let mut scored = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let mut said = format!("{} {} ", hit.memory.title, hit.memory.text).to_lowercase();
+            said.push_str(&self.words_of(hit.memory.id)?.join(" "));
+            let share = terms.iter().filter(|t| said.contains(t.as_str())).count() as f32 / terms.len() as f32;
+            scored.push((hit.distance - SAID * share, hit));
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(scored.into_iter().take(most).map(|(_, hit)| hit).collect())
     }
 
     /// The memories that are about `word`, newest first.
@@ -628,6 +669,33 @@ mod tests {
         let weight = |word: &str| cloud.iter().find(|w| w.word == word).unwrap().weight;
         assert!(weight("photo") < weight("beach") && weight("beach") > weight("invoice"), "being in every memory counts against a word");
         assert_eq!(s.cloud(2, None).unwrap().len(), 2);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_memory_that_says_the_words_asked_for_comes_first() {
+        let path = scratch("said");
+        let mut s = Store::open(&path, &KEY, 3).unwrap();
+        let none: Vec<String> = vec![];
+        // Three pictures of women, all much the same by meaning; one a little nearer.
+        let jinx = s.add(&new(Kind::Photo, None, "jinx.png", "An illustration of a character with a fierce expression.", &none), &[1.0, 0.05, 0.0]).unwrap();
+        let wig = s.add(&new(Kind::Photo, None, "giphy.gif", "A woman singing into a microphone in a bright pink wig.", &words(&["pink hair", "singer"])), &[1.0, 0.25, 0.0]).unwrap();
+        let hat = s.add(&new(Kind::Photo, None, "hat.jpg", "A girl in a pink hat.", &none), &[1.0, 0.3, 0.0]).unwrap();
+        // Far off by meaning, but it says every word.
+        let note = s.add(&new(Kind::Note, None, "A note", "The girl next door dyed her hair pink.", &none), &[0.0, 0.2, 1.0]).unwrap();
+        let ask = [1.0, 0.0, 0.0];
+        let order = |terms: &[&str], most, kind| s.search_for(&ask, &words(terms), most, kind).unwrap().iter().map(|h| h.memory.id).collect::<Vec<_>>();
+        assert_eq!(s.search(&ask, 3, None).unwrap()[0].memory.id, jinx, "by meaning alone, the nearest");
+        assert_eq!(order(&["girl", "pink", "hair"], 3, None), [wig, hat, jinx], "saying pink and hair (in its words) beats saying girl and pink, which beats saying none");
+        assert_eq!(order(&[], 1, None), [jinx], "with no words to go on, meaning alone");
+        // One that says them all is found though far off, yet not put above what is both near and says most.
+        let all = order(&["girl", "pink", "hair"], 10, None);
+        assert!(all.contains(&note) && all[0] == wig, "{all:?}");
+        assert_eq!(order(&["girl", "pink", "hair"], 10, Some(Kind::Note)), [note]);
+        assert!(!order(&["pink"], 10, Some(Kind::Photo)).contains(&note));
+        // The distance given is still the true one.
+        let hits = s.search_for(&ask, &words(&["pink"]), 4, None).unwrap();
+        assert!(hits.iter().all(|h| (0.0..=1.0).contains(&h.distance)) && hits.iter().any(|h| h.memory.id == note && h.distance > 0.9));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

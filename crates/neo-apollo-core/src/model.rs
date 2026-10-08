@@ -58,9 +58,15 @@ pub trait Model: Send + Sync {
     /// Says what a picture, given as a JPEG, shows.
     fn describe(&self, jpeg: &[u8]) -> Result<Seen, String>;
 
-    /// Lets go of whatever it holds in memory until it is next asked
-    /// something. A model that holds nothing need do nothing.
+    /// Lets go of what reading needed and waiting to be asked does not:
+    /// the model that sees, which is the large one. A model that holds
+    /// nothing need do nothing.
     fn rest(&self) {}
+
+    /// Lets go of everything it holds in memory, for when Apollo closes.
+    fn rest_all(&self) {
+        self.rest();
+    }
 
     /// Answers a conversation. `piece` is given the answer as it comes;
     /// returning false from it stops the answer there.
@@ -85,11 +91,16 @@ pub struct Pulling {
 }
 
 /// How long a model stays in memory after it was last asked something.
-/// Short, so that a few gigabytes are given back soon after Apollo is done.
-const KEEP: &str = "2m";
+/// The one that sees is the large one, and is let go soon after a reading.
+const KEEP_SEEING: &str = "2m";
+/// The model that answers is small and back in a second or two, so it
+/// need not sit in memory for long between questions.
+const KEEP_ANSWERING: &str = "5m";
+/// The embedding model is a few hundred megabytes and every search needs
+/// it, so it stays: this is what Apollo holds while it waits to be asked.
+const KEEP_EMBEDDING: &str = "30m";
 
-const DESCRIBE: &str =
-    "Describe this image for someone who will search for it later. In `description`, say in two or three plain sentences what it shows: the people, animals, objects, place, activity, and any text that can be read. If it is a screenshot, say what app or page it shows and what is on it. In `tags`, give five to eight single words or short phrases for what it is of, most important first, lower case.";
+const DESCRIBE: &str = "Describe this image for someone who will search for it later by what is in it. In `description`, say in two to four plain sentences what it shows: the people, animals, objects, place, activity, and any text that can be read. For each person or character, say whether they look like a man, woman, boy or girl, the colour and style of their hair, what they are wearing and its colours, and their expression, since searches are often for such details. Name a well-known person or character only if you are sure who it is. If it is a screenshot, say what app or page it shows and what is on it. In `tags`, give six to ten single words or short phrases for what is actually in this image, most important first, lower case; where there are people, include their telling details, such as the colour of their hair. Describe only what you can see.";
 
 fn agent(wait: Option<Duration>) -> ureq::Agent {
     ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(3))).timeout_recv_response(wait).http_status_as_error(false).build().into()
@@ -121,6 +132,19 @@ impl Ollama {
         let mut res = res;
         let said = res.body_mut().read_json::<Value>().ok().and_then(|v| v["error"].as_str().map(str::to_owned));
         Err(said.unwrap_or_else(|| format!("The model server said {status}.")))
+    }
+
+    /// Has the server unload models now, which gives their memory back,
+    /// and not when they have sat idle for a while.
+    fn unload(&self, models: &[&String]) {
+        let mut done: Vec<&String> = vec![];
+        for model in models {
+            if !done.contains(model) {
+                // Asking for nothing, to be kept for no time, is how the server is told.
+                let _ = self.post(if *model == &self.embed_model { "/api/embed" } else { "/api/generate" }, &json!({ "model": model, "keep_alive": 0 }), Some(Duration::from_secs(5)));
+                done.push(model);
+            }
+        }
     }
 
     /// Whether the server is there.
@@ -214,7 +238,7 @@ impl Ollama {
 /// Reads the model's answer about a picture, which was asked for as JSON.
 pub fn read_seen(answer: &str) -> Seen {
     match serde_json::from_str::<Value>(answer.trim()) {
-        Ok(v) => Seen { text: v["description"].as_str().unwrap_or_default().trim().to_owned(), words: crate::words::clean_all(v["tags"].as_array().into_iter().flatten().filter_map(Value::as_str), 8) },
+        Ok(v) => Seen { text: v["description"].as_str().unwrap_or_default().trim().to_owned(), words: crate::words::clean_all(v["tags"].as_array().into_iter().flatten().filter_map(Value::as_str), 10) },
         // Not what was asked for: what it said is still a description.
         Err(_) => Seen { text: answer.trim().to_owned(), words: vec![] },
     }
@@ -225,17 +249,12 @@ impl Model for Ollama {
         self.embed_model.clone()
     }
 
-    /// Has the server unload the models now, which gives their few
-    /// gigabytes back, and not when they have sat idle for a while.
     fn rest(&self) {
-        let mut done: Vec<&String> = vec![];
-        for model in [&self.chat_model, &self.vision_model, &self.embed_model] {
-            if !done.contains(&model) {
-                // Asking for nothing, to be kept for no time, is how the server is told.
-                let _ = self.post(if model == &self.embed_model { "/api/embed" } else { "/api/generate" }, &json!({ "model": model, "keep_alive": 0 }), Some(Duration::from_secs(5)));
-                done.push(model);
-            }
-        }
+        self.unload(&[&self.vision_model]);
+    }
+
+    fn rest_all(&self) {
+        self.unload(&[&self.chat_model, &self.vision_model, &self.embed_model]);
     }
 
     fn dims(&self) -> Result<usize, String> {
@@ -263,7 +282,7 @@ impl Model for Ollama {
             "search_document: "
         };
         let input: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        let mut res = self.post("/api/embed", &json!({ "model": self.embed_model, "input": input, "keep_alive": KEEP, "truncate": true }), Some(Duration::from_secs(300)))?;
+        let mut res = self.post("/api/embed", &json!({ "model": self.embed_model, "input": input, "keep_alive": KEEP_EMBEDDING, "truncate": true }), Some(Duration::from_secs(300)))?;
         let v: Value = res.body_mut().read_json().map_err(|e| e.to_string())?;
         let out: Vec<Vec<f32>> = v["embeddings"].as_array().map(|all| all.iter().map(|e| e.as_array().map(|e| e.iter().map(|f| f.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default()).collect()).unwrap_or_default();
         if out.len() != texts.len() {
@@ -275,7 +294,7 @@ impl Model for Ollama {
     fn describe(&self, jpeg: &[u8]) -> Result<Seen, String> {
         let picture = base64::engine::general_purpose::STANDARD.encode(jpeg);
         let format = json!({ "type": "object", "properties": { "description": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } } }, "required": ["description", "tags"] });
-        let body = json!({ "model": self.vision_model, "stream": false, "keep_alive": KEEP, "format": format, "options": { "temperature": 0.2 }, "messages": [{ "role": "user", "content": DESCRIBE, "images": [picture] }] });
+        let body = json!({ "model": self.vision_model, "stream": false, "keep_alive": KEEP_SEEING, "format": format, "options": { "temperature": 0.2 }, "messages": [{ "role": "user", "content": DESCRIBE, "images": [picture] }] });
         let mut res = self.post("/api/chat", &body, Some(Duration::from_secs(600)))?;
         let v: Value = res.body_mut().read_json().map_err(|e| e.to_string())?;
         let seen = read_seen(v["message"]["content"].as_str().unwrap_or_default());
@@ -294,7 +313,7 @@ impl Model for Ollama {
                 json!({ "role": role, "content": t.text })
             })
             .collect();
-        let mut res = self.post("/api/chat", &json!({ "model": self.chat_model, "stream": true, "keep_alive": KEEP, "messages": messages }), Some(Duration::from_secs(600)))?;
+        let mut res = self.post("/api/chat", &json!({ "model": self.chat_model, "stream": true, "keep_alive": KEEP_ANSWERING, "messages": messages }), Some(Duration::from_secs(600)))?;
         let mut said = String::new();
         for line in BufReader::new(res.body_mut().as_reader()).lines() {
             let line = line.map_err(|e| format!("The answer stopped: {e}"))?;
@@ -369,8 +388,10 @@ pub mod fake {
         }
 
         fn chat(&self, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
-            let asked = turns.iter().rev().find(|t| t.role == Role::User).map(|t| t.text.as_str()).unwrap_or_default();
-            let knows = turns.iter().filter(|t| t.role == Role::System).map(|t| t.text.matches("\n[").count()).sum::<usize>();
+            // The question is put with what bears on it set out before it, numbered.
+            let put = turns.iter().rev().find(|t| t.role == Role::User).map(|t| t.text.as_str()).unwrap_or_default();
+            let asked = put.split("\nQuestion: ").nth(1).map_or(put, |rest| rest.lines().next().unwrap_or_default()).lines().next().unwrap_or_default();
+            let knows = put.lines().filter(|l| l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))).count();
             let answer = format!("You asked: {asked} I looked at {knows} memories.");
             let mut said = String::new();
             for word in answer.split_inclusive(' ') {
