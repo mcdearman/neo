@@ -2,7 +2,7 @@
 //!
 //! The sound is taken out with ffmpeg and written down by Whisper, which
 //! runs on this computer as the rest does (`whisper-cli`, from
-//! whisper.cpp), with a model of its own of about 150 megabytes that is
+//! whisper.cpp), with a model of its own, of some hundreds of megabytes, that is
 //! downloaded once. What comes of it is text, remembered and searched as
 //! a document's is: "the video where we talk about the ferry".
 
@@ -36,8 +36,10 @@ pub const LISTENERS: [Listener; 4] = [
     Listener { id: "turbo-full", name: "Large v3 Turbo, unpacked", note: "The same model at full size; a shade more exact, and three times the memory.", file: "ggml-large-v3-turbo.bin", bytes: 1_625_000_000 },
 ];
 
-/// Which of them is in use: its place in [`LISTENERS`].
-static LISTENER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Which of them is in use: its place in [`LISTENERS`]. Large v3 Turbo
+/// unless another is chosen: it is right about names and noisy speech far
+/// more often than the small ones, for a few times the wait.
+static LISTENER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
 /// The model in use.
 pub fn listener() -> Listener {
@@ -279,6 +281,7 @@ mod tests {
         assert_eq!(LISTENERS.map(|l| l.id), ["base", "small", "turbo", "turbo-full"]);
         assert!(LISTENERS.windows(2).all(|w| w[0].bytes < w[1].bytes), "smallest first");
         let turbo = LISTENERS[2];
+        assert_eq!(crate::settings::Settings::default().hear_model, turbo.id, "the one used unless another is chosen");
         assert_eq!(turbo.url(), "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin");
         assert!(turbo.kept_at().ends_with("whisper-turbo.bin") && LISTENERS[0].kept_at().ends_with("whisper-base.bin"));
         assert_eq!((LISTENERS[0].runners(), turbo.runners()), (2, 1), "a large one listens to one thing at a time");

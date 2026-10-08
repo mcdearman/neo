@@ -62,7 +62,7 @@ impl Default for Settings {
             chat_model: "gemma3:1b".into(),
             vision_model: "gemma3:4b".into(),
             embed_model: "nomic-embed-text".into(),
-            hear_model: "base".into(),
+            hear_model: "turbo".into(),
             server: "http://127.0.0.1:11434".into(),
             remote: String::new(),
             chat_remote: false,
