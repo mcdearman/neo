@@ -14,6 +14,7 @@
 //! - Windows: `%LOCALAPPDATA%\Programs\Neo`, with shortcuts in the
 //!   Start menu's Neo folder.
 
+mod deps;
 mod apps;
 mod icons;
 mod platform;
@@ -48,7 +49,7 @@ fn build() -> Result<(), String> {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: cargo xtask <install [--no-build] | uninstall | icons>");
+    eprintln!("usage: cargo xtask <install [--no-build] [--no-deps] | deps [--install] | uninstall | icons>");
     ExitCode::from(2)
 }
 
@@ -57,8 +58,12 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("install") => {
             let skip_build = args.iter().any(|a| a == "--no-build");
-            (if skip_build { Ok(()) } else { build() }).and_then(|_| platform::install())
+            // What Neo needs from outside itself comes first, unless told
+            // not to: an install without it is an install that half works.
+            let deps = if args.iter().any(|a| a == "--no-deps") { deps::ensure(false) } else { deps::ensure(true) };
+            deps.and_then(|_| if skip_build { Ok(()) } else { build() }).and_then(|_| platform::install())
         }
+        Some("deps") => deps::ensure(args.iter().any(|a| a == "--install")),
         Some("uninstall") => platform::uninstall(),
         Some("icons") => icons::render_all(&root().join("dist/icons")),
         _ => return usage(),

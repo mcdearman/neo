@@ -70,7 +70,7 @@ Next apps, most useful first:
 
 ### 1.4 Ship
 
-- Packages: an AUR `neo-apps-git` package, a Fedora COPR repository and eventually Flathub.
+- Packages: an AUR `neo-apps-git` package, a Fedora COPR repository and eventually Flathub. Each depends on `ffmpeg`, the one program Neo relies on and does not build (`xtask/src/deps.rs` has the list).
   - The Terminal and Files need broad file-system access, which fits native packages better than Flatpak.
 - Replace the stock `Icon=` names in the `.desktop` files with Neo's own app icons.
 

@@ -204,6 +204,16 @@ pub fn friendly_time(t: SystemTime) -> String {
     }
 }
 
+/// Where a program Neo relies on is: on the `PATH`, or in the places
+/// programs are usually installed, which an app started from the Dock or
+/// a launcher is not always told about. Just the name if it is nowhere to
+/// be found, so that running it says so.
+pub fn tool(program: &str) -> PathBuf {
+    let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
+    let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    on_path.into_iter().chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"].map(PathBuf::from)).map(|dir| dir.join(&name)).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(program))
+}
+
 /// A time in full, for where the exact moment matters: "8 Oct 2026, 09:41:07".
 pub fn full_time(t: SystemTime) -> String {
     let t: DateTime<Local> = t.into();

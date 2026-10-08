@@ -104,10 +104,8 @@ pub fn frame_commands(video: &Path, out_dir: &Path, out: &Path, side: u32) -> Ve
         commands.push(c);
     }
     // A second in, past any black first frame; scaled to fit the side.
-    // Found where it is usually put, since an app started from the Dock
-    // is not told where the user's own programs are.
-    let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].into_iter().find(|p| Path::new(p).is_file()).unwrap_or("ffmpeg");
-    let mut c = std::process::Command::new(ffmpeg);
+    // ffmpeg reads everything, and Neo counts on its being installed.
+    let mut c = std::process::Command::new(neo_desktop::fs::tool("ffmpeg"));
     c.args(["-y", "-loglevel", "error", "-ss", "1", "-i"]).arg(video).args(["-frames:v", "1", "-vf", &format!("scale={side}:{side}:force_original_aspect_ratio=decrease")]).arg(out);
     commands.push(c);
     commands
