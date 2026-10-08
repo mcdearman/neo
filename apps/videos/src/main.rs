@@ -399,10 +399,7 @@ mod tests {
             return;
         }
         // The programs playing this file, by its name on their command lines.
-        let playing = || {
-            let out = std::process::Command::new("pgrep").arg("-f").arg(path.file_name().unwrap()).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
-            out
-        };
+        let playing = || std::process::Command::new("pgrep").arg("-f").arg(path.file_name().unwrap()).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
         let mut app = Videos::new(Some(path.clone()));
         app.update(Msg::Volume(0.0));
         app.autoplay = true;
