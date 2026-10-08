@@ -12,6 +12,8 @@ use crate::event::{Event, Status};
 #[derive(Default)]
 struct ScrollLook {
     hover: Anim,
+    /// The last request to bring something into view that was met.
+    revealed: u64,
 }
 
 /// Scrolls its child vertically.
@@ -20,11 +22,14 @@ pub struct Scrollable<M> {
     width: Length,
     height: Length,
     logic: ScrollLogic,
+    /// A request to bring one of the content's children into view: its
+    /// number, and which child.
+    reveal: Option<(u64, usize)>,
 }
 
 impl<M: 'static> Scrollable<M> {
     pub fn new(child: impl Into<Element<M>>) -> Self {
-        Self { child: [child.into()], width: Length::Fill, height: Length::Fill, logic: ScrollLogic::default() }
+        Self { child: [child.into()], width: Length::Fill, height: Length::Fill, logic: ScrollLogic::default(), reveal: None }
     }
 
     pub fn width(mut self, w: impl Into<Length>) -> Self {
@@ -34,6 +39,15 @@ impl<M: 'static> Scrollable<M> {
 
     pub fn height(mut self, h: impl Into<Length>) -> Self {
         self.height = h.into();
+        self
+    }
+
+    /// Scrolls so that the content's child at `index` is in view, once
+    /// for each new `serial`: change the number to ask again. For a list
+    /// whose selection has moved somewhere that may be out of sight. Zero
+    /// asks for nothing.
+    pub fn reveal(mut self, serial: u64, index: usize) -> Self {
+        self.reveal = (serial != 0).then_some((serial, index));
         self
     }
 }
@@ -69,6 +83,21 @@ impl<M: 'static> Widget<M> for Scrollable<M> {
         let cs = self.child[0].layout(cx, Limits::new(Size::new(l.min.w, 0.0), Size::new(l.max.w, f32::INFINITY)));
         self.logic.content = cs.h;
         let size = l.resolve(cs);
+        // Asked to show one of the rows, and not yet done: move just far
+        // enough that it is inside, with a little room around it.
+        if let Some((serial, index)) = self.reveal
+            && std::mem::replace(&mut cx.state::<ScrollLook>().revealed, serial) != serial
+            && let Some(row) = self.child[0].children_mut().get(index)
+        {
+            let (top, bottom) = (row.position().y, row.position().y + row.bounds().h);
+            let st = cx.state::<ScrollState>();
+            let room = 8.0;
+            if top - room < st.offset {
+                st.offset = top - room;
+            } else if bottom + room > st.offset + size.h {
+                st.offset = bottom + room - size.h;
+            }
+        }
         let off = self.logic.clamp(cx, size.h);
         self.child[0].set_position(Point::new(0.0, -off));
         size

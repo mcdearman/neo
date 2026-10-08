@@ -433,9 +433,21 @@ impl Recorder {
     /// with the picture and a way to find the file; without NeoShell this
     /// window says so itself.
     fn announce(&mut self, saved: Saved) {
-        let title = if matches!(self.copied, Some(Ok(()))) { "Screenshot copied to clipboard" } else { "Screenshot saved" };
+        // A recording has a length; a screenshot has none, and a picture to show.
+        let recording = !saved.length.is_zero();
+        let title = if recording {
+            "Recording saved"
+        } else if matches!(self.copied, Some(Ok(()))) {
+            "Screenshot copied to clipboard"
+        } else {
+            "Screenshot saved"
+        };
         let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let note = neo_desktop::notify::Notification::new(title, name).image(&saved.path).reveal(&saved.path);
+        // Clicking the notification opens it, in Photos or Videos.
+        let mut note = neo_desktop::notify::Notification::new(title, name).reveal(&saved.path).open(&saved.path);
+        if !recording {
+            note = note.image(&saved.path);
+        }
         // Tests must not reach a NeoShell that happens to be running here.
         if !cfg!(test) && note.send() {
             self.phase = Phase::Idle;
@@ -850,6 +862,11 @@ impl Recorder {
                     self.phase = Phase::Failed(format!("Recording could not resume, so it stopped early: {e}"));
                 }
                 self.shown = true;
+                // A recording that went well is announced the same way a
+                // screenshot is, where NeoShell is there to show it.
+                if let Phase::Done(saved) = self.phase.clone() {
+                    self.announce(saved);
+                }
             }
             Msg::Hotkey => match self.phase {
                 Phase::Recording => self.stop(),

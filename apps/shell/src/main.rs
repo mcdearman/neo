@@ -59,6 +59,8 @@ enum Msg {
     Dismiss(u64),
     /// Show the file a notification is about in Files.
     Reveal(u64),
+    /// Open the file a notification is about: its card was clicked.
+    Open(u64),
     Geometry(WindowGeometry),
     Poll,
 }
@@ -176,7 +178,8 @@ impl Shell {
     fn card(&self, c: &Card) -> Element<Msg> {
         let mut words = column().spacing(2.0).width(Length::Fill).push(text(c.note.title.clone()).role(TextRole::Strong).no_wrap());
         if !c.note.body.is_empty() {
-            words = words.push(text(c.note.body.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap());
+            // Written as a link where clicking the card opens the file.
+            words = words.push(text(c.note.body.clone()).role(TextRole::Caption).tone(if c.note.open.is_some() { Tone::Accent } else { Tone::Muted }).no_wrap());
         }
         if c.note.reveal.is_some() {
             let link = row().spacing(5.0).align(Align::Center).push(icon(icons::FOLDER_OPEN).size(13.0)).push(text("Show in Files").role(TextRole::Caption));
@@ -187,7 +190,11 @@ impl Shell {
             body = body.push(container(picture(p).fit(Fit::Cover).width(52.0).height(52.0)).width(52.0).height(52.0));
         }
         body = body.push(words).push(icon_button(icons::X, 24.0).kind(ButtonKind::Ghost).on_press(Msg::Dismiss(c.id)));
-        container(neo_desktop::ui::sheet(container(body).height(CARD_H - 40.0).align_y(Align::Center), CARD_W)).height(CARD_H).into()
+        let inside: Element<Msg> = container(body).height(CARD_H - 40.0).align_y(Align::Center).into();
+        // The card itself opens the file, anywhere its buttons are not.
+        let id = c.id;
+        let inside = if c.note.open.is_some() { mouse_area(inside).on_press(move || Msg::Open(id)).into() } else { inside };
+        container(neo_desktop::ui::sheet(inside, CARD_W)).height(CARD_H).into()
     }
 }
 
@@ -260,6 +267,15 @@ impl App for Shell {
                 }
                 self.dismiss(id, now);
             }
+            Msg::Open(id) => {
+                if let Some(path) = self.cards.iter().find(|c| c.id == id).and_then(|c| c.note.open.clone()) {
+                    // Tests must not start whatever viewers this computer has.
+                    if !cfg!(test) {
+                        let _ = neo_desktop::fs::open_file(&path);
+                    }
+                    self.dismiss(id, now);
+                }
+            }
             Msg::Geometry(g) => self.screen = g.screen,
             Msg::Poll => {
                 self.desktop.poll();
@@ -295,7 +311,7 @@ fn main() {
         snapshots(PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "target/snapshots".into())));
         return;
     }
-    // `neo-shell --notify "Title" ["Body"] [--image file] [--reveal file]`
+    // `neo-shell --notify "Title" ["Body"] [--image file] [--reveal file] [--open file]`
     // sends a notification to the NeoShell that is running, for scripts.
     if let Some(i) = args.iter().position(|a| a == "--notify") {
         let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|j| args.get(j + 1)).map(PathBuf::from);
@@ -304,7 +320,7 @@ fn main() {
             eprintln!("neo-shell: --notify needs a title");
             std::process::exit(2);
         };
-        let note = Notification { title: (*title).clone(), body: words.get(1).map(|b| (*b).clone()).unwrap_or_default(), image: value("--image"), reveal: value("--reveal") };
+        let note = Notification { title: (*title).clone(), body: words.get(1).map(|b| (*b).clone()).unwrap_or_default(), image: value("--image"), reveal: value("--reveal"), open: value("--open") };
         if !note.send() {
             eprintln!("neo-shell: NeoShell is not running, so there is nowhere to show that");
             std::process::exit(1);
@@ -474,6 +490,43 @@ mod tests {
         // The close button, at the card's right edge.
         h.click(neo::Point::new(MARGIN + CARD_W - 32.0, MARGIN + CARD_H / 2.0));
         assert!(h.app().cards.is_empty(), "closing it removes it");
+    }
+
+    #[test]
+    fn clicking_a_card_opens_its_file_and_its_buttons_still_do_their_own_thing() {
+        use neo::testing::Harness;
+        let (mut s, t) = shell();
+        s.add(Notification::new("Recording saved", "clip.mov").reveal("/tmp/clip.mov").open("/tmp/clip.mov"), None, t);
+        // Once it has slid into place.
+        s.step(t + SLIDE_IN * 2);
+        let size = s.size();
+        let mut h = Harness::new(s, size).unwrap();
+        h.render(1.0);
+        // Over the words, the pointer says the card can be clicked.
+        let words = neo::Point::new(MARGIN + 60.0, MARGIN + 34.0);
+        h.move_to(words);
+        assert_eq!(h.cursor(), neo::CursorIcon::Pointer);
+        h.click(words);
+        assert!(h.app().cards.iter().all(|c| c.leaving.is_some()), "opened, and on its way out");
+
+        // One with nothing to open is not a button: clicking it leaves it be.
+        let (mut s, t) = shell();
+        s.add(Notification::new("Backup finished", "All files copied"), None, t);
+        s.step(t + SLIDE_IN * 2);
+        let size = s.size();
+        let mut h = Harness::new(s, size).unwrap();
+        h.render(1.0);
+        h.move_to(words);
+        assert_eq!(h.cursor(), neo::CursorIcon::Default);
+        h.click(words);
+        assert_eq!((h.app().cards.len(), h.app().cards[0].leaving), (1, None));
+        // A message to open a card that has nothing to open does nothing.
+        let id = h.app().cards[0].id;
+        h.app_mut().update(Msg::Open(id));
+        assert_eq!(h.app().cards[0].leaving, None);
+        // The file travels with the notification.
+        let sent = Notification::new("Screenshot saved", "shot.png").open("/tmp/a shot.png");
+        assert_eq!(Notification::decode(&sent.encode()).and_then(|n| n.open), Some("/tmp/a shot.png".into()));
     }
 
     #[test]

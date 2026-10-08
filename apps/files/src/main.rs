@@ -101,6 +101,9 @@ struct Files {
     bookmarks_file: Option<PathBuf>,
     /// The menu open on a bookmark, and where.
     bookmark_menu: Option<(PathBuf, Point)>,
+    /// Raised to bring the selection into view, when it has moved without
+    /// being clicked: by the keyboard, or by being asked to show a file.
+    reveal: u64,
 }
 
 /// What is known of how much a folder holds.
@@ -265,6 +268,7 @@ impl Files {
             bookmarks_file: (!cfg!(test)).then(folders::bookmarks_file),
             bookmarks: vec![],
             bookmark_menu: None,
+            reveal: 0,
         };
         if let Some(file) = &f.bookmarks_file {
             f.bookmarks = folders::load_bookmarks(file);
@@ -370,6 +374,16 @@ impl Files {
         {
             self.status = Some((Tone::Bad, format!("Could not save the sidebar: {e}")));
         }
+    }
+
+    /// Selects a file of this folder and brings it into view, as when
+    /// another app asks for it to be shown. A hidden file is shown for it.
+    fn show(&mut self, file: PathBuf) {
+        if self.entries.iter().find(|e| e.path == file).is_some_and(|e| e.hidden()) {
+            self.show_hidden = true;
+        }
+        self.select_only(file);
+        self.reveal += 1;
     }
 
     /// Selects one entry and nothing else, and makes it the range anchor.
@@ -558,6 +572,7 @@ impl App for Files {
                     let child = self.dir.clone();
                     self.navigate(parent.to_path_buf());
                     self.select_only(child);
+                    self.reveal += 1;
                 }
             }
             Msg::Click(p, modifiers) => {
@@ -685,6 +700,8 @@ impl App for Files {
                 };
                 let path = v[next].path.clone();
                 self.select_only(path);
+                // The keyboard can carry the selection out of sight.
+                self.reveal += 1;
             }
             Msg::Drop(target, sources) => {
                 // What came from this folder is moved; anything else is copied.
@@ -1064,7 +1081,15 @@ impl Files {
         }
         // A right click on the empty part of the folder, below the rows.
         let here = self.dir.clone();
-        let rows = mouse_area(scrollable(rows).height(Length::Fill)).on_secondary_press(|at| Msg::Context(None, at)).on_drop(move |files| Msg::Drop(here.clone(), files));
+        // Where the selection is among the rows, to bring it into view
+        // when asked: after any field for a name, and in the grid by row.
+        let lead = match &self.naming {
+            Some(Naming::NewFolder(_)) => 1,
+            Some(Naming::Rename { .. }) if grid => 1,
+            _ => 0,
+        };
+        let at = self.selected.last().and_then(|s| v.iter().position(|e| &e.path == s)).map(|i| lead + if grid { i / self.columns() } else { i });
+        let rows = mouse_area(scrollable(rows).height(Length::Fill).reveal(if at.is_some() { self.reveal } else { 0 }, at.unwrap_or(0))).on_secondary_press(|at| Msg::Context(None, at)).on_drop(move |files| Msg::Drop(here.clone(), files));
         // The grid has no columns to label.
         let mut view = column().width(Length::Fill).height(Length::Fill);
         if !grid {
@@ -1116,7 +1141,9 @@ fn main() {
         _ => (dir, None),
     };
     let mut files = Files::new(dir);
-    files.selected = select.into_iter().collect();
+    if let Some(file) = select {
+        files.show(file);
+    }
     if let Err(e) = neo::run(files) {
         eprintln!("neo-files: {e}");
         std::process::exit(1);
@@ -1265,6 +1292,47 @@ mod tests {
         let with = h.render(1.0);
         h.app_mut().update(Msg::RemoveBookmark(root.join("alpha")));
         assert!(h.render(1.0) != with);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_asked_for_is_scrolled_into_view() {
+        let root = temp_dir("reveal");
+        for i in 0..120 {
+            std::fs::write(root.join(format!("file-{i:03}.txt")), "x").unwrap();
+        }
+        std::fs::write(root.join(".hidden-one"), "x").unwrap();
+        let size = Size::new(1040.0, 680.0);
+        // Opened as it is: the top of the folder, with the last file far below.
+        let plain = neo::testing::Harness::new(Files::new(root.clone()), size).unwrap().render(1.0);
+        // Opened to show the last file: it is selected, and the list has moved to it.
+        let mut f = Files::new(root.clone());
+        f.show(root.join("file-119.txt"));
+        assert_eq!(f.selected, [root.join("file-119.txt")]);
+        let mut h = neo::testing::Harness::new(f, size).unwrap();
+        let shown = h.render(1.0);
+        assert!(shown != plain);
+        // Selected but not brought into view, it would look as it did
+        // before but for a row nobody can see.
+        let mut unmoved = Files::new(root.clone());
+        unmoved.select_only(root.join("file-119.txt"));
+        let unmoved = neo::testing::Harness::new(unmoved, size).unwrap().render(1.0);
+        assert!(unmoved != shown, "the list really has scrolled");
+        // The selected row is drawn: its highlight is somewhere in the list.
+        // Scrolled, the first rows are gone; one more reveal changes nothing.
+        let again = h.render(1.0);
+        assert!(again == shown, "it is brought into view once, not on every frame");
+        // The arrow keys carry the view with the selection, back to the top.
+        for _ in 0..125 {
+            h.app_mut().update(Msg::Select(-1));
+        }
+        assert_eq!(h.app().selected, [root.join("alpha")]);
+        assert!(h.render(1.0) != shown);
+        // A hidden file asked for is shown, not selected out of sight.
+        let mut f = Files::new(root.clone());
+        assert!(!f.show_hidden);
+        f.show(root.join(".hidden-one"));
+        assert!(f.show_hidden && f.visible().iter().any(|e| e.name == ".hidden-one"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

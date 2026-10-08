@@ -22,6 +22,9 @@ pub struct Notification {
     pub image: Option<PathBuf>,
     /// A file the notification is about, to offer to show in Files.
     pub reveal: Option<PathBuf>,
+    /// A file to open when the notification itself is clicked: a picture
+    /// in Photos, a video in Videos, anything else in the system's choice.
+    pub open: Option<PathBuf>,
 }
 
 const PING: &[u8] = b"neo-ping";
@@ -55,7 +58,7 @@ fn unescape(s: &str) -> String {
 
 impl Notification {
     pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
-        Self { title: title.into(), body: body.into(), image: None, reveal: None }
+        Self { title: title.into(), body: body.into(), image: None, reveal: None, open: None }
     }
 
     pub fn image(mut self, path: impl Into<PathBuf>) -> Self {
@@ -68,10 +71,16 @@ impl Notification {
         self
     }
 
+    /// Clicking the notification opens this file.
+    pub fn open(mut self, path: impl Into<PathBuf>) -> Self {
+        self.open = Some(path.into());
+        self
+    }
+
     /// The notification as `key=value` lines, the form it is sent in.
     pub fn encode(&self) -> String {
         let mut out = format!("title={}\nbody={}\n", escape(&self.title), escape(&self.body));
-        for (key, path) in [("image", &self.image), ("reveal", &self.reveal)] {
+        for (key, path) in [("image", &self.image), ("reveal", &self.reveal), ("open", &self.open)] {
             if let Some(p) = path {
                 out.push_str(&format!("{key}={}\n", escape(&p.to_string_lossy())));
             }
@@ -90,6 +99,7 @@ impl Notification {
                 "body" => n.body = value,
                 "image" => n.image = Some(value.into()),
                 "reveal" => n.reveal = Some(value.into()),
+                "open" => n.open = Some(value.into()),
                 _ => {}
             }
         }
@@ -176,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_notification_survives_being_written_down() {
-        let n = Notification::new("Screenshot copied", "Saved as a = b\\c\nsecond line").image("/tmp/a shot.png").reveal("/tmp/a shot.png");
+        let n = Notification::new("Screenshot copied", "Saved as a = b\\c\nsecond line").image("/tmp/a shot.png").reveal("/tmp/a shot.png").open("/tmp/a shot.png");
         assert_eq!(Notification::decode(&n.encode()), Some(n));
         let plain = Notification::new("Done", "");
         assert_eq!(Notification::decode(&plain.encode()), Some(plain));
