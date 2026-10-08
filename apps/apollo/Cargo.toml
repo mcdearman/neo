@@ -1,0 +1,12 @@
+[package]
+name = "neo-apollo"
+description = "Apollo: Neo's assistant, and a look through what it remembers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo.workspace = true
+neo-desktop.workspace = true
+neo-apollo-core = { path = "../../crates/neo-apollo-core" }
+rfd = "0.17.2"

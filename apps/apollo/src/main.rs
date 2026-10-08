@@ -1,0 +1,1502 @@
+//! Apollo: Neo's assistant.
+//!
+//! Apollo reads the folders it is given (pictures, videos, documents)
+//! and remembers what each is about, in an encrypted database on this
+//! computer. It can be asked things, and answers from what it remembers.
+//! The Memory page looks through the database directly: a search by
+//! meaning, and a cloud of the words the memories are about. That page
+//! asks for the user's login first.
+//!
+//!     cargo run -p neo-apollo
+//!     cargo run -p neo-apollo -- --index        read the folders, without a window
+//!     cargo run -p neo-apollo -- --snapshot target/snapshots
+
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use neo::Size;
+use neo::prelude::*;
+use neo_apollo_core::assistant::{self, Answer};
+use neo_apollo_core::index::{self, Progress};
+use neo_apollo_core::key;
+use neo_apollo_core::model::{Model, Ollama, Role, Turn};
+use neo_apollo_core::settings::{Folder, Settings};
+use neo_apollo_core::store::{Hit, Kind, Memory, Stats, Store, Word};
+use neo_desktop::ui::{nav_item, notice, section, setting, split};
+use neo_desktop::{Desktop, DesktopMsg};
+
+mod cloud;
+use cloud::{Cloud, Graph, Hub};
+
+/// How many words the cloud shows, and how many memories a list.
+const CLOUD_WORDS: usize = 90;
+const LISTED: usize = 40;
+/// How tall the cloud is, and the graph that takes its place.
+const CLOUD_H: f32 = 300.0;
+/// How many picked words the graph shows at once, and how many words go round each.
+const HUBS: usize = 3;
+const ROUND_EACH: usize = 12;
+/// How often the folders are looked through again while the app is open.
+const READ_EVERY: Duration = Duration::from_secs(15 * 60);
+/// How soon reading is tried again after being held off for want of memory.
+const RETRY_EVERY: Duration = Duration::from_secs(2 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Ask,
+    Memory,
+    Sources,
+}
+
+/// Whether the model is there to be used.
+#[derive(Clone, Debug, PartialEq)]
+enum Engine {
+    Checking,
+    /// The server could not be started or asked.
+    Trouble(String),
+    /// These models have not been downloaded yet.
+    Missing(Vec<String>),
+    Pulling {
+        model: String,
+        status: String,
+        done: u64,
+        total: u64,
+    },
+    Ready,
+}
+
+/// Something said in the conversation.
+#[derive(Clone, Debug, PartialEq)]
+struct Said {
+    role: Role,
+    text: String,
+    /// The memories an answer was given to draw on.
+    recalled: Vec<Hit>,
+}
+
+/// The memories listed under the cloud, and what they are.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Shown {
+    heading: String,
+    /// Each with how near it is to what was asked, if something was.
+    items: Vec<(Memory, Option<f32>)>,
+}
+
+/// Asks the user to prove who they are; an error says why they did not.
+type Check = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+struct Apollo {
+    desktop: Desktop,
+    settings: Settings,
+    /// Where settings are kept. Tests and snapshots keep none.
+    settings_file: Option<PathBuf>,
+    page: Page,
+    proxy: Option<Proxy<Msg>>,
+    model: Arc<dyn Model>,
+    /// The model server, to start and to download models with. Tests have none.
+    server: Option<Arc<Ollama>>,
+    ready: Engine,
+    db: PathBuf,
+    key: Option<[u8; 32]>,
+    /// The length of the model's embeddings, once it has been asked.
+    dims: usize,
+    check: Check,
+
+    talk: Vec<Said>,
+    draft: String,
+    answering: bool,
+    stop_answer: Arc<AtomicBool>,
+    /// Counts what is said, to keep the newest in view.
+    said: u64,
+
+    /// The memory, open for looking through. `None` while it is locked.
+    store: Option<Store>,
+    unlocking: bool,
+    query: String,
+    /// The last search, kept so that choosing a kind need not ask the model again.
+    asked: Option<(String, Vec<f32>)>,
+    searching: bool,
+    kind: Option<Kind>,
+    /// The words picked, in the order they were: the last is the one whose
+    /// memories are listed, and together they are the graph.
+    trail: Vec<String>,
+    graph: Rc<Vec<Hub>>,
+    shown: Shown,
+    cloud: Rc<Vec<Word>>,
+    stats: Stats,
+
+    reading: bool,
+    progress: Progress,
+    stop_reading: Arc<AtomicBool>,
+    /// Reading is held off because the computer is short of memory.
+    held: bool,
+    /// Says whether it is. Tests say so themselves.
+    short_of_memory: fn() -> bool,
+    trouble: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum Msg {
+    Page(Page),
+    Desktop(DesktopMsg),
+    Poll,
+
+    /// What was found of the model, and the length of its embeddings.
+    Ready(Engine, usize),
+    CheckModel,
+    Pull,
+
+    Draft(String),
+    Send,
+    /// A suggestion was clicked: ask it.
+    Suggest(String),
+    Piece(String),
+    Answered(Result<Answer, String>),
+    StopAnswer,
+    NewTalk,
+
+    Unlock,
+    Unlocked(Result<(), String>),
+    Lock,
+    Query(String),
+    Search,
+    Asked(String, Result<Vec<f32>, String>),
+    Kind(Option<Kind>),
+    Word(String),
+    Clear,
+    Open(PathBuf),
+    Reveal(PathBuf),
+    Forget(i64),
+
+    Read,
+    Progress(Progress),
+    ReadDone(Progress),
+    /// Reading stopped, or did not start, for want of memory.
+    Held,
+    StopReading,
+    AddFolder,
+    FolderOn(usize, bool),
+    RemoveFolder(usize),
+    RememberTalk(bool),
+}
+
+/// A number with its noun: "1 memory", "1,204 memories".
+fn count(n: u32, one: &str, many: &str) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{grouped} {}", if n == 1 { one } else { many })
+}
+
+/// The start of a text, for a list: one line, no longer than `most`.
+fn snippet(text: &str, most: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= most { flat } else { format!("{}…", flat.chars().take(most - 1).collect::<String>().trim_end()) }
+}
+
+fn kind_icon(kind: Kind) -> neo::theme::Icon {
+    match kind {
+        Kind::Photo => icons::IMAGE,
+        Kind::Video => icons::FILM,
+        Kind::Document => icons::FILE_TEXT,
+        Kind::Conversation => icons::MESSAGES_SQUARE,
+        Kind::Note => icons::STICKY_NOTE,
+    }
+}
+
+/// A path with the home folder written as `~`.
+fn short_path(path: &Path) -> String {
+    match path.strip_prefix(neo_desktop::fs::home_dir()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+impl Apollo {
+    /// Apollo as it runs: the model on this computer, the database in
+    /// Neo's settings folder, and the system's own check of who is asking.
+    fn new() -> Self {
+        let settings = Settings::load();
+        let server = Arc::new(Ollama::from_settings(&settings));
+        let mut app = Self::with(server.clone(), neo_apollo_core::dir().join("memory.db"), None, Arc::new(key::authenticate));
+        app.settings = settings;
+        app.settings_file = Some(Settings::file());
+        app.server = Some(server);
+        app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
+        app.ready = Engine::Checking;
+        app
+    }
+
+    /// Apollo with a model, a database and a check of the caller's choosing.
+    fn with(model: Arc<dyn Model>, db: PathBuf, key: Option<[u8; 32]>, check: Check) -> Self {
+        let dims = if key.is_some() { model.dims().unwrap_or(0) } else { 0 };
+        Self {
+            desktop: Desktop::load(),
+            settings: Settings { folders: vec![], ..Settings::default() },
+            settings_file: None,
+            page: Page::Ask,
+            proxy: None,
+            model,
+            server: None,
+            ready: Engine::Ready,
+            db,
+            key,
+            dims,
+            check,
+            talk: vec![],
+            draft: String::new(),
+            answering: false,
+            stop_answer: Arc::default(),
+            said: 0,
+            store: None,
+            unlocking: false,
+            query: String::new(),
+            asked: None,
+            searching: false,
+            kind: None,
+            trail: vec![],
+            graph: Rc::default(),
+            shown: Shown::default(),
+            cloud: Rc::default(),
+            stats: Stats::default(),
+            reading: false,
+            progress: Progress::default(),
+            stop_reading: Arc::default(),
+            held: false,
+            short_of_memory: || false,
+            trouble: None,
+        }
+    }
+
+    /// Does `job` off the main thread, where there is one to come back
+    /// to; in tests, here and now. What it sends comes back as messages.
+    fn work(&mut self, job: impl FnOnce(&mut dyn FnMut(Msg)) + Send + 'static) {
+        match self.proxy.clone() {
+            Some(proxy) => {
+                std::thread::spawn(move || {
+                    job(&mut |m| {
+                        proxy.send(m);
+                    })
+                });
+            }
+            None => {
+                let mut sent = vec![];
+                job(&mut |m| sent.push(m));
+                for m in sent {
+                    self.update(m);
+                }
+            }
+        }
+    }
+
+    /// What a thread needs to open the memory for itself.
+    fn memory(&self) -> Option<(PathBuf, [u8; 32], usize)> {
+        (self.ready == Engine::Ready && self.dims > 0).then_some(())?;
+        Some((self.db.clone(), self.key?, self.dims))
+    }
+
+    fn save_settings(&mut self) {
+        if let Some(path) = &self.settings_file
+            && let Err(e) = self.settings.save_to(path)
+        {
+            self.trouble = Some(format!("Couldn't save Apollo's settings: {e}"));
+        }
+    }
+
+    /// Finds out whether the model is there, starting its server if not.
+    fn check_model(&mut self) {
+        let Some(server) = self.server.clone() else { return };
+        self.ready = Engine::Checking;
+        self.work(move |send| {
+            let found = server.start().and_then(|()| server.missing()).and_then(|missing| if missing.is_empty() { server.dims().map(|d| (Engine::Ready, d)) } else { Ok((Engine::Missing(missing), 0)) });
+            let (ready, dims) = found.unwrap_or_else(|e| (Engine::Trouble(e), 0));
+            send(Msg::Ready(ready, dims));
+        });
+    }
+
+    fn pull(&mut self) {
+        let (Some(server), Engine::Missing(models)) = (self.server.clone(), self.ready.clone()) else { return };
+        self.ready = Engine::Pulling { model: models[0].clone(), status: "Starting".into(), done: 0, total: 0 };
+        self.work(move |send| {
+            for model in &models {
+                let mut last = std::time::Instant::now();
+                let pulled = server.pull(model, &mut |p| {
+                    // Often enough to see it move, not so often as to do nothing else.
+                    if last.elapsed() > Duration::from_millis(200) {
+                        last = std::time::Instant::now();
+                        send(Msg::Ready(Engine::Pulling { model: model.clone(), status: p.status, done: p.done, total: p.total }, 0));
+                    }
+                    true
+                });
+                if let Err(e) = pulled {
+                    return send(Msg::Ready(Engine::Trouble(format!("{model} could not be downloaded: {e}")), 0));
+                }
+            }
+            send(Msg::CheckModel);
+        });
+    }
+
+    fn send(&mut self) {
+        let question = self.draft.trim().to_owned();
+        if question.is_empty() || self.answering || self.ready != Engine::Ready {
+            return;
+        }
+        let earlier: Vec<Turn> = self.talk.iter().map(|s| Turn::new(s.role, s.text.clone())).collect();
+        self.talk.push(Said { role: Role::User, text: question.clone(), recalled: vec![] });
+        self.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![] });
+        self.draft.clear();
+        self.said += 1;
+        self.answering = true;
+        self.stop_answer = Arc::default();
+        let (model, memory, stop) = (self.model.clone(), self.memory(), self.stop_answer.clone());
+        // Apollo draws on the memory only once it has been unlocked. What
+        // it is told and asked is written down either way.
+        let (open, keep) = (self.store.is_some(), self.settings.remember_conversations);
+        self.work(move |send| {
+            let mut store = memory.and_then(|(db, key, dims)| Store::open(&db, &key, dims).ok());
+            if let Some(note) = assistant::told_to_remember(&question) {
+                let kept = store.as_mut().ok_or_else(|| "The memory could not be opened.".to_owned()).and_then(|s| assistant::keep_note(s, &*model, note));
+                return send(Msg::Answered(kept.map(|_| Answer { text: "I'll remember that.".into(), recalled: vec![] })));
+            }
+            let answer = assistant::ask(store.as_ref().filter(|_| open), &*model, &earlier, &question, &mut |piece| {
+                send(Msg::Piece(piece.to_owned()));
+                !stop.load(Ordering::Relaxed)
+            });
+            if let (Ok(a), true, Some(store)) = (&answer, keep, store.as_mut())
+                && !a.text.is_empty()
+            {
+                let _ = assistant::keep_exchange(store, &*model, &question, &a.text);
+            }
+            send(Msg::Answered(answer));
+        });
+    }
+
+    fn unlock(&mut self) {
+        if self.store.is_some() || self.unlocking {
+            return;
+        }
+        self.unlocking = true;
+        self.trouble = None;
+        let check = self.check.clone();
+        self.work(move |send| send(Msg::Unlocked(check("look through Apollo's memory"))));
+    }
+
+    fn open_memory(&mut self) {
+        let Some(key) = self.key else {
+            self.trouble = Some("The key to Apollo's memory could not be read.".into());
+            return;
+        };
+        // Before the model has been asked, the database says what it was made for.
+        let dims = if self.dims > 0 { Some(self.dims) } else { Store::made_for(&self.db, &key) };
+        let Some(dims) = dims else {
+            self.trouble = Some("There is nothing to look through until the model is ready.".into());
+            return;
+        };
+        match Store::open(&self.db, &key, dims) {
+            Ok(store) => {
+                self.store = Some(store);
+                self.show();
+            }
+            Err(e) => self.trouble = Some(e),
+        }
+    }
+
+    fn lock(&mut self) {
+        self.store = None;
+        (self.shown, self.cloud, self.graph, self.stats, self.asked) = (Shown::default(), Rc::default(), Rc::default(), Stats::default(), None);
+        self.trail.clear();
+        self.query.clear();
+    }
+
+    /// The words folded into `word` in the cloud.
+    fn also(&self, word: &str) -> Vec<String> {
+        self.cloud.iter().find(|w| w.word == word).map(|w| w.also.clone()).unwrap_or_default()
+    }
+
+    /// The memories to list for whatever is being looked at.
+    fn listed(&self, store: &Store) -> Result<Shown, String> {
+        if let Some(word) = self.trail.last() {
+            // What is about the word, and the words folded into it, and
+            // then what is near it in meaning without saying so.
+            let mut items: Vec<(Memory, Option<f32>)> = vec![];
+            for w in std::iter::once(word).chain(&self.also(word)) {
+                for m in store.about(w, LISTED)? {
+                    if self.kind.is_none_or(|k| k == m.kind) && !items.iter().any(|(have, _)| have.id == m.id) {
+                        items.push((m, None));
+                    }
+                }
+            }
+            if let Some(vector) = store.word_vector(word)? {
+                for hit in store.search(&vector, LISTED, self.kind)? {
+                    if hit.distance < assistant::NEAR && !items.iter().any(|(have, _)| have.id == hit.memory.id) {
+                        items.push((hit.memory, Some(hit.distance)));
+                    }
+                }
+            }
+            items.truncate(LISTED);
+            return Ok(Shown { heading: format!("About “{word}”"), items });
+        }
+        if let Some((question, vector)) = &self.asked {
+            let items = store.search(vector, LISTED, self.kind)?.into_iter().map(|h| (h.memory, Some(h.distance))).collect();
+            return Ok(Shown { heading: format!("Nearest to “{question}”"), items });
+        }
+        Ok(Shown { heading: "Newest".into(), items: store.recent(LISTED, self.kind)?.into_iter().map(|m| (m, None)).collect() })
+    }
+
+    /// The last few picked words, each with the words that go with it.
+    fn hubs(&self, store: &Store) -> Result<Vec<Hub>, String> {
+        let shown = &self.trail[self.trail.len().saturating_sub(HUBS)..];
+        // Fewer round each when there are more of them to fit.
+        let each = ROUND_EACH - (shown.len().saturating_sub(1)) * 2;
+        shown
+            .iter()
+            .map(|word| {
+                let related = store.related(word, &self.also(word), each)?;
+                let most = related.iter().map(|r| r.shared).max().unwrap_or(0).max(1) as f32;
+                // One that only means something near counts for less than any that shares a memory.
+                Ok(Hub { word: word.clone(), related: related.into_iter().map(|r| (r.word, if r.shared > 0 { 0.25 + 0.75 * r.shared as f32 / most } else { 0.1 })).collect() })
+            })
+            .collect()
+    }
+
+    /// Fills the Memory page from the database: the counts, the cloud,
+    /// the graph of picked words, and the list.
+    fn show(&mut self) {
+        let Some(store) = self.store.take() else { return };
+        let filled = (|| -> Result<(), String> {
+            self.stats = store.stats()?;
+            self.cloud = Rc::new(store.cloud(CLOUD_WORDS)?);
+            self.graph = Rc::new(self.hubs(&store)?);
+            self.shown = self.listed(&store)?;
+            Ok(())
+        })();
+        if let Err(e) = filled {
+            self.trouble = Some(e);
+        }
+        self.store = Some(store);
+    }
+
+    fn search(&mut self) {
+        let question = self.query.trim().to_owned();
+        if question.is_empty() {
+            return self.update(Msg::Clear);
+        }
+        if self.store.is_none() || self.searching {
+            return;
+        }
+        self.searching = true;
+        let model = self.model.clone();
+        self.work(move |send| {
+            let vector = model.embed(std::slice::from_ref(&question), true).and_then(|mut v| v.pop().ok_or_else(|| "no embedding".to_owned()));
+            send(Msg::Asked(question, vector));
+        });
+    }
+
+    fn read(&mut self) {
+        let Some((db, key, dims)) = self.memory() else { return };
+        if self.reading {
+            return;
+        }
+        // A model of a few gigabytes is not set to work on a computer with none to spare.
+        self.held = (self.short_of_memory)();
+        if self.held {
+            return;
+        }
+        self.reading = true;
+        self.stop_reading = Arc::default();
+        self.progress = Progress::default();
+        let (model, roots, stop, short) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory);
+        self.work(move |send| {
+            let done = match Store::open(&db, &key, dims) {
+                Ok(mut store) => index::run(&mut store, &*model, &roots, &mut |p| {
+                    send(Msg::Progress(p.clone()));
+                    // Between files is where it can stop without losing anything.
+                    if short() {
+                        send(Msg::Held);
+                        return false;
+                    }
+                    !stop.load(Ordering::Relaxed)
+                }),
+                Err(e) => Progress { trouble: Some(e), ..Progress::default() },
+            };
+            send(Msg::ReadDone(done));
+        });
+    }
+
+    /// One line on what Apollo is doing, for the sidebar.
+    fn status(&self) -> String {
+        match &self.ready {
+            Engine::Checking => "Starting the model…".into(),
+            Engine::Trouble(_) => "The model is not running".into(),
+            Engine::Missing(_) => "The model needs downloading".into(),
+            Engine::Pulling { .. } => "Downloading the model…".into(),
+            Engine::Ready if self.reading && self.progress.total > 0 => format!("Reading {} of {}", (self.progress.done + 1).min(self.progress.total), self.progress.total),
+            Engine::Ready if self.reading => "Looking through folders…".into(),
+            Engine::Ready if self.held => "Paused: memory is short".into(),
+            Engine::Ready => "Up to date".into(),
+        }
+    }
+}
+
+impl App for Apollo {
+    type Message = Msg;
+
+    fn title(&self) -> String {
+        match self.page {
+            Page::Ask => "Apollo".into(),
+            Page::Memory => "Memory · Apollo".into(),
+            Page::Sources => "Sources · Apollo".into(),
+        }
+    }
+
+    fn window(&self) -> WindowSettings {
+        WindowSettings { size: Size::new(1080.0, 720.0), min_size: Some(Size::new(760.0, 480.0)), app_id: Some("org.neo.Apollo".into()), ..Default::default() }
+    }
+
+    fn app_menu(&self) -> Vec<MenuEntry<Msg>> {
+        self.desktop.app_menu(Msg::Desktop)
+    }
+
+    fn theme(&self, system: Scheme) -> Theme {
+        self.desktop.theme(system)
+    }
+
+    fn menus(&self) -> Vec<Menu<Msg>> {
+        let ready = self.ready == Engine::Ready;
+        vec![
+            Menu::new("File").push(MenuEntry::new("New Conversation", Msg::NewTalk).shortcut(Shortcut::command("n")).enabled(!self.talk.is_empty() && !self.answering)).separator().push(MenuEntry::new("Add Folder…", Msg::AddFolder)).push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading)),
+            Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))),
+            Menu::new("Memory").push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking)).push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some())),
+        ]
+    }
+
+    fn start(&mut self, proxy: Proxy<Msg>) {
+        // Tests do their work in place, where what comes of it can be looked at.
+        if !cfg!(test) {
+            self.proxy = Some(proxy);
+        }
+        if self.key.is_none() {
+            match key::database_key() {
+                Ok(key) => self.key = Some(key),
+                Err(e) => self.trouble = Some(e),
+            }
+        }
+        self.check_model();
+    }
+
+    fn subscriptions(&self) -> Vec<Subscription<Msg>> {
+        let mut subs = vec![Desktop::subscription(Msg::Poll)];
+        if self.ready == Engine::Ready && !self.reading {
+            subs.push(Subscription::every(if self.held { RETRY_EVERY } else { READ_EVERY }, Msg::Read));
+        }
+        subs
+    }
+
+    fn on_exit(&mut self) {
+        // Whatever is under way stops at the next file or the next word.
+        self.stop_reading.store(true, Ordering::Relaxed);
+        self.stop_answer.store(true, Ordering::Relaxed);
+    }
+
+    fn update(&mut self, m: Msg) {
+        match m {
+            Msg::Page(page) => self.page = page,
+            Msg::Desktop(m) => {
+                self.desktop.update(m);
+            }
+            Msg::Poll => {
+                self.desktop.poll();
+            }
+
+            Msg::Ready(ready, dims) => {
+                let first = self.ready != Engine::Ready && ready == Engine::Ready;
+                self.ready = ready;
+                if dims > 0 {
+                    self.dims = dims;
+                }
+                // The model is there: see what is new in the folders.
+                if first {
+                    self.read();
+                }
+            }
+            Msg::CheckModel => self.check_model(),
+            Msg::Pull => self.pull(),
+
+            Msg::Draft(text) => self.draft = text,
+            Msg::Send => self.send(),
+            Msg::Suggest(text) => {
+                self.draft = text;
+                self.send();
+            }
+            Msg::Piece(piece) => {
+                if let Some(last) = self.talk.last_mut().filter(|s| s.role == Role::Assistant && self.answering) {
+                    last.text.push_str(&piece);
+                    self.said += 1;
+                }
+            }
+            Msg::Answered(answer) => {
+                if !self.answering {
+                    return;
+                }
+                self.answering = false;
+                self.said += 1;
+                let Some(last) = self.talk.last_mut() else { return };
+                match answer {
+                    Ok(a) => (last.text, last.recalled) = (a.text, a.recalled),
+                    Err(e) => {
+                        // What could not be answered is put back to be asked again.
+                        self.talk.pop();
+                        if let Some(asked) = self.talk.pop() {
+                            self.draft = asked.text;
+                        }
+                        self.trouble = Some(e);
+                    }
+                }
+                self.show();
+            }
+            Msg::StopAnswer => self.stop_answer.store(true, Ordering::Relaxed),
+            Msg::NewTalk => {
+                if !self.answering {
+                    self.talk.clear();
+                    self.page = Page::Ask;
+                }
+            }
+
+            Msg::Unlock => self.unlock(),
+            Msg::Unlocked(outcome) => {
+                self.unlocking = false;
+                match outcome {
+                    Ok(()) => self.open_memory(),
+                    Err(e) => self.trouble = Some(e),
+                }
+            }
+            Msg::Lock => self.lock(),
+            Msg::Query(text) => self.query = text,
+            Msg::Search => self.search(),
+            Msg::Asked(question, vector) => {
+                self.searching = false;
+                match vector {
+                    Ok(vector) => {
+                        self.asked = Some((question, vector));
+                        self.trail.clear();
+                        self.show();
+                    }
+                    Err(e) => self.trouble = Some(e),
+                }
+            }
+            Msg::Kind(kind) => {
+                self.kind = kind;
+                self.show();
+            }
+            Msg::Word(word) => {
+                // A picked word again goes back to it; a new one is picked too.
+                match self.trail.iter().position(|w| *w == word) {
+                    Some(i) => self.trail.truncate(i + 1),
+                    None => self.trail.push(word),
+                }
+                self.asked = None;
+                self.query.clear();
+                self.show();
+            }
+            Msg::Clear => {
+                self.trail.clear();
+                self.asked = None;
+                self.query.clear();
+                self.show();
+            }
+            Msg::Open(path) => {
+                // Tests must not start whatever viewers this computer has.
+                if !cfg!(test)
+                    && let Err(e) = neo_desktop::fs::open_file(&path)
+                {
+                    self.trouble = Some(format!("Couldn't open {}: {e}", path.display()));
+                }
+            }
+            Msg::Reveal(path) => {
+                if !cfg!(test) {
+                    let _ = neo_desktop::fs::reveal(&path);
+                }
+            }
+            Msg::Forget(id) => {
+                if let Some(store) = &mut self.store {
+                    if let Err(e) = store.forget(id).and_then(|()| store.tidy_words()) {
+                        self.trouble = Some(e);
+                    }
+                    self.show();
+                }
+            }
+
+            Msg::Read => self.read(),
+            Msg::Progress(p) => {
+                // What has just been read shows up without waiting for the end.
+                let more = p.read != self.progress.read;
+                self.progress = p;
+                if more && self.page == Page::Memory {
+                    self.show();
+                }
+            }
+            Msg::ReadDone(p) => {
+                self.reading = false;
+                self.progress = p;
+                self.show();
+            }
+            Msg::Held => self.held = true,
+            Msg::StopReading => self.stop_reading.store(true, Ordering::Relaxed),
+            Msg::AddFolder => {
+                if let Some(dir) = rfd::FileDialog::new().set_title("Add a Folder for Apollo to Read").pick_folder() {
+                    if !self.settings.folders.iter().any(|f| f.path == dir) {
+                        self.settings.folders.push(Folder { path: dir, on: true });
+                        self.save_settings();
+                    }
+                    self.read();
+                }
+            }
+            Msg::FolderOn(i, on) => {
+                if let Some(f) = self.settings.folders.get_mut(i) {
+                    f.on = on;
+                    self.save_settings();
+                    self.read();
+                }
+            }
+            Msg::RemoveFolder(i) => {
+                if i < self.settings.folders.len() {
+                    self.settings.folders.remove(i);
+                    self.save_settings();
+                    self.read();
+                }
+            }
+            Msg::RememberTalk(on) => {
+                self.settings.remember_conversations = on;
+                self.save_settings();
+            }
+        }
+    }
+
+    fn view(&self) -> Element<Msg> {
+        self.desktop.with_settings(self.content(), "Apollo Settings", Msg::Desktop, vec![])
+    }
+}
+
+impl Apollo {
+    fn content(&self) -> Element<Msg> {
+        let main = match self.page {
+            Page::Ask => self.ask_page(),
+            Page::Memory => self.memory_page(),
+            Page::Sources => self.sources_page(),
+        };
+        split(self.sidebar(), main)
+    }
+
+    fn sidebar(&self) -> Element<Msg> {
+        let busy = self.reading || matches!(self.ready, Engine::Checking | Engine::Pulling { .. });
+        let tone = if matches!(self.ready, Engine::Trouble(_) | Engine::Missing(_)) { Tone::Warn } else { Tone::Muted };
+        let status = row().spacing(8.0).align(Align::Center).padding([0.0, 10.0]).push(icon(if busy { icons::REFRESH_CW } else { icons::SPARKLES }).size(13.0).tone(tone)).push(text(self.status()).role(TextRole::Caption).tone(tone).no_wrap());
+        column()
+            .spacing(2.0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .push(section("Apollo"))
+            .push(nav_item(icons::MESSAGE_CIRCLE, "Ask", self.page == Page::Ask, Msg::Page(Page::Ask)))
+            .push(nav_item(if self.store.is_some() { icons::BRAIN } else { icons::LOCK }, "Memory", self.page == Page::Memory, Msg::Page(Page::Memory)))
+            .push(nav_item(icons::FOLDER_SEARCH, "Sources", self.page == Page::Sources, Msg::Page(Page::Sources)))
+            .push(Space::new(0.0, Length::Fill))
+            .push(status)
+            .into()
+    }
+
+    /// What stands in for the question box until the model can be used.
+    fn setup(&self) -> Option<Element<Msg>> {
+        let card = |glyph, title: &str, body: String, action: Option<Element<Msg>>| -> Element<Msg> {
+            let mut words = column().spacing(3.0).width(Length::Fill).push(text(title).role(TextRole::Strong)).push(text(body).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill));
+            if let Engine::Pulling { done, total, .. } = &self.ready {
+                words = words.push(Space::new(0.0, 4.0)).push(progress_bar(if *total > 0 { *done as f32 / *total as f32 } else { 0.0 }).width(Length::Fill));
+            }
+            let mut line = row().spacing(14.0).align(Align::Center).width(Length::Fill).push(icon(glyph).size(22.0).tone(Tone::Accent)).push(words);
+            if let Some(action) = action {
+                line = line.push(action);
+            }
+            container(line).surface(Surface::Well).radius(12.0).padding([16.0, 14.0]).width(Length::Fill).into()
+        };
+        Some(match &self.ready {
+            Engine::Ready => return None,
+            Engine::Checking => card(icons::SPARKLES, "Starting Apollo's model", "It runs on this computer; the first start takes a moment.".into(), None),
+            Engine::Trouble(why) => card(icons::TRIANGLE_ALERT, "Apollo's model is not running", why.clone(), Some(Button::new(text("Try Again")).on_press(Msg::CheckModel).into())),
+            Engine::Missing(models) => card(icons::DOWNLOAD, "Apollo needs to download its model", format!("{} will be downloaded once, about 3.6 GB in all, and then run on this computer. Nothing you ask or keep here is sent anywhere.", models.join(" and ")), Some(Button::new(text("Download")).kind(ButtonKind::Accent).on_press(Msg::Pull).into())),
+            Engine::Pulling { model, status, done, total } => {
+                let how_far = if *total > 0 { format!("{} of {}", neo_desktop::fs::human_size(*done), neo_desktop::fs::human_size(*total)) } else { status.clone() };
+                card(icons::DOWNLOAD, &format!("Downloading {model}"), how_far, None)
+            }
+        })
+    }
+
+    fn ask_page(&self) -> Element<Msg> {
+        let mut page = column().spacing(12.0).padding(18.0).width(Length::Fill).height(Length::Fill);
+        if self.talk.is_empty() {
+            let suggest = |q: &str| -> Element<Msg> { Button::new(text(q).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([12.0, 6.0]).radius(14.0).on_press_maybe((self.ready == Engine::Ready).then(|| Msg::Suggest(q.to_owned()))).into() };
+            let about = if self.store.is_some() { "Ask about anything, or about what is on this computer." } else { "Ask about anything. To ask about what is on this computer, unlock Apollo's memory first." };
+            let mut welcome = column().spacing(8.0).align(Align::Center).push(icon(icons::SPARKLES).size(34.0).tone(Tone::Accent)).push(text("Ask Apollo").role(TextRole::Heading)).push(text(about).tone(Tone::Muted)).push(Space::new(0.0, 6.0));
+            welcome = welcome.push(row().spacing(6.0).push(suggest("What videos do I have from this month?")).push(suggest("Which screenshots show code?")));
+            welcome = welcome.push(row().spacing(6.0).push(suggest("Remember that the spare key is with Sam")).push(suggest("What did I ask you last time?")));
+            if self.store.is_none() {
+                welcome = welcome.push(Space::new(0.0, 6.0)).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::LOCK_OPEN).size(14.0)).push(text("Unlock Memory…"))).on_press_maybe((!self.unlocking).then_some(Msg::Unlock)));
+            }
+            page = page.push(container(welcome).width(Length::Fill).height(Length::Fill).center());
+        } else {
+            let mut said = column().spacing(14.0).width(Length::Fill).padding([0.0, 4.0]);
+            for s in &self.talk {
+                said = said.push(self.turn(s));
+            }
+            page = page.push(scrollable(said).height(Length::Fill).reveal(self.said, self.talk.len().saturating_sub(1)));
+        }
+        if let Some(why) = &self.trouble {
+            page = page.push(notice(Tone::Bad, why.clone()));
+        }
+        match self.setup() {
+            Some(setup) => page = page.push(setup),
+            None => {
+                let button = if self.answering { icon_button(icons::SQUARE, 34.0).on_press(Msg::StopAnswer) } else { icon_button(icons::ARROW_UP, 34.0).kind(ButtonKind::Accent).on_press_maybe((!self.draft.trim().is_empty()).then_some(Msg::Send)) };
+                let hint = if self.store.is_some() { "Ask Apollo" } else { "Ask Apollo (memory locked)" };
+                page = page.push(row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text_input(hint, self.draft.clone()).on_input(Msg::Draft).on_submit(Msg::Send).autofocus(true).width(Length::Fill)).push(button));
+            }
+        }
+        page.into()
+    }
+
+    /// One thing said: the user's on the right, Apollo's across the page
+    /// with the files it drew on underneath.
+    fn turn(&self, s: &Said) -> Element<Msg> {
+        if s.role == Role::User {
+            let bubble = container(text(s.text.clone())).surface(Surface::Raised).radius(14.0).padding([14.0, 9.0]).max_width(560.0);
+            return row().width(Length::Fill).push(Space::new(Length::Fill, 0.0)).push(bubble).into();
+        }
+        let waiting = s.text.is_empty() && self.answering;
+        let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { "Thinking…".to_owned() } else { s.text.clone() }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
+        // Each file once, however many passages of it were looked at.
+        let mut files: Vec<&Memory> = vec![];
+        for hit in &s.recalled {
+            if hit.memory.source.is_some() && !files.iter().any(|m| m.source == hit.memory.source) {
+                files.push(&hit.memory);
+            }
+        }
+        if !files.is_empty() {
+            let mut chips = row().spacing(6.0);
+            for m in files.into_iter().take(4) {
+                let chip = row().spacing(6.0).align(Align::Center).push(icon(kind_icon(m.kind)).size(13.0)).push(text(snippet(&m.title, 26)).role(TextRole::Caption).no_wrap());
+                chips = chips.push(Button::new(chip).padding([10.0, 5.0]).radius(12.0).on_press_maybe(m.source.clone().map(Msg::Open)));
+            }
+            answer = answer.push(chips);
+        }
+        row().spacing(12.0).width(Length::Fill).push(container(icon(icons::SPARKLES).size(16.0).tone(Tone::Accent)).padding([0.0, 2.0, 0.0, 0.0])).push(answer).into()
+    }
+
+    fn memory_page(&self) -> Element<Msg> {
+        if self.store.is_none() {
+            let (glyph, title, body) = if self.unlocking { (icons::FINGERPRINT, "Waiting for you", "Use Touch ID or type your password in the window that has come up.") } else { (icons::LOCK, "Apollo's memory is locked", "What Apollo remembers of your pictures, videos, documents and conversations is kept encrypted. Looking through it takes your login.") };
+            let mut lock = column().spacing(8.0).align(Align::Center).push(icon(glyph).size(40.0).tone(Tone::Accent)).push(text(title).role(TextRole::Heading)).push(container(text(body).tone(Tone::Muted).align(Align::Center).width(Length::Fill)).max_width(440.0)).push(Space::new(0.0, 8.0));
+            lock = lock.push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::LOCK_OPEN).size(15.0)).push(text("Unlock…"))).kind(ButtonKind::Accent).on_press_maybe((!self.unlocking).then_some(Msg::Unlock)));
+            if let Some(why) = &self.trouble {
+                lock = lock.push(Space::new(0.0, 6.0)).push(notice(Tone::Bad, why.clone()));
+            }
+            return container(lock).width(Length::Fill).height(Length::Fill).center().into();
+        }
+        let search = text_input("Search by meaning: “a dog on a beach”, “the invoice from March”", self.query.clone()).on_input(Msg::Query).on_submit(Msg::Search).on_cancel(Msg::Clear).width(Length::Fill);
+        let top = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(icon(icons::SEARCH).size(16.0).tone(Tone::Muted)).push(search).push(icon_button(icons::LOCK, 30.0).kind(ButtonKind::Ghost).on_press(Msg::Lock));
+        let kinds = segmented(std::iter::once("All").chain(Kind::ALL.iter().map(|k| k.plural())), Some(self.kind.map_or(0, |k| 1 + Kind::ALL.iter().position(|a| *a == k).unwrap_or(0))), |i| Msg::Kind(i.checked_sub(1).and_then(|i| Kind::ALL.get(i).copied())));
+
+        let cloud: Element<Msg> = if self.cloud.is_empty() {
+            let why = if self.reading { "Nothing is remembered yet. Apollo is reading your folders; words will gather here as it goes." } else { "Nothing is remembered yet. Give Apollo folders to read in Sources." };
+            container(text(why).tone(Tone::Muted)).width(Length::Fill).height(120.0).center().into()
+        } else if self.graph.is_empty() {
+            Element::new(Cloud::new(self.cloud.clone()).height(CLOUD_H).on_pick(Msg::Word))
+        } else {
+            Element::new(Graph::new(self.graph.clone()).height(CLOUD_H).on_pick(Msg::Word))
+        };
+        let summary = format!("{} · {} from {}", count(self.stats.total(), "memory", "memories"), count(self.stats.words, "word", "words"), count(self.stats.files, "file", "files"));
+        let mut heading = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(text(self.shown.heading.clone()).role(TextRole::Title)).push(text(if self.searching { "Searching…".to_owned() } else { summary }).role(TextRole::Caption).tone(Tone::Muted)).push(Space::new(Length::Fill, 0.0));
+        if !self.trail.is_empty() || self.asked.is_some() {
+            heading = heading.push(Button::new(text(if self.trail.is_empty() { "Clear" } else { "Back to the Cloud" }).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([10.0, 4.0]).on_press(Msg::Clear));
+        }
+        let mut list = column().spacing(2.0).width(Length::Fill);
+        for (memory, distance) in &self.shown.items {
+            list = list.push(self.memory_row(memory, *distance));
+        }
+        if self.shown.items.is_empty() {
+            list = list.push(container(text("Nothing here.").tone(Tone::Muted)).padding([0.0, 12.0]));
+        }
+        let mut body = column().spacing(12.0).width(Length::Fill).push(container(cloud).surface(Surface::Well).radius(14.0).padding(10.0).width(Length::Fill)).push(heading);
+        if let Some(why) = &self.trouble {
+            body = body.push(notice(Tone::Bad, why.clone()));
+        }
+        column().spacing(12.0).padding(18.0).width(Length::Fill).height(Length::Fill).push(top).push(kinds).push(scrollable(body.push(list)).height(Length::Fill)).into()
+    }
+
+    fn memory_row(&self, m: &Memory, distance: Option<f32>) -> Element<Msg> {
+        let when = neo_desktop::fs::friendly_time(std::time::UNIX_EPOCH + Duration::from_secs(m.created));
+        let place = m.source.as_deref().and_then(Path::parent).map(|p| format!("{}  ·  ", short_path(p))).unwrap_or_default();
+        let words = column().spacing(2.0).width(Length::Fill).push(text(m.title.clone()).role(TextRole::Strong).no_wrap()).push(text(snippet(&m.text, 210)).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(text(format!("{place}{when}")).role(TextRole::Caption).tone(Tone::Faint).no_wrap());
+        let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(icon(kind_icon(m.kind)).size(18.0).tone(Tone::Accent)).push(words);
+        if let Some(d) = distance {
+            // How near in meaning, as a share: the same is 100%.
+            line = line.push(text(format!("{:.0}%", ((1.0 - d) * 100.0).clamp(0.0, 100.0))).role(TextRole::Caption).tone(Tone::Muted));
+        }
+        if let Some(path) = &m.source {
+            line = line.push(icon_button(icons::FOLDER_OPEN, 28.0).kind(ButtonKind::Ghost).on_press(Msg::Reveal(path.clone())));
+        }
+        line = line.push(icon_button(icons::TRASH_2, 28.0).kind(ButtonKind::Ghost).on_press(Msg::Forget(m.id)));
+        let inside: Element<Msg> = container(line).padding([10.0, 8.0]).width(Length::Fill).into();
+        // The row opens the file, anywhere its buttons are not.
+        match m.source.clone() {
+            Some(path) => mouse_area(inside).on_press(move || Msg::Open(path.clone())).into(),
+            None => inside,
+        }
+    }
+
+    fn sources_page(&self) -> Element<Msg> {
+        let p = &self.progress;
+        let mut page = column().spacing(14.0).padding(22.0).width(Length::Fill);
+        page = page.push(text("Sources").role(TextRole::Heading)).push(text("The folders Apollo reads. Each picture is described, each video looked at in a few places along its length, and each document read in passages; what it finds goes into its memory.").tone(Tone::Muted).width(Length::Fill));
+
+        // How the reading is going.
+        let (what, detail) = if self.ready != Engine::Ready {
+            (self.status(), "Apollo reads once its model is running.".to_owned())
+        } else if self.reading {
+            let name = p.now.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned());
+            (self.status(), name.map_or_else(|| "Seeing what is new.".to_owned(), |n| format!("Now: {n}")))
+        } else {
+            let mut parts = vec![count(p.read as u32, "file read", "files read") + " last time"];
+            if p.forgotten > 0 {
+                parts.push(format!("{} forgotten", p.forgotten));
+            }
+            if p.failed > 0 {
+                parts.push(format!("{} could not be read", p.failed));
+            }
+            if self.held { (self.status(), "Reading is held off while the computer is short of memory, and taken up again when there is room.".to_owned()) } else { ("Up to date".to_owned(), parts.join("  ·  ")) }
+        };
+        let action: Element<Msg> = if self.reading { Button::new(text("Stop")).on_press(Msg::StopReading).into() } else { Button::new(text("Read Now")).on_press_maybe((self.ready == Engine::Ready).then_some(Msg::Read)).into() };
+        let mut reading = column().spacing(8.0).width(Length::Fill).push(setting(&what, &detail, action));
+        if self.reading && p.total > 0 {
+            reading = reading.push(progress_bar(p.done as f32 / p.total as f32).width(Length::Fill));
+        }
+        page = page.push(container(reading).surface(Surface::Well).radius(12.0).padding([16.0, 14.0]).width(Length::Fill));
+        if let Some(setup) = self.setup() {
+            page = page.push(setup);
+        }
+        for tool in &p.needs {
+            let what = match *tool {
+                "pdftotext" => "PDFs are being left unread. To read them, install pdftotext: cargo xtask deps --install",
+                "ffmpeg" => "Videos are being left unread. To read them, install ffmpeg: cargo xtask deps --install",
+                _ => "Some documents are being left unread. To read them, install pandoc.",
+            };
+            page = page.push(notice(Tone::Warn, what));
+        }
+        if let Some(why) = p.trouble.as_ref().or(self.trouble.as_ref()) {
+            page = page.push(notice(Tone::Bad, why.clone()));
+        }
+
+        page = page.push(section("Folders"));
+        for (i, f) in self.settings.folders.iter().enumerate() {
+            let help = if !f.path.is_dir() {
+                "This folder is not there."
+            } else if f.on {
+                "Read, with everything inside it."
+            } else {
+                "Left alone; what was remembered of it is forgotten."
+            };
+            let controls = row().spacing(8.0).align(Align::Center).push(toggle(f.on, move |on| Msg::FolderOn(i, on))).push(icon_button(icons::TRASH_2, 28.0).kind(ButtonKind::Ghost).on_press(Msg::RemoveFolder(i)));
+            page = page.push(setting(&short_path(&f.path), help, controls));
+        }
+        if self.settings.folders.is_empty() {
+            page = page.push(text("No folders yet.").tone(Tone::Muted));
+        }
+        page = page.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PLUS).size(14.0)).push(text("Add Folder…"))).on_press(Msg::AddFolder)));
+
+        page = page.push(section("Conversations")).push(setting("Remember what I ask", "What you ask Apollo and what it answers go into its memory, so it can be brought up later.", toggle(self.settings.remember_conversations, Msg::RememberTalk)));
+        page = page.push(section("Where it all is")).push(setting(
+            "On this computer",
+            &format!("{} describes pictures and answers; {} places text by meaning. Both run here, and nothing is sent anywhere.", self.settings.chat_model, self.settings.embed_model),
+            text(if self.ready == Engine::Ready { "Running" } else { "Not running" }).role(TextRole::Caption).tone(if self.ready == Engine::Ready { Tone::Good } else { Tone::Warn }),
+        ));
+        page = page.push(setting("Encrypted memory", &format!("{}, encrypted with a key in your keychain. Looking through it takes your login.", short_path(&self.db)), text(if self.store.is_some() { "Unlocked" } else { "Locked" }).role(TextRole::Caption).tone(Tone::Muted)));
+        scrollable(page).into()
+    }
+}
+
+/// Reads the folders without a window, saying how it goes: for a script,
+/// or to run at login.
+fn read_folders() -> Result<(), String> {
+    let settings = Settings::load();
+    let model = Ollama::from_settings(&settings);
+    model.start()?;
+    let missing = model.missing()?;
+    if !missing.is_empty() {
+        return Err(format!("{} must be downloaded first: open Apollo, or run `ollama pull` for each.", missing.join(" and ")));
+    }
+    let mut store = Store::open(&neo_apollo_core::dir().join("memory.db"), &key::database_key()?, model.dims()?)?;
+    let done = index::run(&mut store, &model, &settings.roots(), &mut |p| {
+        if let Some(now) = &p.now {
+            println!("[{} of {}] {}", p.done + 1, p.total, now.display());
+        }
+        true
+    });
+    println!("{} read, {} forgotten, {} could not be read.", done.read, done.forgotten, done.failed);
+    for tool in &done.needs {
+        println!("Some files were left for want of {tool}.");
+    }
+    Ok(())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--snapshot") {
+        snapshots(PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "target/snapshots".into())));
+        return;
+    }
+    if args.iter().any(|a| a == "--index") {
+        if let Err(e) = read_folders() {
+            eprintln!("neo-apollo: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Err(e) = neo::run(Apollo::new()) {
+        eprintln!("neo-apollo: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// An Apollo for snapshots and tests: a model that answers at once, a
+/// database of its own in the temporary folder, and a check that passes.
+fn sample(name: &str, filed: bool) -> (Apollo, PathBuf) {
+    use neo_apollo_core::model::fake::Fake;
+    use neo_apollo_core::store::New;
+    let dir = std::env::temp_dir().join(format!("neo-apollo-app-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let model = Arc::new(Fake::default());
+    let key = [5u8; 32];
+    let mut store = Store::open(&dir.join("memory.db"), &key, model.dims().unwrap()).expect("a database");
+    let things: [(Kind, &str, &str, &str, &[&str]); 12] = [
+        (Kind::Photo, "~/Pictures/Trips/IMG_2041.jpg", "A golden retriever running along a beach at low tide, with waves breaking behind it.", "dog beach sea", &["dog", "beach", "sea", "waves", "golden retriever", "summer"]),
+        (Kind::Photo, "~/Pictures/Trips/IMG_2057.jpg", "Two people and a dog sitting on a picnic blanket on the sand, a kite in the sky.", "dog beach sand", &["dog", "beach", "picnic", "kite", "friends", "summer"]),
+        (Kind::Photo, "~/Pictures/Trips/IMG_2110.jpg", "A snow-covered mountain peak above a pine forest, under a clear sky.", "mountain snow", &["mountain", "snow", "forest", "hiking", "sky"]),
+        (Kind::Video, "~/Movies/Neo Recording 2026-10-06 at 09.42.30.mov", "A video 1:12 long. At 0:11: A code editor with a Rust file open and a terminal below it. At 0:36: A file manager showing a folder of pictures.", "code editor terminal screenshot", &["code", "editor", "terminal", "rust", "screen recording", "file manager"]),
+        (Kind::Video, "~/Movies/Hike.mp4", "A video 3:40 long. At 0:33: A trail climbing through a forest. At 1:50: A dog drinking from a stream. At 3:07: A view from a mountain peak over a valley.", "mountain hiking dog", &["hiking", "mountain", "dog", "forest", "trail", "stream"]),
+        (Kind::Photo, "~/Pictures/Neo Screenshot 2026-10-06 at 09.41.07.png", "A screenshot of a code editor showing a function that draws a word cloud, with a hover popup.", "code editor screenshot", &["screenshot", "code", "editor", "rust"]),
+        (Kind::Document, "~/Documents/Invoices/March.md", "Invoice 4411 from Hartley Supplies. Payment of 240.00 is due to the supplier's bank by the end of March.", "invoice payment supplier bank", &["invoice", "payment", "supplier", "march"]),
+        (Kind::Document, "~/Documents/Invoices/April.md", "Invoice 4460 from Hartley Supplies for paper and ink. Payment is due in April.", "invoice payment supplier", &["invoice", "payment", "supplier", "paper"]),
+        (Kind::Document, "~/Documents/Recipes/Soup.txt", "Leek and potato soup. Soften the leeks in butter, add potatoes and stock, simmer for twenty minutes and blend.", "soup", &["soup", "recipe", "leek", "potato", "cooking"]),
+        (Kind::Photo, "~/Pictures/Cats/Mog.jpg", "A tabby cat asleep on a windowsill in the sun, beside a potted fern.", "cat", &["cat", "window", "sleeping", "plant", "sun"]),
+        (Kind::Note, "", "The spare key is with Sam next door.", "key", &["spare", "sam", "key"]),
+        (Kind::Conversation, "", "Asked: Which videos show hiking?\nAnswered: Hike.mp4 shows a trail through a forest and a view from a mountain peak.", "hiking mountain", &["hiking", "videos"]),
+    ];
+    let home = neo_desktop::fs::home_dir();
+    for (i, (kind, file, text, subject, words)) in things.iter().enumerate() {
+        let path = (!file.is_empty()).then(|| home.join(file.trim_start_matches("~/")));
+        let title = match (&path, kind) {
+            (Some(p), _) => p.file_name().unwrap().to_string_lossy().into_owned(),
+            (None, Kind::Conversation) => "Which videos show hiking?".into(),
+            (None, _) => (*text).to_owned(),
+        };
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        let created = 1_791_400_000 + i as u64 * 4000;
+        store.add(&New { kind: *kind, source: path.as_deref(), title: &title, text, part: 0, created, words: &words }, &neo_apollo_core::model::fake::vector(subject)).expect("a memory");
+        // Snapshots show the files counted; tests' reading would forget them, as they are not there.
+        if let Some(path) = path.as_ref().filter(|_| filed) {
+            store.set_file(path, "sample", 1).expect("a file");
+        }
+    }
+    drop(store);
+    let mut app = Apollo::with(model, dir.join("memory.db"), Some(key), Arc::new(|_| Ok(())));
+    // Shown in snapshots only: a test that reads must not read the real ones.
+    if filed {
+        app.settings.folders = ["Pictures", "Movies", "Documents"].iter().map(|d| Folder { path: home.join(d), on: true }).collect();
+    }
+    (app, dir)
+}
+
+fn snapshots(dir: PathBuf) {
+    use neo::testing::Harness;
+    std::fs::create_dir_all(&dir).expect("create snapshot dir");
+    type Shot<'a> = (&'a str, neo_desktop::SchemePref, &'a dyn Fn(&mut Apollo));
+    let shots: [Shot; 5] = [
+        ("apollo-ask", neo_desktop::SchemePref::Light, &|a| {
+            a.update(Msg::Unlock);
+            a.update(Msg::Suggest("Which photos show a dog on the beach?".into()));
+        }),
+        ("apollo-locked", neo_desktop::SchemePref::Dark, &|a| a.update(Msg::Page(Page::Memory))),
+        ("apollo-memory", neo_desktop::SchemePref::Dark, &|a| {
+            a.update(Msg::Page(Page::Memory));
+            a.update(Msg::Unlock);
+        }),
+        ("apollo-word", neo_desktop::SchemePref::Light, &|a| {
+            a.update(Msg::Page(Page::Memory));
+            a.update(Msg::Unlock);
+            a.update(Msg::Word("dog".into()));
+            a.update(Msg::Word("beach".into()));
+        }),
+        ("apollo-sources", neo_desktop::SchemePref::Light, &|a| a.update(Msg::Page(Page::Sources))),
+    ];
+    for (name, scheme, set) in shots {
+        let (mut app, scratch) = sample(name, true);
+        app.desktop.appearance.scheme = scheme;
+        set(&mut app);
+        let mut h = Harness::new(app, Size::new(1080.0, 720.0)).expect("GPU");
+        let path = dir.join(format!("{name}.png"));
+        h.save_png(&path, 1.0).expect("write png");
+        println!("wrote {}", path.display());
+        drop(h);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neo::testing::Harness;
+    use neo::{Key, Modifiers, Point};
+
+    const WINDOW: Size = Size::new(1080.0, 720.0);
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app(name: &str) -> (Apollo, Scratch) {
+        let (app, dir) = sample(name, false);
+        (app, Scratch(dir))
+    }
+
+    fn titles(a: &Apollo) -> Vec<&str> {
+        a.shown.items.iter().map(|(m, _)| m.title.as_str()).collect()
+    }
+
+    #[test]
+    fn the_memory_is_locked_until_the_login_check_passes() {
+        let (mut a, _scratch) = app("lock");
+        a.check = Arc::new(|reason| {
+            assert_eq!(reason, "look through Apollo's memory");
+            Err("Authentication was cancelled.".into())
+        });
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Unlock);
+        assert!(a.store.is_none() && !a.unlocking, "refused, it stays locked");
+        assert_eq!(a.trouble.as_deref(), Some("Authentication was cancelled."));
+        assert!(a.shown.items.is_empty() && a.cloud.is_empty() && a.stats.total() == 0, "and nothing of it is in the app");
+        // Searching while locked finds nothing and asks nothing.
+        a.update(Msg::Query("dog".into()));
+        a.update(Msg::Search);
+        a.update(Msg::Word("dog".into()));
+        assert!(a.shown.items.is_empty());
+        a.update(Msg::Clear);
+
+        a.check = Arc::new(|_| Ok(()));
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        // The Unlock button, under the words in the middle of the page.
+        let before = h.app().store.is_some();
+        for y in (300..460).step_by(8) {
+            h.click(Point::new(neo_desktop::ui::SIDEBAR_W + (WINDOW.w - neo_desktop::ui::SIDEBAR_W) / 2.0, y as f32));
+            if h.app().store.is_some() {
+                break;
+            }
+        }
+        assert!(!before && h.app().store.is_some(), "the button unlocks it");
+        let a = h.app_mut();
+        assert_eq!(a.trouble, None);
+        assert!(a.stats.total() == 12 && !a.cloud.is_empty() && a.shown.heading == "Newest" && !a.shown.items.is_empty());
+        assert_eq!(a.cloud[0].weight, 1.0);
+        h.render(1.0);
+        // Locked again, it is all gone from the app.
+        h.app_mut().update(Msg::Lock);
+        let a = h.app();
+        assert!(a.store.is_none() && a.shown.items.is_empty() && a.cloud.is_empty() && a.stats.total() == 0);
+        h.render(1.0);
+    }
+
+    #[test]
+    fn the_memory_is_searched_by_meaning_kind_and_word() {
+        let (mut a, _scratch) = app("search");
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Unlock);
+        a.update(Msg::Query("  a puppy at the seaside ".into()));
+        a.update(Msg::Search);
+        assert_eq!(a.shown.heading, "Nearest to “a puppy at the seaside”");
+        assert!(titles(&a)[0].starts_with("IMG_20"), "the beach photos of the dog come first: {:?}", titles(&a));
+        assert!(a.shown.items[0].1.is_some_and(|d| d < 0.2));
+        // Only videos: the search is not asked again, only narrowed.
+        a.update(Msg::Kind(Some(Kind::Video)));
+        assert!(!titles(&a).is_empty() && a.shown.items.iter().all(|(m, _)| m.kind == Kind::Video));
+        assert_eq!(titles(&a)[0], "Hike.mp4", "the one with a dog in it");
+        a.update(Msg::Kind(None));
+        // A word from the cloud: what is about it.
+        a.update(Msg::Word("invoice".into()));
+        assert_eq!((a.shown.heading.as_str(), a.trail.as_slice(), a.query.as_str()), ("About “invoice”", ["invoice".to_owned()].as_slice(), ""));
+        let found = titles(&a);
+        assert!(found.contains(&"March.md") && found.contains(&"April.md") && found.iter().all(|t| t.ends_with(".md")), "{found:?}");
+        a.update(Msg::Clear);
+        assert_eq!((a.shown.heading.as_str(), a.trail.is_empty(), a.graph.is_empty(), a.asked.is_none()), ("Newest", true, true, true));
+        // An empty search is the same as clearing.
+        a.update(Msg::Word("dog".into()));
+        a.update(Msg::Query("   ".into()));
+        a.update(Msg::Search);
+        assert_eq!(a.shown.heading, "Newest");
+        // Forgetting one takes it from the list and the counts.
+        let (before, first) = (a.stats.total(), a.shown.items[0].0.id);
+        a.update(Msg::Forget(first));
+        assert_eq!(a.stats.total(), before - 1);
+        assert!(a.shown.items.iter().all(|(m, _)| m.id != first));
+    }
+
+    #[test]
+    fn a_word_in_the_cloud_can_be_clicked() {
+        let (mut a, _scratch) = app("click");
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Unlock);
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        // Somewhere in the cloud's middle there is a word under the pointer.
+        let left = neo_desktop::ui::SIDEBAR_W + 30.0;
+        let spot = (0..40).map(|i| Point::new(left + 300.0 + i as f32 * 6.0, 330.0)).find(|p| {
+            h.move_to(*p);
+            h.cursor() == neo::CursorIcon::Pointer
+        });
+        let spot = spot.expect("a word says it can be clicked");
+        h.click(spot);
+        let a = h.app();
+        assert_eq!(a.trail.len(), 1, "the word is picked");
+        let word = a.trail[0].clone();
+        assert!(a.cloud.iter().any(|w| w.word == word) && a.graph.len() == 1 && a.graph[0].word == word);
+        assert_eq!(a.shown.heading, format!("About “{word}”"));
+        assert!(!a.shown.items.is_empty());
+        h.render(1.0);
+    }
+
+    #[test]
+    fn picking_words_grows_a_graph_of_the_words_that_go_together() {
+        let (mut a, _scratch) = app("graph");
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Unlock);
+        a.update(Msg::Word("dog".into()));
+        assert_eq!(a.graph.len(), 1);
+        let round: Vec<&str> = a.graph[0].related.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(round[0], "beach", "the word that shares most memories with it first: {round:?}");
+        assert!(round.contains(&"hiking") && round.contains(&"summer") && !round.contains(&"invoice") && !round.contains(&"dog"));
+        assert!(a.graph[0].related[0].1 == 1.0 && a.graph[0].related.iter().all(|(_, w)| *w > 0.0 && *w <= 1.0));
+        // One of those picked too: both are in the graph, and the list is of the newer.
+        a.update(Msg::Word("beach".into()));
+        assert_eq!((a.trail.clone(), a.graph.iter().map(|h| h.word.as_str()).collect::<Vec<_>>(), a.shown.heading.as_str()), (vec!["dog".to_owned(), "beach".to_owned()], vec!["dog", "beach"], "About “beach”"));
+        assert!(a.graph[1].related.iter().any(|(w, _)| w == "dog") && a.graph[1].related.iter().any(|(w, _)| w == "picnic"));
+        a.update(Msg::Word("picnic".into()));
+        a.update(Msg::Word("kite".into()));
+        assert_eq!((a.trail.len(), a.graph.len(), a.graph[0].word.as_str()), (4, HUBS, "beach"), "the graph keeps to the last few");
+        // A picked word again goes back to it.
+        a.update(Msg::Word("beach".into()));
+        assert_eq!((a.trail.clone(), a.shown.heading.as_str()), (vec!["dog".to_owned(), "beach".to_owned()], "About “beach”"));
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        // The two picked words sit side by side; clicking the first goes back to it.
+        let (left, wide) = (neo_desktop::ui::SIDEBAR_W + 28.0, WINDOW.w - neo_desktop::ui::SIDEBAR_W - 12.0 - 56.0);
+        let first = Point::new(left + wide / 4.0, 170.0 + 10.0 + CLOUD_H / 2.0);
+        h.move_to(first);
+        assert_eq!(h.cursor(), neo::CursorIcon::Pointer);
+        h.click(first);
+        assert_eq!(h.app().trail, ["dog".to_owned()]);
+        h.app_mut().update(Msg::Clear);
+        assert!(h.app().graph.is_empty() && h.app().trail.is_empty(), "and back to the cloud");
+        h.render(1.0);
+    }
+
+    #[test]
+    fn apollo_answers_from_memory_only_once_it_is_unlocked() {
+        let (mut a, _scratch) = app("ask");
+        a.settings.remember_conversations = false;
+        a.update(Msg::Draft("Where is the photo of the dog on the beach?".into()));
+        a.update(Msg::Send);
+        assert_eq!((a.talk.len(), a.answering, a.draft.as_str()), (2, false, ""));
+        assert_eq!(a.talk[1].text, "You asked: Where is the photo of the dog on the beach? I looked at 0 memories.");
+        assert!(a.talk[1].recalled.is_empty(), "locked, it is shown nothing");
+        a.update(Msg::Unlock);
+        let before = a.stats.total();
+        a.update(Msg::Suggest("Where is the photo of the dog on the beach?".into()));
+        let answer = a.talk.last().unwrap();
+        assert!(!answer.recalled.is_empty() && answer.text.ends_with("memories.") && !answer.text.contains(" 0 memories"));
+        assert!(answer.recalled[0].memory.title.starts_with("IMG_20"));
+        assert_eq!(a.stats.total(), before, "with remembering off, what was asked is not kept");
+        // With it on, it is, and what Apollo is told goes in as a note.
+        a.settings.remember_conversations = true;
+        a.update(Msg::Suggest("What about the mountain?".into()));
+        assert_eq!((a.stats.total(), a.stats.of(Kind::Conversation)), (before + 1, 2));
+        a.update(Msg::Suggest("Remember that the bins go out on Thursday".into()));
+        assert_eq!(a.talk.last().unwrap().text, "I'll remember that.");
+        assert_eq!(a.stats.of(Kind::Note), 2);
+        assert_eq!(a.store.as_ref().unwrap().recent(1, Some(Kind::Note)).unwrap()[0].text, "the bins go out on Thursday");
+        // Nothing is sent while one is being answered, or with nothing to ask.
+        let said = a.talk.len();
+        a.update(Msg::Draft("   ".into()));
+        a.update(Msg::Send);
+        assert_eq!(a.talk.len(), said);
+        a.update(Msg::NewTalk);
+        assert!(a.talk.is_empty());
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        h.type_text("What dog?");
+        h.key(Key::Enter, Modifiers::default());
+        assert_eq!(h.app().talk.len(), 2, "typed and sent from the keyboard");
+        h.render(1.0);
+    }
+
+    #[test]
+    fn an_answer_that_fails_puts_the_question_back() {
+        let (mut a, _scratch) = app("fail");
+        a.update(Msg::Draft("Hello".into()));
+        a.answering = true;
+        a.talk.push(Said { role: Role::User, text: "Hello".into(), recalled: vec![] });
+        a.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![] });
+        a.update(Msg::Piece("Hi".into()));
+        assert_eq!(a.talk[1].text, "Hi", "an answer shows as it comes");
+        a.update(Msg::Answered(Err("The model server did not answer.".into())));
+        assert_eq!((a.talk.len(), a.draft.as_str(), a.trouble.as_deref(), a.answering), (0, "Hello", Some("The model server did not answer."), false));
+        // A piece that comes after the end is not added to anything.
+        a.update(Msg::Piece("late".into()));
+        assert!(a.talk.is_empty());
+    }
+
+    #[test]
+    fn folders_are_read_and_the_list_of_them_is_kept() {
+        let (mut a, scratch) = app("read");
+        let folder = scratch.0.join("things");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("trail.txt"), "Notes on hiking the mountain trail in the snow.").unwrap();
+        let file = scratch.0.join("settings");
+        a.settings_file = Some(file.clone());
+        a.settings.folders = vec![Folder { path: folder.clone(), on: true }];
+        a.update(Msg::Unlock);
+        let before = a.stats.of(Kind::Document);
+        a.update(Msg::Read);
+        assert_eq!((a.reading, a.progress.read, a.progress.total, a.progress.trouble.clone()), (false, 1, 1, None));
+        assert_eq!(a.stats.of(Kind::Document), before + 1, "what was read shows at once in a memory that is open");
+        assert_eq!(a.status(), "Up to date");
+        // Short of memory, nothing is read, and it says why; with room again, it is.
+        std::fs::write(folder.join("more.txt"), "Another note about the beach and the sea.").unwrap();
+        a.short_of_memory = || true;
+        a.update(Msg::Read);
+        assert_eq!((a.reading, a.held, a.status(), a.stats.of(Kind::Document)), (false, true, "Paused: memory is short".to_owned(), before + 1));
+        a.short_of_memory = || false;
+        a.update(Msg::Read);
+        assert_eq!((a.held, a.status(), a.stats.of(Kind::Document)), (false, "Up to date".to_owned(), before + 2));
+        std::fs::remove_file(folder.join("more.txt")).unwrap();
+        a.update(Msg::Read);
+        assert_eq!(a.stats.of(Kind::Document), before + 1);
+        // Turned off, the folder's memories are forgotten; the choice is saved.
+        a.update(Msg::FolderOn(0, false));
+        assert_eq!((a.stats.of(Kind::Document), a.progress.forgotten), (before, 1));
+        assert_eq!(Settings::load_from(&file).folders, [Folder { path: folder.clone(), on: false }]);
+        a.update(Msg::RememberTalk(false));
+        a.update(Msg::RemoveFolder(0));
+        a.update(Msg::RemoveFolder(7));
+        let saved = Settings::load_from(&file);
+        assert!(saved.folders.is_empty() && !saved.remember_conversations);
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.app_mut().update(Msg::Page(Page::Sources));
+        h.render(1.0);
+    }
+
+    #[test]
+    fn a_model_that_is_not_there_is_said_and_nothing_is_asked_of_it() {
+        let (mut a, _scratch) = app("model");
+        for (ready, status) in [(Engine::Checking, "Starting the model…"), (Engine::Trouble("Ollama is not installed.".into()), "The model is not running"), (Engine::Missing(vec!["gemma3:4b".into()]), "The model needs downloading"), (Engine::Pulling { model: "gemma3:4b".into(), status: "pulling".into(), done: 1 << 30, total: 3 << 30 }, "Downloading the model…")] {
+            a.update(Msg::Ready(ready.clone(), 0));
+            assert_eq!(a.status(), status);
+            assert!(a.setup().is_some());
+            a.update(Msg::Suggest("Hello".into()));
+            a.update(Msg::Read);
+            assert!(a.talk.is_empty() && !a.reading && a.draft == "Hello", "nothing is asked of a model that is not there");
+            let mut h = Harness::new(a, WINDOW).unwrap();
+            h.render(1.0);
+            h.app_mut().update(Msg::Page(Page::Sources));
+            h.render(1.0);
+            (a, _) = (std::mem::replace(h.app_mut(), sample("model-swap", false).0), ());
+            a.update(Msg::Page(Page::Ask));
+        }
+        // Once it is there, the folders are read straight away.
+        a.update(Msg::Ready(Engine::Ready, 8));
+        assert_eq!((a.status(), a.setup().is_none()), ("Up to date".into(), true));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-model-swap-{}", std::process::id())));
+    }
+
+    /// By hand, with the real model, on a folder of your choosing:
+    /// `NEO_APOLLO_PROBE=folder NEO_APOLLO_ASK="question" NEO_SNAPSHOT_DIR=dir cargo test -p neo-apollo probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_a_real_folder() {
+        let folder = PathBuf::from(std::env::var("NEO_APOLLO_PROBE").expect("NEO_APOLLO_PROBE"));
+        let dir = std::env::temp_dir().join(format!("neo-apollo-probe-{}", std::process::id()));
+        let model = Arc::new(Ollama::from_settings(&Settings::default()));
+        model.start().unwrap();
+        let mut a = Apollo::with(model, dir.join("memory.db"), Some([9; 32]), Arc::new(|_| Ok(())));
+        a.settings.folders = vec![Folder { path: folder, on: true }];
+        a.settings.remember_conversations = false;
+        let began = std::time::Instant::now();
+        a.update(Msg::Read);
+        println!("read in {:?}: {:?}", began.elapsed(), a.progress);
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Unlock);
+        println!("{:?}", a.stats);
+        for m in a.store.as_ref().unwrap().recent(50, None).unwrap() {
+            println!("- {} [{}] {} :: {:?}", m.title, m.kind.name(), snippet(&m.text, 300), a.store.as_ref().unwrap().words_of(m.id).unwrap());
+        }
+        println!("cloud: {:?}", a.cloud.iter().map(|w| (w.word.as_str(), w.count, &w.also)).collect::<Vec<_>>());
+        let shots = std::env::var("NEO_SNAPSHOT_DIR").ok().map(PathBuf::from);
+        let shoot = |a: Apollo, name: &str| -> Apollo {
+            let Some(dir) = &shots else { return a };
+            let mut h = Harness::new(a, WINDOW).unwrap();
+            h.save_png(dir.join(format!("{name}.png")), 1.0).unwrap();
+            std::mem::replace(h.app_mut(), sample("probe-swap", false).0)
+        };
+        a = shoot(a, "probe-cloud");
+        if let Some(word) = a.cloud.first().map(|w| w.word.clone()) {
+            a.update(Msg::Word(word));
+            println!("graph: {:?}", a.graph);
+            if let Some(next) = a.graph[0].related.first().map(|r| r.0.clone()) {
+                a.update(Msg::Word(next));
+            }
+            a = shoot(a, "probe-graph");
+            a.update(Msg::Clear);
+        }
+        for q in std::env::var("NEO_APOLLO_SEARCH").unwrap_or_default().split('|').filter(|q| !q.is_empty()) {
+            a.update(Msg::Query(q.into()));
+            a.update(Msg::Search);
+            println!("search {q:?}: {:?}", a.shown.items.iter().take(5).map(|(m, d)| (m.title.as_str(), d.map(|d| (d * 1000.0).round() / 1000.0))).collect::<Vec<_>>());
+        }
+        a.update(Msg::Clear);
+        if let Ok(q) = std::env::var("NEO_APOLLO_ASK") {
+            let began = std::time::Instant::now();
+            a.update(Msg::Suggest(q));
+            let said = a.talk.last().unwrap();
+            println!("answered in {:?}: {}\n  from {:?}; trouble {:?}", began.elapsed(), said.text, said.recalled.iter().map(|h| (h.memory.title.as_str(), h.distance)).collect::<Vec<_>>(), a.trouble);
+            shoot(a, "probe-ask");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-probe-swap-{}", std::process::id())));
+    }
+
+    #[test]
+    fn numbers_and_snippets_read_well() {
+        assert_eq!((count(1, "memory", "memories"), count(0, "word", "words"), count(1204, "memory", "memories"), count(1_000_000, "file", "files")), ("1 memory".into(), "0 words".into(), "1,204 memories".into(), "1,000,000 files".into()));
+        assert_eq!(snippet("one\n  two   three", 40), "one two three");
+        assert_eq!(snippet("abcdefghij", 6), "abcde…");
+        assert_eq!(short_path(&neo_desktop::fs::home_dir().join("Pictures/a.png")), "~/Pictures/a.png");
+        assert_eq!(short_path(Path::new("/Volumes/Disk/a")), "/Volumes/Disk/a");
+    }
+}
