@@ -14,6 +14,7 @@
 //! - [`model`]: the model that describes, embeds and answers.
 //! - [`index`]: reading folders into memories.
 //! - [`pressure`]: whether there is memory to spare for reading.
+//! - [`warden`]: what Apollo warns of: resources running out, and what stands open.
 //! - [`words`]: the words that matter in a piece of text, for the cloud.
 //! - [`assistant`]: answering a question from what is remembered.
 //! - [`settings`]: which folders are read, and which models are used.
@@ -25,6 +26,7 @@ pub mod model;
 pub mod pressure;
 pub mod settings;
 pub mod store;
+pub mod warden;
 pub mod words;
 
 pub use model::Model;

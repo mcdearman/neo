@@ -23,6 +23,11 @@ pub fn free_percent() -> Option<u32> {
     imp::free_percent()
 }
 
+/// How much memory this computer has, in bytes, where it says.
+pub fn total_bytes() -> Option<u64> {
+    imp::total_bytes()
+}
+
 /// Whether there is too little memory free for Apollo to be reading.
 /// Where the system does not say, it is taken that there is enough.
 pub fn short_of_memory() -> bool {
@@ -39,6 +44,14 @@ mod imp {
         let ok = unsafe { libc::sysctlbyname(c"kern.memorystatus_level".as_ptr(), (&raw mut value).cast(), &mut size, std::ptr::null_mut(), 0) } == 0;
         ok.then_some(value.clamp(0, 100) as u32)
     }
+
+    pub fn total_bytes() -> Option<u64> {
+        let mut value: u64 = 0;
+        let mut size = size_of::<u64>();
+        // SAFETY: the buffer is a u64 and its size is passed.
+        let ok = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut value).cast(), &mut size, std::ptr::null_mut(), 0) } == 0;
+        ok.then_some(value)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -46,11 +59,20 @@ mod imp {
     pub fn free_percent() -> Option<u32> {
         super::parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
     }
+
+    pub fn total_bytes() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb * 1024)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 mod imp {
     pub fn free_percent() -> Option<u32> {
+        None
+    }
+
+    pub fn total_bytes() -> Option<u64> {
         None
     }
 }
@@ -70,5 +92,6 @@ mod tests {
     #[test]
     fn this_computer_says_how_much_memory_is_free() {
         assert!(free_percent().is_some_and(|f| f <= 100));
+        assert!(total_bytes().is_some_and(|t| t > 1 << 28));
     }
 }

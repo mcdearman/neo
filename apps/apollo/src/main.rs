@@ -27,6 +27,7 @@ use neo_apollo_core::key;
 use neo_apollo_core::model::{Model, Ollama, Role, Turn};
 use neo_apollo_core::settings::{Folder, Settings};
 use neo_apollo_core::store::{Hit, Kind, Memory, Stats, Store, Word};
+use neo_apollo_core::warden::{self, Warning};
 use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Desktop, DesktopMsg};
 
@@ -51,6 +52,11 @@ const LOOK_FOR_ANSWER: usize = 6;
 const LOOK_FOR_SEARCH: usize = 12;
 /// How many files the Activity page's list goes back.
 const LOGGED: usize = 60;
+/// How often memory and disk are looked at, how often what stands open
+/// is, and how many warnings the Activity page keeps.
+const WATCH_EVERY: Duration = Duration::from_secs(60);
+const LOOK_OVER_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+const WARNINGS_KEPT: usize = 20;
 /// How wide a model's menu button is in Sources.
 const MODEL_W: f32 = 230.0;
 /// How tall the cloud is, and the graph that takes its place.
@@ -214,6 +220,15 @@ struct Apollo {
     /// Files a search turned up only listed that were sent to be looked at,
     /// so that none is sent twice.
     asked_after: Vec<PathBuf>,
+    /// What has been warned of lately, newest last, and when each kind of
+    /// thing was last said, so that it is not said over and over.
+    warnings: Vec<Warning>,
+    warned: HashMap<String, std::time::Instant>,
+    /// When what stands open was last looked over.
+    looked_over: Option<std::time::Instant>,
+    /// Tells the user of a warning: through NeoShell, as it runs. False if
+    /// there was nobody to tell.
+    tell: fn(&Warning) -> bool,
     /// A question from outside the window (the search bar, the command
     /// line) that is waiting for the model to be ready or free.
     waiting_question: Option<String>,
@@ -298,6 +313,11 @@ enum Msg {
     /// A question is looking at a file before it answers: which, of how many.
     Looking(usize, usize),
     LookAhead(bool),
+    /// Time to look at how the computer is doing.
+    Watch,
+    /// What was found worth warning of.
+    Warned(Vec<Warning>),
+    WarnMe(bool),
     AskReset,
     CancelReset,
     /// Forget everything and read it all again with the model now chosen.
@@ -349,6 +369,28 @@ fn listen(roots: &[PathBuf], heard: impl Fn(Vec<PathBuf>) -> bool + Send + 'stat
         }
     });
     Some(watcher)
+}
+
+/// How long before the same thing is warned of again: memory soon, since
+/// it is what brings a computer down; what stands open once a day.
+fn quiet_for(w: &Warning) -> Duration {
+    Duration::from_secs(match w.key.split(':').next().unwrap_or_default() {
+        "memory" => 15 * 60,
+        "greedy" => 60 * 60,
+        "disk" => 6 * 60 * 60,
+        _ => 24 * 60 * 60,
+    })
+}
+
+/// Tells the user of a warning through NeoShell, which shows it at the
+/// corner of the screen. A card has room for a line: the first sentence.
+fn tell_neoshell(w: &Warning) -> bool {
+    let first = w.body.split_inclusive(". ").next().unwrap_or(&w.body).trim();
+    let mut note = neo_desktop::notify::Notification::new(format!("Apollo: {}", w.title), first);
+    if let Some(file) = &w.file {
+        note = note.reveal(file);
+    }
+    note.send()
 }
 
 /// A length of time said roughly: "under a minute", "about 12 minutes", "about 3 hours".
@@ -414,6 +456,7 @@ impl Apollo {
         app.settings_file = Some(Settings::file());
         app.server = Some(server);
         app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
+        app.tell = tell_neoshell;
         app.ready = Engine::Checking;
         app
     }
@@ -463,6 +506,10 @@ impl Apollo {
             remote_draft: String::new(),
             choosing: None,
             typing: None,
+            warnings: vec![],
+            warned: HashMap::new(),
+            looked_over: None,
+            tell: |_| false,
             waiting_question: None,
             pending: vec![],
             log: Default::default(),
@@ -649,6 +696,48 @@ impl Apollo {
                 }
             }
             send(Msg::CheckModel);
+        });
+    }
+
+    /// Takes in warnings: each is said, and kept for the Activity page,
+    /// unless the same thing was said too lately to say again.
+    fn warn(&mut self, found: Vec<Warning>) {
+        if !self.settings.warn {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for w in found {
+            if self.warned.get(&w.key).is_some_and(|last| now.duration_since(*last) < quiet_for(&w)) {
+                continue;
+            }
+            self.warned.insert(w.key.clone(), now);
+            (self.tell)(&w);
+            self.warnings.push(w);
+            if self.warnings.len() > WARNINGS_KEPT {
+                self.warnings.remove(0);
+            }
+        }
+    }
+
+    /// Looks at how the computer is doing, off the main thread: memory
+    /// and disk every time, and what stands open now and then.
+    fn keep_watch(&mut self) {
+        if !self.settings.warn {
+            return;
+        }
+        let over = self.looked_over.is_none_or(|t| t.elapsed() >= LOOK_OVER_EVERY);
+        if over {
+            self.looked_over = Some(std::time::Instant::now());
+        }
+        let (remote, there) = (self.settings.remote.clone(), self.away().contains(&true));
+        self.work(move |send| {
+            let mut found = warden::resources();
+            if over {
+                found.extend(warden::security(&remote, there));
+            }
+            if !found.is_empty() {
+                send(Msg::Warned(found));
+            }
         });
     }
 
@@ -1050,6 +1139,9 @@ impl App for Apollo {
         }
         self.check_model();
         self.watch();
+        if self.proxy.is_some() {
+            self.keep_watch();
+        }
         // Questions from the search bar, and from an Apollo started with one
         // while this is running.
         if let Some(proxy) = self.proxy.clone() {
@@ -1066,6 +1158,9 @@ impl App for Apollo {
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
         let mut subs = vec![Desktop::subscription(Msg::Poll)];
+        if self.settings.warn {
+            subs.push(Subscription::every(WATCH_EVERY, Msg::Watch));
+        }
         if self.ready == Engine::Ready && !self.reading && self.settings.read_automatically {
             subs.push(Subscription::every(if self.held { RETRY_EVERY } else { READ_EVERY }, Msg::Read));
         }
@@ -1248,6 +1343,12 @@ impl App for Apollo {
             }
 
             Msg::Read => self.read(),
+            Msg::Watch => self.keep_watch(),
+            Msg::Warned(found) => self.warn(found),
+            Msg::WarnMe(on) => {
+                self.settings.warn = on;
+                self.save_settings();
+            }
             Msg::Looking(i, n) => self.looking = Some((i, n)),
             Msg::LookAhead(on) => {
                 self.settings.look_ahead = on;
@@ -1268,6 +1369,8 @@ impl App for Apollo {
             }
             Msg::ReadDone(mut p) => {
                 self.reading = false;
+                // Keys and tokens it came on lying in the files it read.
+                self.warn(p.secrets.iter().map(|(file, what)| warden::secret_warning(file, what)).collect());
                 self.log_done(self.progress.failed, &p);
                 // Made with another model: said once, with what to do about it.
                 if let Some(why) = p.trouble.take_if(|t| t.starts_with(neo_apollo_core::store::OTHER_MODEL)) {
@@ -1677,6 +1780,19 @@ impl Apollo {
             page = page.push(notice(Tone::Warn, format!("Some files are being left for want of {tool}: cargo xtask deps --install")));
         }
 
+        // What it has warned of, newest first.
+        if !self.warnings.is_empty() {
+            page = page.push(section("Warnings"));
+            for w in self.warnings.iter().rev() {
+                let words = column().spacing(2.0).width(Length::Fill).push(text(w.title.clone()).role(TextRole::Strong)).push(text(w.body.clone()).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill));
+                let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(icon(if w.security { icons::SHIELD_ALERT } else { icons::TRIANGLE_ALERT }).size(18.0).tone(if w.security { Tone::Bad } else { Tone::Warn })).push(words);
+                if let Some(file) = &w.file {
+                    line = line.push(icon_button(icons::FOLDER_OPEN, 28.0).kind(ButtonKind::Ghost).on_press(Msg::Reveal(file.clone())));
+                }
+                page = page.push(container(line).surface(Surface::Well).radius(10.0).padding([14.0, 10.0]).width(Length::Fill));
+            }
+        }
+
         // Lately, newest first.
         page = page.push(section("Lately"));
         if self.log.is_empty() {
@@ -1766,6 +1882,11 @@ impl Apollo {
         }
         page = page.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PLUS).size(14.0)).push(text("Add Folder…"))).on_press(Msg::AddFolder)));
 
+        page = page.push(section("Warnings")).push(setting(
+            "Warn me",
+            "While it is open Apollo keeps an eye on the computer and says, through NeoShell, when memory or the disk is running out and what is using it, and when something stands open: a disk that is not encrypted, a firewall that is off, a model server the whole network can use, a key or a token lying in a file it reads. It looks and tells; it changes nothing.",
+            toggle(self.settings.warn, Msg::WarnMe),
+        ));
         page = page.push(section("Conversations")).push(setting("Remember what I ask", "What you ask Apollo and what it answers go into its memory, so it can be brought up later.", toggle(self.settings.remember_conversations, Msg::RememberTalk)));
         // The models, which can be any the servers have or can get.
         let anything_away = self.away().contains(&true);
@@ -2622,6 +2743,54 @@ mod tests {
         h.render(1.0);
         h.app_mut().update(Msg::Lock);
         h.render(1.0);
+    }
+
+    #[test]
+    fn warnings_are_told_once_and_kept_for_the_activity_page() {
+        use std::sync::atomic::AtomicUsize;
+        static TOLD: AtomicUsize = AtomicUsize::new(0);
+        let (mut a, scratch) = app("warn");
+        a.tell = |w| {
+            assert!(!w.title.is_empty());
+            TOLD.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let using = [warden::Using { name: "MeadowBoot".into(), processes: 8, bytes: 73 << 30 }];
+        let short = warden::memory_warnings(4, 16 << 30, &using);
+        a.update(Msg::Warned(short.clone()));
+        a.update(Msg::Warned(short.clone()));
+        assert_eq!((TOLD.load(Ordering::Relaxed), a.warnings.len(), a.warnings[0].title.as_str()), (1, 1, "Memory is running short"), "the same thing is not said twice running");
+        // Another kind of thing is said; and the first again once it has been quiet long enough.
+        a.update(Msg::Warned(warden::disk_warnings(1 << 30, 460 << 30)));
+        *a.warned.get_mut("memory").unwrap() = std::time::Instant::now().checked_sub(Duration::from_secs(16 * 60)).unwrap();
+        a.update(Msg::Warned(short.clone()));
+        assert_eq!((TOLD.load(Ordering::Relaxed), a.warnings.len()), (3, 3));
+        // A key lying in a file that is read is warned of, with the file, and left out of the memory.
+        let folder = scratch.0.join("docs");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("deploy.md"), "To deploy:\n\nexport TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n").unwrap();
+        a.settings.folders = vec![Folder { path: folder.clone(), on: true }];
+        a.update(Msg::Read);
+        let last = a.warnings.last().unwrap();
+        assert_eq!((last.title.as_str(), last.file.clone(), last.security, TOLD.load(Ordering::Relaxed)), ("deploy.md holds what looks like a GitHub token", Some(folder.join("deploy.md")), true, 4));
+        a.update(Msg::Unlock);
+        assert!(a.store.as_ref().unwrap().recent(1, Some(Kind::Document)).unwrap()[0].text.contains("[a GitHub token, left out]"));
+        // The page shows them; turned off, nothing more is said or looked for.
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.app_mut().update(Msg::Page(Page::Activity));
+        h.render(1.0);
+        let mut a = std::mem::replace(h.app_mut(), sample("warn-swap", false).0);
+        a.settings_file = Some(scratch.0.join("settings"));
+        a.update(Msg::WarnMe(false));
+        a.update(Msg::Warned(warden::disk_warnings(1 << 20, 460 << 30)));
+        a.update(Msg::Watch);
+        assert_eq!((a.warnings.len(), TOLD.load(Ordering::Relaxed), Settings::load_from(&scratch.0.join("settings")).warn), (4, 4, false));
+        assert_eq!((quiet_for(&short[0]), quiet_for(last_of(&a))), (Duration::from_secs(900), Duration::from_secs(86_400)));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-warn-swap-{}", std::process::id())));
+    }
+
+    fn last_of(a: &Apollo) -> &Warning {
+        a.warnings.last().unwrap()
     }
 
     #[test]

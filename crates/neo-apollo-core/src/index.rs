@@ -188,6 +188,9 @@ fn have(program: &str) -> bool {
 pub enum Outcome {
     /// Read, and this many memories made of it.
     Read(u32),
+    /// Read, and found to hold something that looks like a key or a token
+    /// (what kind is said), which was left out of what is remembered.
+    Holds(u32, &'static str),
     /// Not read, because the program that could read it is not installed.
     /// It will be tried again.
     Needs(&'static str),
@@ -357,6 +360,7 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let (title, created) = (name(path), modified(&meta));
     let what = classify(path).ok_or("Not a kind of file Apollo reads.")?;
+    let mut secret = None;
     let made = match what {
         What::Photo => {
             let seen = model.describe(&look_at(path)?)?;
@@ -388,6 +392,9 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
                 Ok(text) => text,
                 Err(tool) => return Ok(Outcome::Needs(tool)),
             };
+            // A key or a token lying in it is left out of what is remembered.
+            let (text, found) = crate::warden::without_secrets(&text);
+            secret = found;
             let parts = passages(&text);
             store.forget_source(path)?;
             // Embedded a few at a time: one request for each would crawl.
@@ -403,7 +410,10 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
         }
     };
     store.set_file(path, &stamp_of(path, &meta), made)?;
-    Ok(Outcome::Read(made))
+    Ok(match secret {
+        Some(what) => Outcome::Holds(made, what),
+        None => Outcome::Read(made),
+    })
 }
 
 /// How a run through the folders is going.
@@ -426,6 +436,9 @@ pub struct Progress {
     pub needs: Vec<&'static str>,
     /// The last thing to go wrong, and with what.
     pub trouble: Option<String>,
+    /// Files read this run that hold what looks like a key or a token, and
+    /// what kind.
+    pub secrets: Vec<(PathBuf, &'static str)>,
     /// Pictures and videos are being looked at, which is the slow part,
     /// and not merely listed.
     pub looking: bool,
@@ -547,6 +560,10 @@ fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: 
             match if look { index_file(store, model, &file) } else { list_file(store, model, &file) } {
                 Ok(Outcome::Read(_)) if seen && !look => p.listed += 1,
                 Ok(Outcome::Read(_)) => p.read += 1,
+                Ok(Outcome::Holds(_, what)) => {
+                    p.read += 1;
+                    p.secrets.push((file.clone(), what));
+                }
                 Ok(Outcome::Needs(tool)) => {
                     if !p.needs.contains(&tool) {
                         p.needs.push(tool);
@@ -785,6 +802,24 @@ mod tests {
         picture(&root.join("new.png"), [40, 40, 220]);
         assert_eq!(update(&mut store, &model, &roots, &[root.join("new.png")], false, &mut |_| true).listed, 1);
         assert_eq!(store.stats().unwrap().light, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_lying_in_a_document_is_left_out_of_the_memory_and_said() {
+        let dir = scratch("secret");
+        let model = Fake::default();
+        let mut store = Store::open(&dir.join("db/memory.db"), &[1; 32], model.dims().unwrap()).unwrap();
+        let root = dir.join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("server.txt"), "Notes on the server.\n\nexport AWS_KEY=AKIAIOSFODNN7EXAMPLE\n\nThe invoice is paid by the bank.").unwrap();
+        std::fs::write(root.join("plain.txt"), "Nothing to hide here.").unwrap();
+        let p = run(&mut store, &model, std::slice::from_ref(&root), false, &mut |_| true);
+        assert_eq!((p.read, p.secrets.clone()), (2, vec![(root.join("server.txt"), "an Amazon access key")]));
+        let kept = store.recent(5, Some(Kind::Document)).unwrap().into_iter().find(|m| m.title == "server.txt").unwrap();
+        assert!(kept.text.contains("[an Amazon access key, left out]") && !kept.text.contains("AKIA") && kept.text.contains("The invoice is paid"), "{}", kept.text);
+        // Not said again while the file stays as it is.
+        assert_eq!(run(&mut store, &model, std::slice::from_ref(&root), false, &mut |_| true).secrets, vec![]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
