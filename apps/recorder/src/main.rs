@@ -147,6 +147,10 @@ struct Recorder {
     own_overlay: bool,
     /// NeoCap's own selection is up.
     overlay: bool,
+    /// Where on the screen the overlay really is, once the system has
+    /// said. It is asked to cover the screen from its corner, but the
+    /// system may put it lower, under the menu bar.
+    overlay_at: Option<Point>,
     /// The drag so far, from where it began to where the mouse is, within
     /// the overlay.
     drag: Option<(Point, Point)>,
@@ -297,6 +301,7 @@ impl Recorder {
             picker: None,
             own_overlay: cfg!(target_os = "macos"),
             overlay: false,
+            overlay_at: None,
             drag: None,
             flash_from: None,
             clipboard: None,
@@ -453,6 +458,7 @@ impl Recorder {
     fn start_pick(&mut self) -> bool {
         // NeoCap's own overlay needs to know how big the screen is.
         self.overlay = self.own_overlay && self.screen != Rect::ZERO;
+        self.overlay_at = None;
         self.drag = None;
         // Without an event loop there is nothing to report back to, which
         // is how tests run: they stand in for the crosshair themselves.
@@ -889,7 +895,10 @@ impl Recorder {
             }
             Msg::PickDrop => {
                 if self.phase == Phase::Picking && self.overlay {
-                    let area = self.drag.map(|(a, b)| Rect::new(a.x.min(b.x) + self.screen.x, a.y.min(b.y) + self.screen.y, (a.x - b.x).abs(), (a.y - b.y).abs()));
+                    // The drag is measured within the overlay, so the area on
+                    // the screen is counted from where the overlay really is.
+                    let origin = self.overlay_at.unwrap_or(Point::new(self.screen.x, self.screen.y));
+                    let area = self.drag.map(|(a, b)| Rect::new(a.x.min(b.x) + origin.x, a.y.min(b.y) + origin.y, (a.x - b.x).abs(), (a.y - b.y).abs()));
                     self.end_pick();
                     match area {
                         // The overlay goes, and then the picture is taken.
@@ -960,6 +969,11 @@ impl Recorder {
                 self.screen = g.screen;
                 self.scale = g.scale;
                 // The recording bar's own frame is not the area to record.
+                // Where the selection overlay has been put, which is not
+                // always where it was asked to go.
+                if self.overlay && self.phase == Phase::Picking {
+                    self.overlay_at = Some(Point::new(g.frame.x, g.frame.y));
+                }
                 // Nor are the overlays that cover the whole screen.
                 if !self.busy() && !self.overlay && !matches!(self.phase, Phase::Flash(_)) {
                     self.frame = g.frame;
@@ -1719,6 +1733,24 @@ mod tests {
         let saved = Saved { path: "/tmp/shot.png".into(), bytes: 10, length: Duration::ZERO };
         r.update(Msg::Finished(Ok(saved.clone())));
         assert!(matches!(r.phase, Phase::Flash(_) | Phase::Done(_)));
+    }
+
+    #[test]
+    fn the_area_is_counted_from_where_the_overlay_really_is() {
+        // The system puts the overlay under the menu bar, 38 points down
+        // from where it was asked to be, and says so.
+        let mut r = overlaying();
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::Geometry(WindowGeometry { frame: Rect::new(0.0, 63.0, 800.0, 462.0), screen: Rect::new(0.0, 25.0, 800.0, 500.0), scale: 2.0 }));
+        r.update(Msg::PickDrag(Point::new(100.0, 50.0), Point::new(300.0, 200.0)));
+        r.update(Msg::PickDrop);
+        assert_eq!(r.phase, Phase::Shooting(Target::Area(Rect::new(100.0, 113.0, 200.0, 150.0))), "what was dragged over, not a strip above it");
+        assert_eq!(r.frame, Rect::new(100.0, 100.0, 400.0, 300.0), "and the overlay's frame is still not taken for the window's");
+        // The next time starts afresh, in case the screen has changed.
+        r.update(Msg::Finished(Err("no picture".into())));
+        r.shown = false;
+        r.update(Msg::ScreenshotHotkey);
+        assert_eq!(r.overlay_at, None);
     }
 
     #[test]
