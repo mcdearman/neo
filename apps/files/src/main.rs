@@ -205,6 +205,12 @@ const THUMB_SIDE: u32 = 224;
 /// camera recorded it should be shown.
 fn thumbnail(path: &Path) -> Option<Image> {
     use image::{DynamicImage, ImageDecoder, ImageReader};
+    // A video is shown by a frame of it, made by the system and kept.
+    let frame = neo_desktop::fs::has_extension(path, neo_desktop::fs::VIDEO_EXTENSIONS).then(|| folders::video_frame(path, &folders::frames_dir(), THUMB_SIDE * 2));
+    let path = match &frame {
+        Some(made) => made.as_deref()?,
+        None => path,
+    };
     let mut decoder = ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
     let orientation = decoder.orientation().ok()?;
     let mut picture = DynamicImage::from_decoder(decoder).ok()?;
@@ -341,7 +347,7 @@ impl Files {
         }
         let Some(queue) = self.thumb_queue.clone() else { return };
         let visit = self.visit.load(std::sync::atomic::Ordering::Relaxed);
-        let wanted: Vec<PathBuf> = self.visible().iter().take(MAX_ROWS).filter(|e| !e.dir && neo_desktop::fs::has_extension(&e.path, neo_desktop::fs::IMAGE_EXTENSIONS)).map(|e| e.path.clone()).filter(|p| !self.thumbs.contains_key(p)).collect();
+        let wanted: Vec<PathBuf> = self.visible().iter().take(MAX_ROWS).filter(|e| !e.dir && (neo_desktop::fs::has_extension(&e.path, neo_desktop::fs::IMAGE_EXTENSIONS) || neo_desktop::fs::has_extension(&e.path, neo_desktop::fs::VIDEO_EXTENSIONS))).map(|e| e.path.clone()).filter(|p| !self.thumbs.contains_key(p)).collect();
         for path in wanted {
             self.thumbs.insert(path.clone(), Thumb::Loading);
             let _ = queue.send((visit, path));
