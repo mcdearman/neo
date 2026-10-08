@@ -287,6 +287,12 @@ pub fn reveal(path: &Path) -> std::io::Result<()> {
     open(path.parent().unwrap_or(path))
 }
 
+/// Starts another Neo app with these arguments. Returns false if that
+/// app is not installed.
+pub fn open_with(program: &str, bundle: &str, args: &[&str]) -> bool {
+    neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).args(args).stdin(std::process::Stdio::null()).spawn().is_ok())
+}
+
 /// Opens `path` in another Neo app. Returns false if that app is not installed.
 pub fn open_in(program: &str, bundle: &str, path: &Path) -> bool {
     neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).arg(path).spawn().is_ok())

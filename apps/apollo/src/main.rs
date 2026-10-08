@@ -9,6 +9,7 @@
 //!
 //!     cargo run -p neo-apollo
 //!     cargo run -p neo-apollo -- --index        read the folders, without a window
+//!     cargo run -p neo-apollo -- --ask "…"      ask it, in the Apollo that is running or a new one
 //!     cargo run -p neo-apollo -- --snapshot target/snapshots
 
 use std::collections::HashMap;
@@ -213,6 +214,9 @@ struct Apollo {
     /// Files a search turned up only listed that were sent to be looked at,
     /// so that none is sent twice.
     asked_after: Vec<PathBuf>,
+    /// A question from outside the window (the search bar, the command
+    /// line) that is waiting for the model to be ready or free.
+    waiting_question: Option<String>,
     /// Files the system says have changed, waiting to be read.
     pending: Vec<PathBuf>,
     /// Tells of changes in the folders that are read. Dropped to stop.
@@ -241,6 +245,9 @@ enum Msg {
     Send,
     /// A suggestion was clicked: ask it.
     Suggest(String),
+    /// A question from outside the window: the search bar, or another
+    /// Apollo started with one.
+    Ask(String),
     Piece(String),
     Answered(Result<Answer, String>),
     StopAnswer,
@@ -456,6 +463,7 @@ impl Apollo {
             remote_draft: String::new(),
             choosing: None,
             typing: None,
+            waiting_question: None,
             pending: vec![],
             log: Default::default(),
             working: None,
@@ -642,6 +650,18 @@ impl Apollo {
             }
             send(Msg::CheckModel);
         });
+    }
+
+    /// Asks the question that came from outside the window, once the
+    /// model is ready and not in the middle of another. Until then it
+    /// shows in the box, so that it is plain it was heard.
+    fn ask_what_waits(&mut self) {
+        let Some(question) = self.waiting_question.clone() else { return };
+        self.draft = question;
+        if self.ready == Engine::Ready && !self.answering {
+            self.waiting_question = None;
+            self.send();
+        }
     }
 
     fn send(&mut self) {
@@ -1030,6 +1050,18 @@ impl App for Apollo {
         }
         self.check_model();
         self.watch();
+        // Questions from the search bar, and from an Apollo started with one
+        // while this is running.
+        if let Some(proxy) = self.proxy.clone() {
+            std::thread::spawn(move || {
+                let Ok(questions) = neo_desktop::apollo::Questions::open() else { return };
+                while let Ok(question) = questions.next() {
+                    if !question.trim().is_empty() && !proxy.send(Msg::Ask(question)) {
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
@@ -1067,6 +1099,9 @@ impl App for Apollo {
                     self.dims = dims;
                 }
                 // The model is there: see what is new in the folders.
+                if first {
+                    self.ask_what_waits();
+                }
                 if first && self.settings.read_automatically {
                     self.read();
                 }
@@ -1079,6 +1114,11 @@ impl App for Apollo {
             Msg::Suggest(text) => {
                 self.draft = text;
                 self.send();
+            }
+            Msg::Ask(question) => {
+                self.page = Page::Ask;
+                self.waiting_question = Some(question);
+                self.ask_what_waits();
             }
             Msg::Piece(piece) => {
                 self.looking = None;
@@ -1094,6 +1134,8 @@ impl App for Apollo {
                 self.answering = false;
                 self.looking = None;
                 self.said += 1;
+                // One that came in the meantime is asked when this is dealt with.
+                let waits = self.waiting_question.is_some();
                 let Some(last) = self.talk.last_mut() else { return };
                 match answer {
                     Ok(a) => {
@@ -1112,6 +1154,9 @@ impl App for Apollo {
                     }
                 }
                 self.show();
+                if waits {
+                    self.ask_what_waits();
+                }
             }
             Msg::StopAnswer => self.stop_answer.store(true, Ordering::Relaxed),
             Msg::NewTalk => {
@@ -1800,7 +1845,18 @@ fn main() {
         }
         return;
     }
-    if let Err(e) = neo::run(Apollo::new()) {
+    // `neo-apollo --ask "question"` asks it: of the Apollo that is running,
+    // if one is, and otherwise of this one once it is up.
+    let question = args.iter().position(|a| a == "--ask").and_then(|i| args.get(i + 1)).filter(|q| !q.trim().is_empty()).cloned();
+    if let Some(question) = &question
+        && neo_desktop::apollo::send_to(&neo_desktop::apollo::port_file(), question)
+    {
+        return;
+    }
+    let mut app = Apollo::new();
+    app.waiting_question = question.clone();
+    app.draft = question.unwrap_or_default();
+    if let Err(e) = neo::run(app) {
         eprintln!("neo-apollo: {e}");
         std::process::exit(1);
     }
@@ -2193,6 +2249,29 @@ mod tests {
         h.key(Key::Enter, Modifiers::default());
         assert_eq!(h.app().talk.len(), 2, "typed and sent from the keyboard");
         h.render(1.0);
+    }
+
+    #[test]
+    fn a_question_from_outside_is_asked_when_it_can_be() {
+        let (mut a, _scratch) = app("outside");
+        // Ready and free: asked at once, on the page where the answer shows.
+        a.update(Msg::Page(Page::Sources));
+        a.update(Msg::Ask("What dog?".into()));
+        assert_eq!((a.page, a.talk.len(), a.talk[0].text.as_str(), a.waiting_question.clone()), (Page::Ask, 2, "What dog?", None));
+        // With the model not there yet, it waits in the box, and is asked when the model is.
+        a.update(Msg::Ready(Engine::Checking, 0));
+        a.update(Msg::Ask("And the beach?".into()));
+        assert_eq!((a.talk.len(), a.draft.as_str(), a.waiting_question.as_deref()), (2, "And the beach?", Some("And the beach?")));
+        a.update(Msg::Ready(Engine::Ready, 8));
+        assert_eq!((a.talk.len(), a.talk[2].text.as_str(), a.waiting_question.clone(), a.draft.as_str()), (4, "And the beach?", None, ""));
+        // One that comes while another is being answered is asked after it.
+        a.answering = true;
+        a.talk.push(Said { role: Role::User, text: "First".into(), recalled: vec![], listed: vec![] });
+        a.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![], listed: vec![] });
+        a.update(Msg::Ask("Second".into()));
+        assert_eq!((a.talk.len(), a.waiting_question.as_deref()), (6, Some("Second")));
+        a.update(Msg::Answered(Ok(Answer { text: "Done.".into(), recalled: vec![], listed: vec![] })));
+        assert_eq!((a.talk.len(), a.talk[6].text.as_str(), a.talk[5].text.as_str(), a.waiting_question.clone()), (8, "Second", "Done.", None));
     }
 
     #[test]

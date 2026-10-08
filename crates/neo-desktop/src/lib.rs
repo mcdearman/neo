@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+pub mod apollo;
 mod appearance;
 pub mod autostart;
 pub mod fs;

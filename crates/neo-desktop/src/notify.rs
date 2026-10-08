@@ -113,6 +113,18 @@ impl Notification {
     }
 }
 
+/// Sends something written as a notification to whoever noted its port in
+/// `port_file`: the same post that carries notifications to NeoShell
+/// carries questions to Apollo. False if nobody is there.
+pub fn send_to(port_file: &Path, note: &Notification) -> bool {
+    deliver(port_file, note.encode().as_bytes())
+}
+
+/// Whether whoever noted its port in `port_file` is there and answering.
+pub fn answers(port_file: &Path) -> bool {
+    deliver(port_file, PING)
+}
+
 /// Whether NeoShell is running and answering.
 pub fn shell_running() -> bool {
     deliver(&port_file(), PING)

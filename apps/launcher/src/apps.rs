@@ -192,7 +192,7 @@ pub fn launch(app: &AppEntry) -> std::io::Result<()> {
 pub fn icon(app: &AppEntry) -> Option<Image> {
     #[cfg(target_os = "macos")]
     {
-        use std::ffi::{c_char, c_int, CString};
+        use std::ffi::{CString, c_char, c_int};
         unsafe extern "C" {
             fn neo_app_icon(path: *const c_char, side: c_int, rgba: *mut u8) -> c_int;
         }

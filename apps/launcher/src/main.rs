@@ -38,6 +38,9 @@ const WIDTH: f32 = 640.0;
 /// The search field, the rows and the hint under them.
 const HEIGHT: f32 = 66.0 + ROWS as f32 * ROW_H + 44.0;
 const SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘'" } else { "Ctrl+'" };
+/// The bar for asking Apollo is the search field and a line under it.
+const ASK_HEIGHT: f32 = 66.0 + 44.0;
+const ASK_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧A" } else { "Ctrl+Shift+A" };
 
 struct Launcher {
     desktop: Desktop,
@@ -58,6 +61,8 @@ struct Launcher {
     showings: u64,
     screen: Rect,
     error: Option<String>,
+    /// The window is the bar for asking Apollo, and not the list of apps.
+    asking: bool,
     /// Kept alive so the shortcut stays registered.
     hotkeys: Option<GlobalHotKeyManager>,
     /// With no shortcut to bring it back, putting the window away quits.
@@ -72,6 +77,8 @@ enum Msg {
     Launch,
     LaunchAt(usize),
     Toggle,
+    /// Show the bar for asking Apollo, or put it away.
+    ToggleAsk,
     Hide,
     Focus(bool),
     Geometry(WindowGeometry),
@@ -106,7 +113,7 @@ fn save_uses(uses: &HashMap<PathBuf, u32>) {
 
 impl Launcher {
     fn new(register_hotkey: bool, apps: Vec<AppEntry>, uses: HashMap<PathBuf, u32>) -> Self {
-        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), uses, query: String::new(), results: vec![], selected: 0, shown: true, focused: false, showings: 0, screen: Rect::ZERO, error: None, hotkeys: None, register_hotkey, quit: false };
+        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), uses, query: String::new(), results: vec![], selected: 0, asking: false, shown: true, focused: false, showings: 0, screen: Rect::ZERO, error: None, hotkeys: None, register_hotkey, quit: false };
         l.search();
         l
     }
@@ -147,6 +154,19 @@ impl Launcher {
         }
     }
 
+    /// Hands what was typed to Apollo, which comes up with it, and puts the bar away.
+    fn ask(&mut self) {
+        let question = self.query.trim().to_owned();
+        if question.is_empty() {
+            return;
+        }
+        // Tests must not start Apollo.
+        match if cfg!(test) { Ok(()) } else { neo_desktop::apollo::ask(&question) } {
+            Ok(()) => self.hide(),
+            Err(e) => self.error = Some(format!("Could not ask Apollo: {e}")),
+        }
+    }
+
     fn launch(&mut self, row: usize) {
         let Some(app) = self.results.get(row).and_then(|i| self.apps.get(*i)).cloned() else { return };
         match apps::launch(&app) {
@@ -170,7 +190,7 @@ impl App for Launcher {
     }
 
     fn window(&self) -> WindowSettings {
-        WindowSettings { size: Size::new(WIDTH, HEIGHT), min_size: Some(Size::new(WIDTH, HEIGHT)), resizable: false, app_id: Some("org.neo.Launcher".into()), ..Default::default() }
+        WindowSettings { size: Size::new(WIDTH, HEIGHT), min_size: Some(Size::new(WIDTH, ASK_HEIGHT)), resizable: false, app_id: Some("org.neo.Launcher".into()), ..Default::default() }
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -183,7 +203,7 @@ impl App for Launcher {
     fn window_state(&self) -> WindowState {
         // Centred, a little above the middle, where the eye goes first.
         let position = (self.screen != Rect::ZERO).then(|| Point::new((self.screen.x + (self.screen.w - WIDTH) * 0.5).round(), (self.screen.y + self.screen.h * 0.22).round()));
-        WindowState { visible: self.shown, always_on_top: true, bare: true, size: Some(Size::new(WIDTH, HEIGHT)), position, hidden_from_capture: false, passive: false }
+        WindowState { visible: self.shown, always_on_top: true, bare: true, size: Some(Size::new(WIDTH, if self.asking { ASK_HEIGHT } else { HEIGHT })), position, hidden_from_capture: false, passive: false }
     }
 
     fn on_window_geometry(&self, geometry: WindowGeometry) -> Option<Msg> {
@@ -219,10 +239,14 @@ impl App for Launcher {
             return;
         }
         let modifier = if cfg!(target_os = "macos") { HotMods::SUPER } else { HotMods::CONTROL };
-        if let Ok(manager) = GlobalHotKeyManager::new().and_then(|m| m.register(HotKey::new(Some(modifier), Code::Quote)).map(|_| m)) {
+        let (apps, ask) = (HotKey::new(Some(modifier), Code::Quote), HotKey::new(Some(modifier | HotMods::SHIFT), Code::KeyA));
+        if let Ok(manager) = GlobalHotKeyManager::new().and_then(|m| m.register(apps).map(|_| m)) {
+            // The bar for Apollo is a second key; without it the first still works.
+            let _ = manager.register(ask);
+            let ask = ask.id();
             GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
                 if e.state() == HotKeyState::Pressed {
-                    proxy.send(Msg::Toggle);
+                    proxy.send(if e.id() == ask { Msg::ToggleAsk } else { Msg::Toggle });
                 }
             }));
             self.hotkeys = Some(manager);
@@ -251,19 +275,30 @@ impl App for Launcher {
                 self.search();
             }
             Msg::Move(by) => {
-                if !self.results.is_empty() {
+                if !self.results.is_empty() && !self.asking {
                     self.selected = (self.selected as isize + by).rem_euclid(self.results.len() as isize) as usize;
                 }
             }
+            Msg::Launch if self.asking => self.ask(),
             Msg::Launch => self.launch(self.selected),
             Msg::LaunchAt(row) => self.launch(row),
+            Msg::ToggleAsk => {
+                // The same key puts it away; from the list of apps, it turns the window into the bar.
+                if self.shown && self.asking {
+                    self.hide();
+                } else {
+                    self.show();
+                    self.asking = true;
+                }
+            }
             Msg::Toggle => {
-                if self.shown {
+                if self.shown && !self.asking {
                     self.hide();
                 } else {
                     // Pick up apps installed since the last time.
                     self.apps = apps::discover();
                     self.show();
+                    self.asking = false;
                 }
             }
             Msg::Hide => self.hide(),
@@ -286,8 +321,18 @@ impl App for Launcher {
 
     fn view(&self) -> Element<Msg> {
         // A new key each showing gives the field focus again, with its text selected away.
-        let field = text_input("Search apps", self.query.clone()).on_input(Msg::Query).on_submit(Msg::Launch).on_cancel(Msg::Hide).on_arrow(|by| Msg::Move(by as isize)).autofocus(true);
-        let search = row().spacing(12.0).align(Align::Center).width(Length::Fill).padding([18.0, 12.0]).push(icon(icons::SEARCH).size(20.0).tone(Tone::Muted)).push(Element::from(field).key(self.showings));
+        let field = text_input(if self.asking { "Ask Apollo" } else { "Search apps" }, self.query.clone()).on_input(Msg::Query).on_submit(Msg::Launch).on_cancel(Msg::Hide).on_arrow(|by| Msg::Move(by as isize)).autofocus(true);
+        let glyph = if self.asking { icon(icons::SPARKLES).size(20.0).tone(Tone::Accent) } else { icon(icons::SEARCH).size(20.0).tone(Tone::Muted) };
+        let search = row().spacing(12.0).align(Align::Center).width(Length::Fill).padding([18.0, 12.0]).push(glyph).push(Element::from(field).key(self.showings));
+        // Asking Apollo, the window is the field and a line under it; the
+        // answer comes in Apollo's own window.
+        if self.asking {
+            let hint = match &self.error {
+                Some(e) => text(e.clone()).role(TextRole::Caption).tone(Tone::Bad),
+                None => text(format!("↵ ask, and Apollo opens with the answer   esc close   {ASK_SHORTCUT} show or hide")).role(TextRole::Caption).tone(Tone::Faint),
+            };
+            return container(column().width(Length::Fill).height(Length::Fill).push(search).push(Divider::horizontal()).push(container(hint).padding([18.0, 10.0]).width(Length::Fill))).surface(Surface::Card).radius(16.0).width(Length::Fill).height(Length::Fill).into();
+        }
 
         let loose = !self.query.trim().is_empty() && self.results.first().is_some_and(|i| fuzzy::score(&self.query, &self.apps[*i].name).0 <= fuzzy::LOOSE + 10_000);
         let mut list = column().spacing(2.0).width(Length::Fill).padding([8.0, 6.0]);
@@ -297,13 +342,7 @@ impl App for Launcher {
                 Some(image) => picture(image).width(30.0).height(30.0).into(),
                 None => container(icon(icons::APP_WINDOW).size(20.0).tone(Tone::Muted)).width(30.0).height(30.0).center().into(),
             };
-            let content = row()
-                .spacing(12.0)
-                .align(Align::Center)
-                .width(Length::Fill)
-                .push(picture_or_glyph)
-                .push(text(app.name.clone()).role(TextRole::Strong).no_wrap().width(Length::Fill))
-                .push(text(app.place.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap());
+            let content = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(picture_or_glyph).push(text(app.name.clone()).role(TextRole::Strong).no_wrap().width(Length::Fill)).push(text(app.place.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap());
             list = list.push(Button::new(content).kind(ButtonKind::Ghost).selected(row_index == self.selected).padding([12.0, 0.0]).width(Length::Fill).height(ROW_H - 2.0).align_x(Align::Start).on_press(Msg::LaunchAt(row_index)));
         }
         if self.results.is_empty() {
@@ -321,12 +360,7 @@ impl App for Launcher {
         };
         let footer = container(hint).padding([18.0, 10.0]).width(Length::Fill);
 
-        container(column().width(Length::Fill).height(Length::Fill).push(search).push(Divider::horizontal()).push(container(list).width(Length::Fill).height(Length::Fill)).push(Divider::horizontal()).push(footer))
-            .surface(Surface::Card)
-            .radius(16.0)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        container(column().width(Length::Fill).height(Length::Fill).push(search).push(Divider::horizontal()).push(container(list).width(Length::Fill).height(Length::Fill)).push(Divider::horizontal()).push(footer)).surface(Surface::Card).radius(16.0).width(Length::Fill).height(Length::Fill).into()
     }
 }
 
@@ -359,6 +393,9 @@ fn main() {
     keep_at_startup();
     let mut app = Launcher::new(true, apps::discover(), load_uses());
     app.shown = !args.iter().any(|a| a == "--hidden");
+    // `neo-launcher --ask` opens as the bar for asking Apollo: for a window
+    // manager's own key binding, where this cannot bind one itself.
+    app.asking = args.iter().any(|a| a == "--ask");
     if let Err(e) = neo::run(app) {
         eprintln!("neo-launcher: {e}");
         std::process::exit(1);
@@ -382,6 +419,15 @@ fn snapshots(dir: PathBuf) {
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());
     }
+    // The bar for asking Apollo.
+    let mut app = Launcher::new(false, vec![], HashMap::new());
+    app.desktop.appearance.scheme = neo_desktop::SchemePref::Dark;
+    app.asking = true;
+    app.update(Msg::Query("which photos show a girl with pink hair?".into()));
+    let mut h = Harness::new(app, Size::new(WIDTH, ASK_HEIGHT)).expect("GPU");
+    let path = dir.join("launcher-ask.png");
+    h.save_png(&path, 2.0).expect("write png");
+    println!("wrote {}", path.display());
 }
 
 #[cfg(test)]
@@ -398,6 +444,40 @@ mod tests {
 
     fn names(l: &Launcher) -> Vec<&str> {
         l.results.iter().map(|i| l.apps[*i].name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_other_key_turns_the_window_into_a_bar_for_asking_apollo() {
+        let mut l = launcher();
+        l.update(Msg::Hide);
+        l.quit = false;
+        l.update(Msg::ToggleAsk);
+        assert!(l.shown && l.asking);
+        assert_eq!(l.window_state().size, Some(Size::new(WIDTH, ASK_HEIGHT)), "only the field and a line, not the list of apps");
+        // What is typed is not a search for apps, and nothing is asked with nothing typed.
+        l.update(Msg::Query("which photos show a dog?".into()));
+        l.update(Msg::Move(1));
+        assert_eq!(l.selected, 0);
+        let mut h = neo::testing::Harness::new(l, Size::new(WIDTH, ASK_HEIGHT)).unwrap();
+        h.render(1.0);
+        let mut l = std::mem::replace(h.app_mut(), launcher());
+        l.update(Msg::Query("   ".into()));
+        l.update(Msg::Launch);
+        assert!(l.shown, "nothing to ask: it stays");
+        l.update(Msg::Query("which photos show a dog?".into()));
+        l.update(Msg::Launch);
+        assert!(!l.shown && l.error.is_none(), "asked, it is put away and Apollo takes over");
+        // Its key again puts it away; the apps' key from it brings the list, and back.
+        l.quit = false;
+        l.update(Msg::ToggleAsk);
+        l.update(Msg::ToggleAsk);
+        assert!(!l.shown);
+        l.quit = false;
+        l.update(Msg::ToggleAsk);
+        l.update(Msg::Toggle);
+        assert!(l.shown && !l.asking && l.window_state().size == Some(Size::new(WIDTH, HEIGHT)));
+        l.update(Msg::ToggleAsk);
+        assert!(l.shown && l.asking && l.query.is_empty());
     }
 
     #[test]
