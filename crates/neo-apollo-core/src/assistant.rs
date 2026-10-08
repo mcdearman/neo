@@ -380,9 +380,10 @@ pub fn ask(mut store: Option<&mut Store>, model: &dyn Model, earlier: &[Turn], q
     Ok(Answer { text, recalled, listed })
 }
 
-/// Whether an answer has words in it, and is not only marks or nothing.
+/// Whether an answer has a word in it, and is not only marks or nothing.
+/// One word is an answer: "Paris", or one that was stopped as it began.
 fn says_something(answer: &str) -> bool {
-    answer.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count() >= 2
+    answer.split_whitespace().any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
 }
 
 /// What was found, in its own words, for when the model gave no answer.
@@ -550,7 +551,8 @@ mod tests {
     #[test]
     fn a_model_that_answers_with_nothing_is_stood_in_for() {
         assert!(says_something("It is in Documents.") && says_something("Paris, France"));
-        assert!(!says_something("```") && !says_something("") && !says_something(" . \n ") && !says_something("[1]") && !says_something("Ok"));
+        assert!(says_something("Ok") && says_something("You"));
+        assert!(!says_something("```") && !says_something("") && !says_something(" . \n ") && !says_something("[1]") && !says_something("a"));
         let m = |text: &str| Memory { id: 1, kind: Kind::Folder, source: Some("/d/v".into()), title: "v".into(), text: text.into(), part: 0, created: 0, light: false };
         assert_eq!(said_plainly(&[], &[Hit { memory: m("A folder that is an Obsidian vault, called v, in ~/Documents."), distance: 0.3 }]), "Here is what I found. A folder that is an Obsidian vault, called v, in ~/Documents.");
         assert_eq!(said_plainly(&[m("One."), m("Two.\nMore.")], &[]), "Here is what I found. One. Two.");
