@@ -209,18 +209,27 @@ impl neo::Widget<Msg> for VideoMark {
     }
 
     fn draw(&self, cx: &mut neo::DrawCx) {
+        use neo::ThemeCx;
         let b = cx.bounds();
+        let theme = *cx.theme();
+        let p = theme.palette();
         self.picture[0].draw(cx);
         // Over the frame, which is drawn after the shapes of its own layer.
         cx.scene.push_layer();
-        cx.scene.fill(b, 5.0, neo::Color::TRANSPARENT, Some((1.5, neo::Color::BLACK.with_alpha(0.55))));
+        // The frame's edge, square as the frame is.
+        cx.scene.fill(b, 0.0, neo::Color::TRANSPARENT, Some((1.0, p.line)));
+        // The play sign as Neo's own primary button: the accent, with the
+        // sign in the colour that goes on it.
+        let side = 30.0;
         let centre = b.center();
-        let disc = neo::Rect::new(centre.x - 15.0, centre.y - 15.0, 30.0, 30.0);
-        cx.scene.fill(disc, 15.0, neo::Color::BLACK.with_alpha(0.6), Some((1.0, neo::Color::WHITE.with_alpha(0.85))));
+        let badge = neo::Rect::new((centre.x - side * 0.5).round(), (centre.y - side * 0.5).round(), side, side);
+        let mut paint = theme.paint(Surface::Accent);
+        paint.border = None;
+        cx.scene.paint(badge, theme.small_radius() + 2.0, &paint);
         if let Some(glyph) = &self.glyph {
             let g = glyph.size();
-            // A play sign looks centred a little to the right of where it is.
-            cx.scene.text(glyph, Point::new((centre.x - g.w * 0.5 + 1.0).round(), (centre.y - g.h * 0.5).round()), neo::Color::WHITE);
+            // Centred on the badge itself, by the sign's own box.
+            cx.scene.text(glyph, Point::new(badge.x + (side - g.w) * 0.5, badge.y + (side - g.h) * 0.5), paint.content);
         }
     }
 
