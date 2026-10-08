@@ -44,6 +44,12 @@ const THUMBS_KEPT: usize = 400;
 /// The pictures under an answer: how large, and how many at most.
 const TILE: (f32, f32) = (108.0, 72.0);
 const TILES: usize = 6;
+/// How many listed-only files a question may look at before answering,
+/// and how many a search sends to be looked at behind it.
+const LOOK_FOR_ANSWER: usize = 6;
+const LOOK_FOR_SEARCH: usize = 12;
+/// How many files the Activity page's list goes back.
+const LOGGED: usize = 60;
 /// How wide a model's menu button is in Sources.
 const MODEL_W: f32 = 230.0;
 /// How tall the cloud is, and the graph that takes its place.
@@ -66,6 +72,8 @@ enum Page {
     Ask,
     Memory,
     Sources,
+    /// What Apollo is doing: how the reading is going, and what it has taken in.
+    Activity,
 }
 
 /// Whether the model is there to be used.
@@ -102,6 +110,27 @@ struct Shown {
     heading: String,
     /// Each with how near it is to what was asked, if something was.
     items: Vec<(Memory, Option<f32>)>,
+}
+
+/// Something done with a file.
+#[derive(Clone, Debug, PartialEq)]
+struct Logged {
+    path: PathBuf,
+    /// Looked at, as against listed or read as text.
+    looked: bool,
+    seconds: f32,
+    /// Why it could not be done, if it could not.
+    trouble: Option<String>,
+}
+
+/// What a reading is of.
+enum Reading {
+    /// Everything in the folders.
+    All,
+    /// What the system said changed.
+    Changed(Vec<PathBuf>),
+    /// Files that are only listed, to be looked at now.
+    LookAt(Vec<PathBuf>),
 }
 
 /// Asks the user to prove who they are; an error says why they did not.
@@ -175,6 +204,15 @@ struct Apollo {
     choosing: Option<(usize, Point)>,
     /// Which model's name is being typed, for one that is not here yet.
     typing: Option<usize>,
+    /// What has been done with files lately, newest last, for the Activity page.
+    log: std::collections::VecDeque<Logged>,
+    /// The file being worked on, since when, and whether it is being looked at.
+    working: Option<(PathBuf, std::time::Instant, bool)>,
+    /// How many files a question is looking at before it answers: which, of how many.
+    looking: Option<(usize, usize)>,
+    /// Files a search turned up only listed that were sent to be looked at,
+    /// so that none is sent twice.
+    asked_after: Vec<PathBuf>,
     /// Files the system says have changed, waiting to be read.
     pending: Vec<PathBuf>,
     /// Tells of changes in the folders that are read. Dropped to stop.
@@ -250,6 +288,9 @@ enum Msg {
     OtherModel(usize, bool),
     /// The system says these files or folders have changed.
     Changed(Vec<PathBuf>),
+    /// A question is looking at a file before it answers: which, of how many.
+    Looking(usize, usize),
+    LookAhead(bool),
     AskReset,
     CancelReset,
     /// Forget everything and read it all again with the model now chosen.
@@ -301,6 +342,17 @@ fn listen(roots: &[PathBuf], heard: impl Fn(Vec<PathBuf>) -> bool + Send + 'stat
         }
     });
     Some(watcher)
+}
+
+/// A length of time said roughly: "under a minute", "about 12 minutes", "about 3 hours".
+fn how_long(seconds: f32) -> String {
+    let minutes = (seconds / 60.0).round() as u32;
+    match minutes {
+        0 => "under a minute".into(),
+        1 => "about a minute".into(),
+        2..=89 => format!("about {minutes} minutes"),
+        _ => format!("about {} hours", ((minutes as f32) / 60.0).round() as u32),
+    }
 }
 
 /// A number with its noun: "1 memory", "1,204 memories".
@@ -405,6 +457,10 @@ impl Apollo {
             choosing: None,
             typing: None,
             pending: vec![],
+            log: Default::default(),
+            working: None,
+            looking: None,
+            asked_after: vec![],
             watcher: None,
             stale: None,
             asking_reset: false,
@@ -604,17 +660,30 @@ impl Apollo {
         // Apollo draws on the memory only once it has been unlocked. What
         // it is told and asked is written down either way.
         let (open, keep) = (self.store.is_some(), self.settings.remember_conversations);
-        let aware = assistant::Aware { reading: (self.reading && self.progress.total > 0).then_some((self.progress.done, self.progress.total)) };
+        let aware = assistant::Aware { reading: (self.reading && self.progress.total > 0).then_some((self.progress.done, self.progress.total)), look: LOOK_FOR_ANSWER };
         self.work(move |send| {
             let mut store = memory.and_then(|(db, key)| Store::open_for(&db, &key, &*model).ok());
             if let Some(note) = assistant::told_to_remember(&question) {
                 let kept = store.as_mut().ok_or_else(|| "The memory could not be opened.".to_owned()).and_then(|s| assistant::keep_note(s, &*model, note));
                 return send(Msg::Answered(kept.map(|_| Answer { text: "I'll remember that.".into(), recalled: vec![], listed: vec![] })));
             }
-            let answer = assistant::ask(store.as_ref().filter(|_| open), &*model, &earlier, &question, &aware, &mut |piece| {
-                send(Msg::Piece(piece.to_owned()));
-                !stop.load(Ordering::Relaxed)
-            });
+            // Two things are heard from it as it goes, through the one way out.
+            let out = std::cell::RefCell::new(&mut *send);
+            let answer = assistant::ask(
+                store.as_mut().filter(|_| open),
+                &*model,
+                &earlier,
+                &question,
+                &aware,
+                &mut |i, n| {
+                    (out.borrow_mut())(Msg::Looking(i, n));
+                    !stop.load(Ordering::Relaxed)
+                },
+                &mut |piece| {
+                    (out.borrow_mut())(Msg::Piece(piece.to_owned()));
+                    !stop.load(Ordering::Relaxed)
+                },
+            );
             if let (Ok(a), true, Some(store)) = (&answer, keep, store.as_mut())
                 && !a.text.is_empty()
             {
@@ -657,6 +726,7 @@ impl Apollo {
         self.trail.clear();
         (self.history, self.at) = (vec![vec![]], 0);
         self.thumbs.clear();
+        self.asked_after.clear();
         self.query.clear();
     }
 
@@ -742,6 +812,7 @@ impl Apollo {
         }
         self.store = Some(store);
         self.picture_the_list();
+        self.look_into_the_list();
     }
 
     /// Has small pictures made of the photos and videos listed that have
@@ -796,7 +867,7 @@ impl Apollo {
 
     /// Looks through all the folders for what is new, changed or gone.
     fn read(&mut self) {
-        self.read_some(None);
+        self.read_some(Reading::All);
     }
 
     /// Reads what the system has said changed, if nothing stands in the way.
@@ -804,13 +875,27 @@ impl Apollo {
     fn catch_up(&mut self) {
         if !self.pending.is_empty() && !self.reading && self.settings.read_automatically && self.memory().is_some() {
             let changed = std::mem::take(&mut self.pending);
-            self.read_some(Some(changed));
+            self.read_some(Reading::Changed(changed));
         }
     }
 
-    /// Brings the memory up to date: with everything in the folders, or
-    /// with just the paths in `only`.
-    fn read_some(&mut self, only: Option<Vec<PathBuf>>) {
+    /// Sends the photos and videos in the list that are only listed to be
+    /// looked at, so that a search by what they show can find them; the
+    /// list is filled again as they come in.
+    fn look_into_the_list(&mut self) {
+        if self.reading || (self.trail.is_empty() && self.asked.is_none()) {
+            return;
+        }
+        let files: Vec<PathBuf> = self.shown.items.iter().filter(|(m, _)| m.light).filter_map(|(m, _)| m.source.clone()).filter(|p| !self.asked_after.contains(p)).take(LOOK_FOR_SEARCH).collect();
+        if !files.is_empty() {
+            self.asked_after.extend(files.iter().cloned());
+            self.read_some(Reading::LookAt(files));
+        }
+    }
+
+    /// Brings the memory up to date: with everything in the folders, with
+    /// what changed, or by looking at some files that are only listed.
+    fn read_some(&mut self, what: Reading) {
         let Some((db, key)) = self.memory() else { return };
         if self.reading {
             return;
@@ -821,13 +906,13 @@ impl Apollo {
             return;
         }
         // A full look finds whatever changes were waiting.
-        if only.is_none() {
+        if matches!(what, Reading::All) {
             self.pending.clear();
         }
         self.reading = true;
         self.stop_reading = Arc::default();
         self.progress = Progress::default();
-        let (model, roots, stop, short) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory);
+        let (model, roots, stop, short, ahead) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory, self.settings.look_ahead);
         self.work(move |send| {
             let mut report = |p: &Progress| {
                 send(Msg::Progress(p.clone()));
@@ -838,15 +923,34 @@ impl Apollo {
                 }
                 !stop.load(Ordering::Relaxed)
             };
-            let done = match (Store::open_for(&db, &key, &*model), &only) {
-                (Ok(mut store), None) => index::run(&mut store, &*model, &roots, &mut report),
-                (Ok(mut store), Some(changed)) => index::update(&mut store, &*model, &roots, changed, &mut report),
+            let done = match (Store::open_for(&db, &key, &*model), what) {
+                (Ok(mut store), Reading::All) => index::run(&mut store, &*model, &roots, ahead, &mut report),
+                (Ok(mut store), Reading::Changed(changed)) => index::update(&mut store, &*model, &roots, &changed, ahead, &mut report),
+                (Ok(mut store), Reading::LookAt(files)) => index::look_at_files(&mut store, &*model, files, &mut report),
                 (Err(e), _) => Progress { trouble: Some(e), ..Progress::default() },
             };
             // Done for now: give the memory of the model that sees back.
             model.rest();
             send(Msg::ReadDone(done));
         });
+    }
+
+    /// Notes what was done with the file that was being worked on, now
+    /// that the next has begun or the reading is over.
+    fn log_done(&mut self, failed_before: usize, p: &Progress) {
+        if let Some((path, since, looked)) = self.working.take() {
+            let trouble = (p.failed > failed_before).then(|| p.trouble.clone().unwrap_or_default());
+            self.log.push_back(Logged { path, looked, seconds: since.elapsed().as_secs_f32(), trouble });
+            while self.log.len() > LOGGED {
+                self.log.pop_front();
+            }
+        }
+    }
+
+    /// About how long looking at one file takes, from those looked at lately.
+    fn seconds_a_look(&self) -> Option<f32> {
+        let looks: Vec<f32> = self.log.iter().filter(|l| l.looked && l.trouble.is_none()).map(|l| l.seconds).collect();
+        (!looks.is_empty()).then(|| looks.iter().sum::<f32>() / looks.len() as f32)
     }
 
     /// Has the system tell of changes in the folders that are read, so
@@ -866,7 +970,7 @@ impl Apollo {
             Engine::Trouble(_) => "The model is not running".into(),
             Engine::Missing(_) => "The model needs downloading".into(),
             Engine::Pulling { .. } => "Downloading the model…".into(),
-            Engine::Ready if self.reading && self.progress.total > 0 => format!("Reading {} of {}", (self.progress.done + 1).min(self.progress.total), self.progress.total),
+            Engine::Ready if self.reading && self.progress.total > 0 => format!("{} {} of {}", if self.progress.looking { "Looking at" } else { "Listing" }, (self.progress.done + 1).min(self.progress.total), self.progress.total),
             Engine::Ready if self.reading => "Looking through folders…".into(),
             Engine::Ready if self.stale.is_some() => "Memory is another model's".into(),
             Engine::Ready if self.held => "Paused: memory is short".into(),
@@ -883,6 +987,7 @@ impl App for Apollo {
             Page::Ask => "Apollo".into(),
             Page::Memory => "Memory · Apollo".into(),
             Page::Sources => "Sources · Apollo".into(),
+            Page::Activity => "Activity · Apollo".into(),
         }
     }
 
@@ -902,7 +1007,7 @@ impl App for Apollo {
         let ready = self.ready == Engine::Ready;
         vec![
             Menu::new("File").push(MenuEntry::new("New Conversation", Msg::NewTalk).shortcut(Shortcut::command("n")).enabled(!self.talk.is_empty() && !self.answering)).separator().push(MenuEntry::new("Add Folder…", Msg::AddFolder)).push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading)),
-            Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))),
+            Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))).push(MenuEntry::new("Activity", Msg::Page(Page::Activity)).shortcut(Shortcut::command("4"))),
             Menu::new("Memory")
                 .push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking))
                 .push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some()))
@@ -976,6 +1081,7 @@ impl App for Apollo {
                 self.send();
             }
             Msg::Piece(piece) => {
+                self.looking = None;
                 if let Some(last) = self.talk.last_mut().filter(|s| s.role == Role::Assistant && self.answering) {
                     last.text.push_str(&piece);
                     self.said += 1;
@@ -986,6 +1092,7 @@ impl App for Apollo {
                     return;
                 }
                 self.answering = false;
+                self.looking = None;
                 self.said += 1;
                 let Some(last) = self.talk.last_mut() else { return };
                 match answer {
@@ -1096,9 +1203,19 @@ impl App for Apollo {
             }
 
             Msg::Read => self.read(),
+            Msg::Looking(i, n) => self.looking = Some((i, n)),
+            Msg::LookAhead(on) => {
+                self.settings.look_ahead = on;
+                self.save_settings();
+                if on {
+                    self.read();
+                }
+            }
             Msg::Progress(p) => {
                 // What has just been read shows up without waiting for the end.
                 let more = p.read != self.progress.read;
+                self.log_done(self.progress.failed, &p);
+                self.working = p.now.clone().map(|path| (path, std::time::Instant::now(), p.looking));
                 self.progress = p;
                 if more && self.page == Page::Memory {
                     self.show();
@@ -1106,6 +1223,7 @@ impl App for Apollo {
             }
             Msg::ReadDone(mut p) => {
                 self.reading = false;
+                self.log_done(self.progress.failed, &p);
                 // Made with another model: said once, with what to do about it.
                 if let Some(why) = p.trouble.take_if(|t| t.starts_with(neo_apollo_core::store::OTHER_MODEL)) {
                     self.stale = Some(why);
@@ -1114,6 +1232,7 @@ impl App for Apollo {
                 self.show();
                 // Whatever changed while that was going on.
                 self.catch_up();
+                self.look_into_the_list();
             }
             Msg::Held => self.held = true,
             Msg::ModelDraft(i, name) => {
@@ -1211,6 +1330,7 @@ impl Apollo {
             Page::Ask => self.ask_page(),
             Page::Memory => self.memory_page(),
             Page::Sources => self.sources_page(),
+            Page::Activity => self.activity_page(),
         };
         let page = split(self.sidebar(), main);
         // The menu of models hangs over everything, from the control that opened it.
@@ -1274,7 +1394,8 @@ impl Apollo {
     fn sidebar(&self) -> Element<Msg> {
         let busy = self.reading || matches!(self.ready, Engine::Checking | Engine::Pulling { .. });
         let tone = if matches!(self.ready, Engine::Trouble(_) | Engine::Missing(_)) { Tone::Warn } else { Tone::Muted };
-        let status = row().spacing(8.0).align(Align::Center).padding([0.0, 10.0]).push(icon(if busy { icons::REFRESH_CW } else { icons::SPARKLES }).size(13.0).tone(tone)).push(text(self.status()).role(TextRole::Caption).tone(tone).no_wrap());
+        // What it is doing, which is also the way to the page that says more.
+        let status = Button::new(row().spacing(8.0).align(Align::Center).push(icon(if busy { icons::REFRESH_CW } else { icons::SPARKLES }).size(13.0).tone(tone)).push(text(self.status()).role(TextRole::Caption).tone(tone).no_wrap())).kind(ButtonKind::Ghost).selected(self.page == Page::Activity).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Page(Page::Activity));
         column()
             .spacing(2.0)
             .width(Length::Fill)
@@ -1354,7 +1475,11 @@ impl Apollo {
             return row().width(Length::Fill).push(Space::new(Length::Fill, 0.0)).push(bubble).into();
         }
         let waiting = s.text.is_empty() && self.answering;
-        let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { "Thinking…".to_owned() } else { assistant::plain(&s.text) }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
+        let wait = match self.looking {
+            Some((i, n)) => format!("Looking at {} of {} {} this may be about…", i + 1, n, if n == 1 { "file" } else { "files" }),
+            None => "Thinking…".to_owned(),
+        };
+        let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { wait } else { assistant::plain(&s.text) }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
         // The files the answer was given to draw on, each a picture that shows it in Files.
         let files = assistant::sources(&s.listed, &s.recalled);
         if !files.is_empty() && !(self.answering && std::ptr::eq(s, self.talk.last().unwrap_or(s))) {
@@ -1443,6 +1568,94 @@ impl Apollo {
         }
     }
 
+    /// What Apollo is doing and has done: how the reading stands, why it
+    /// takes the time it does, and the files it has been through lately.
+    fn activity_page(&self) -> Element<Msg> {
+        let p = &self.progress;
+        let mut page = column().spacing(14.0).padding(22.0).width(Length::Fill);
+        page = page.push(text("Activity").role(TextRole::Heading));
+        let how = if self.settings.look_ahead {
+            "Apollo is set to look at every photo and video ahead of time. Listing a file takes a moment; looking at one means showing it to the model that can see, which takes some seconds for each picture and several times that for a video, looked at in a few places along its length. That is what takes the time."
+        } else {
+            "Apollo lists every file by its name, place and date as soon as it finds it, which takes moments, and reads documents in full. A photo or a video is looked at (shown to the model that can see, some seconds each) only when a question or a search turns it up, and it is remembered from then on."
+        };
+        page = page.push(text(how).tone(Tone::Muted).width(Length::Fill));
+
+        // Now.
+        let pace = self.seconds_a_look();
+        let (what, detail) = if self.ready != Engine::Ready {
+            (self.status(), "Nothing is read until the model is running.".to_owned())
+        } else if self.reading {
+            let left = p.total.saturating_sub(p.done);
+            let name = self.working.as_ref().and_then(|(path, _, _)| path.file_name()).map(|n| n.to_string_lossy().into_owned());
+            let mut detail = name.map_or_else(|| "Seeing what is new.".to_owned(), |n| format!("Now: {n}"));
+            if let (true, Some(each)) = (p.looking, pace) {
+                detail.push_str(&format!("  ·  about {:.0} s a file, so {} more", each, how_long(each * left as f32)));
+            }
+            (self.status(), detail)
+        } else if self.held {
+            (self.status(), "Held off while the computer is short of memory, and taken up again when there is room.".to_owned())
+        } else {
+            ("Nothing under way".to_owned(), format!("Last time: {}, {} listed{}.", count(p.read as u32, "file read", "files read"), p.listed, if p.failed > 0 { format!(", {} could not be", p.failed) } else { String::new() }))
+        };
+        let action: Element<Msg> = if self.reading { Button::new(text("Stop")).on_press(Msg::StopReading).into() } else { Button::new(text("Read Now")).on_press_maybe((self.ready == Engine::Ready).then_some(Msg::Read)).into() };
+        let mut now = column().spacing(8.0).width(Length::Fill).push(setting(&what, &detail, action));
+        if self.reading && p.total > 0 {
+            now = now.push(progress_bar(p.done as f32 / p.total as f32).width(Length::Fill));
+        }
+        page = page.push(container(now).surface(Surface::Well).radius(12.0).padding([16.0, 14.0]).width(Length::Fill));
+
+        // What is in the memory, which is only said once it is unlocked.
+        page = page.push(section("In the memory"));
+        if self.store.is_some() {
+            let seen = self.stats.of(Kind::Photo) + self.stats.of(Kind::Video);
+            let figures = [
+                (count(self.stats.files, "file", "files"), "taken in"),
+                (count(seen.saturating_sub(self.stats.light), "photo or video", "photos and videos"), "looked at"),
+                (count(self.stats.light, "photo or video", "photos and videos"), "listed, not looked at yet"),
+                (count(self.stats.of(Kind::Document), "passage", "passages"), "of documents read"),
+                (count(self.stats.words, "word", "words"), "they are about"),
+            ];
+            let mut tiles = row().spacing(10.0).width(Length::Fill);
+            for (figure, what) in figures {
+                tiles = tiles.push(container(column().spacing(2.0).push(text(figure).role(TextRole::Strong).no_wrap()).push(text(what).role(TextRole::Caption).tone(Tone::Muted))).surface(Surface::Well).radius(10.0).padding([12.0, 10.0]).width(Length::Fill));
+            }
+            page = page.push(tiles);
+            if self.stats.light > 0 && !self.settings.look_ahead {
+                let all = pace.map_or(String::new(), |each| format!(" At the pace so far that would take {}.", how_long(each * self.stats.light as f32)));
+                page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(format!("To look at the rest now rather than as they are asked after, turn on Look at everything up front.{all}")).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Look at Everything")).on_press(Msg::LookAhead(true))));
+            }
+        } else {
+            page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("How much has been taken in is part of the memory, and shown once it is unlocked.").tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Unlock…")).on_press_maybe((!self.unlocking).then_some(Msg::Unlock))));
+        }
+        for tool in &p.needs {
+            page = page.push(notice(Tone::Warn, format!("Some files are being left for want of {tool}: cargo xtask deps --install")));
+        }
+
+        // Lately, newest first.
+        page = page.push(section("Lately"));
+        if self.log.is_empty() {
+            page = page.push(text("Nothing has been read since Apollo was opened.").tone(Tone::Muted));
+        }
+        let mut list = column().spacing(2.0).width(Length::Fill);
+        for done in self.log.iter().rev() {
+            let name = done.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let place = done.path.parent().map(short_path).unwrap_or_default();
+            let photo_or_video = matches!(index::classify(&done.path), Some(index::What::Photo | index::What::Video));
+            let (said, tone) = match (&done.trouble, done.looked, photo_or_video) {
+                (Some(why), _, _) => (format!("Could not be read: {why}"), Tone::Bad),
+                (None, true, _) => (format!("Looked at, {:.0} s", done.seconds.max(1.0)), Tone::Good),
+                (None, false, true) => ("Listed".to_owned(), Tone::Muted),
+                (None, false, false) => ("Read".to_owned(), Tone::Good),
+            };
+            let line =
+                row().spacing(12.0).align(Align::Center).width(Length::Fill).push(icon(neo_desktop::fs::file_icon(&done.path, false)).size(16.0).tone(Tone::Accent)).push(column().spacing(1.0).width(Length::Fill).push(text(name).role(TextRole::Strong).no_wrap()).push(text(place).role(TextRole::Caption).tone(Tone::Faint).no_wrap())).push(text(said).role(TextRole::Caption).tone(tone).no_wrap());
+            let path = done.path.clone();
+            list = list.push(mouse_area(container(line).padding([8.0, 6.0]).width(Length::Fill)).on_press(move || Msg::Reveal(path.clone())));
+        }
+        scrollable(page.push(list)).into()
+    }
+
     fn sources_page(&self) -> Element<Msg> {
         let p = &self.progress;
         let mut page = column().spacing(14.0).padding(22.0).width(Length::Fill);
@@ -1486,6 +1699,11 @@ impl Apollo {
         }
 
         page = page.push(setting("Read by itself", "When Apollo opens, and now and then while it is open. Reading keeps a model of a few gigabytes in memory until it is done; turned off, the folders are read only when you press Read Now.", toggle(self.settings.read_automatically, Msg::ReadAutomatically)));
+        page = page.push(setting(
+            "Look at everything up front",
+            "Photos and videos are listed by name as soon as they are found, which takes moments, and looked at when a question or a search turns them up. Turned on, every one is looked at ahead of time instead: searches by what a picture shows then find everything at once, at the cost of some seconds a picture, with the large model in memory all the while.",
+            toggle(self.settings.look_ahead, Msg::LookAhead),
+        ));
         page = page.push(section("Folders"));
         for (i, f) in self.settings.folders.iter().enumerate() {
             let help = if !f.path.is_dir() {
@@ -1556,7 +1774,7 @@ fn read_folders() -> Result<(), String> {
         return Err(format!("{} must be downloaded first: open Apollo, or run `ollama pull` for each.", missing.join(" and ")));
     }
     let mut store = Store::open_for(&neo_apollo_core::dir().join("memory.db"), &key::database_key()?, &model)?;
-    let done = index::run(&mut store, &model, &settings.roots(), &mut |p| {
+    let done = index::run(&mut store, &model, &settings.roots(), settings.look_ahead, &mut |p: &Progress| {
         if let Some(now) = &p.now {
             println!("[{} of {}] {}", p.done + 1, p.total, now.display());
         }
@@ -1642,7 +1860,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
     type Shot<'a> = (&'a str, neo_desktop::SchemePref, &'a dyn Fn(&mut Apollo));
-    let shots: [Shot; 6] = [
+    let shots: [Shot; 7] = [
         ("apollo-ask", neo_desktop::SchemePref::Light, &|a| {
             a.update(Msg::Unlock);
             a.update(Msg::Suggest("Which photos show a dog on the beach?".into()));
@@ -1660,6 +1878,17 @@ fn snapshots(dir: PathBuf) {
             a.update(Msg::Word("beach".into()));
         }),
         ("apollo-sources", neo_desktop::SchemePref::Light, &|a| a.update(Msg::Page(Page::Sources))),
+        ("apollo-activity", neo_desktop::SchemePref::Dark, &|a| {
+            a.update(Msg::Unlock);
+            a.update(Msg::Page(Page::Activity));
+            let home = neo_desktop::fs::home_dir();
+            for (file, looked, seconds, trouble) in [("Documents/Invoices/March.md", false, 0.1, None), ("Pictures/Trips/IMG_2041.jpg", false, 0.1, None), ("Pictures/Trips/IMG_2057.jpg", true, 8.4, None), ("Movies/Hike.mp4", true, 31.0, None), ("Pictures/old scan.tiff", true, 0.4, Some("It is not a picture that can be read."))] {
+                a.log.push_back(Logged { path: home.join(file), looked, seconds, trouble: trouble.map(str::to_owned) });
+            }
+            a.stats.light = 4;
+            (a.reading, a.working) = (true, Some((home.join("Pictures/Trips/IMG_2110.jpg"), std::time::Instant::now(), true)));
+            a.progress = Progress { done: 46, total: 170, looking: true, read: 12, listed: 124, ..Progress::default() };
+        }),
         ("apollo-models", neo_desktop::SchemePref::Dark, &|a| {
             a.update(Msg::Page(Page::Sources));
             let can = |name: &str, what: &[&str], away: bool| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>(), away);
@@ -2254,6 +2483,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-models-swap-{}", std::process::id())));
     }
 
+    /// A picture the test model takes for a dog on a beach (red), a mountain (green) or the sea (blue).
+    fn paint(path: &Path, colour: [u8; 3]) {
+        image::RgbImage::from_fn(240, 160, |x, y| if x < 8 && y < 8 { image::Rgb(colour) } else { image::Rgb([colour[0] ^ ((x * 7 + y * 13) % 31) as u8, colour[1] ^ ((x * 3 + y * 5) % 29) as u8, colour[2] ^ ((x + y * 11) % 23) as u8]) }).save(path).unwrap();
+    }
+
+    #[test]
+    fn pictures_are_listed_at_once_and_looked_at_when_something_asks_after_them() {
+        let (mut a, scratch) = app("lazy");
+        let folder = scratch.0.join("Trips");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (i, colour) in [[220u8, 40, 40], [40, 220, 40], [40, 40, 220]].into_iter().enumerate() {
+            paint(&folder.join(format!("IMG_{i}.png")), colour);
+        }
+        std::fs::write(folder.join("plan.txt"), "The invoice from the supplier.").unwrap();
+        a.settings.folders = vec![Folder { path: folder.clone(), on: true }];
+        a.update(Msg::Unlock);
+        let photos = a.stats.of(Kind::Photo);
+        // Reading lists the pictures and reads the document; nothing is looked at.
+        a.update(Msg::Read);
+        assert_eq!((a.progress.read, a.progress.listed, a.stats.light, a.stats.of(Kind::Photo)), (1, 3, 3, photos + 3));
+        assert_eq!(a.log.iter().map(|l| (l.path.file_name().unwrap().to_str().unwrap(), l.looked)).collect::<Vec<_>>(), [("plan.txt", false), ("IMG_0.png", false), ("IMG_1.png", false), ("IMG_2.png", false)], "the Activity page's account of it");
+        assert_eq!(a.seconds_a_look(), None);
+        // A search turns them up by name; they are looked at behind it, and the list is of what they show.
+        a.update(Msg::Page(Page::Memory));
+        a.update(Msg::Query("IMG trips".into()));
+        a.update(Msg::Search);
+        assert_eq!(a.stats.light, 0, "the three it turned up were looked at");
+        assert!(a.log.iter().filter(|l| l.looked).count() == 3 && a.seconds_a_look().is_some());
+        a.update(Msg::Query("a dog on the beach".into()));
+        a.update(Msg::Search);
+        assert_eq!((a.shown.items[0].0.text.as_str(), a.shown.items[0].0.light), ("A dog running on a beach.", false), "and so found by what they show");
+        assert_eq!(a.asked_after.len(), 3, "each sent once");
+        // A question looks at what it turns up before answering, and says so while it does.
+        // (With no search showing: one that is would have it looked at for its list.)
+        a.update(Msg::Clear);
+        paint(&folder.join("IMG_9.png"), [220, 40, 40]);
+        a.update(Msg::Changed(vec![folder.join("IMG_9.png")]));
+        assert_eq!((a.progress.listed, a.stats.light), (1, 1), "a new picture is listed as it arrives");
+        a.update(Msg::Looking(0, 2));
+        assert_eq!(a.looking, Some((0, 2)));
+        a.update(Msg::Suggest("What photos do I have from this year?".into()));
+        assert_eq!((a.stats.light, a.looking, a.answering), (0, None, false));
+        assert!(a.talk.last().unwrap().listed.iter().all(|m| !m.light));
+        // Chosen, everything is looked at up front, and what arrives after is too.
+        a.settings_file = Some(scratch.0.join("settings"));
+        paint(&folder.join("IMG_10.png"), [40, 220, 40]);
+        a.update(Msg::LookAhead(true));
+        assert_eq!((a.stats.light, a.progress.looking, Settings::load_from(&scratch.0.join("settings")).look_ahead), (0, true, true));
+        paint(&folder.join("IMG_11.png"), [40, 40, 220]);
+        a.update(Msg::Changed(vec![folder.join("IMG_11.png")]));
+        assert_eq!((a.stats.light, a.progress.read), (0, 1));
+        // The page that tells of all this is reached from the status in the corner, and draws locked or not.
+        assert_eq!(a.status(), "Up to date");
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        h.click(Point::new(80.0, WINDOW.h - 34.0));
+        assert_eq!((h.app().page, h.title().as_str()), (Page::Activity, "Activity · Apollo"));
+        h.render(1.0);
+        h.app_mut().update(Msg::Lock);
+        h.render(1.0);
+    }
+
     #[test]
     fn the_system_tells_of_a_file_that_changes() {
         let dir = std::env::temp_dir().join(format!("neo-apollo-listen-{}", std::process::id()));
@@ -2277,6 +2568,7 @@ mod tests {
     #[test]
     fn numbers_and_snippets_read_well() {
         assert_eq!((count(1, "memory", "memories"), count(0, "word", "words"), count(1204, "memory", "memories"), count(1_000_000, "file", "files")), ("1 memory".into(), "0 words".into(), "1,204 memories".into(), "1,000,000 files".into()));
+        assert_eq!((how_long(20.0), how_long(70.0), how_long(700.0), how_long(3.0 * 3600.0)), ("under a minute".into(), "about a minute".into(), "about 12 minutes".into(), "about 3 hours".into()));
         assert_eq!(snippet("one\n  two   three", 40), "one two three");
         assert_eq!(snippet("abcdefghij", 6), "abcde…");
         assert_eq!(short_path(&neo_desktop::fs::home_dir().join("Pictures/a.png")), "~/Pictures/a.png");

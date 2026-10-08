@@ -322,6 +322,35 @@ fn learn_words(store: &mut Store, model: &dyn Model, words: &[String]) -> Result
     Ok(())
 }
 
+/// What a listed-only file's stamp ends with.
+const LISTED: &str = "-l";
+
+/// Lists a photo or a video without looking at it: a memory of its name,
+/// its folder and its date, which is enough to find it by those and to
+/// count it among the photos from last month. It costs one embedding,
+/// where looking costs a model of several gigabytes some seconds; so a
+/// folder of thousands is listed in the time a dozen would be looked at.
+/// Looking comes later: when something asks after it, or for everything
+/// at once if that was chosen.
+pub fn list_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<Outcome, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let kind = match classify(path) {
+        Some(What::Photo) => Kind::Photo,
+        Some(What::Video) => Kind::Video,
+        _ => return index_file(store, model, path),
+    };
+    let (title, folder) = (name(path), path.parent().and_then(Path::file_name).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default());
+    let what = if kind == Kind::Photo { "A photo" } else { "A video" };
+    let text = format!("{what} that has not been looked at yet, called {title}, in the folder {folder}.");
+    // What its name and folder say of it: "Neo Recording", "Trips".
+    let about = words::clean_all(words::terms(&format!("{} {folder}", path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())), 6);
+    store.forget_source(path)?;
+    let id = remember(store, model, &New { kind, source: Some(path), title: &title, text: &text, part: 0, created: modified(&meta), words: &about })?;
+    store.mark_light(id)?;
+    store.set_file(path, &format!("{}{LISTED}", stamp(&meta)), 1)?;
+    Ok(Outcome::Read(1))
+}
+
 /// Reads one file into the memory, in place of whatever was remembered of
 /// it before.
 pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<Outcome, String> {
@@ -385,8 +414,11 @@ pub struct Progress {
     pub total: usize,
     /// The file being read.
     pub now: Option<PathBuf>,
-    /// Files read this run, and those that could not be.
+    /// Files read this run (documents read, pictures and videos looked
+    /// at), and those that could not be.
     pub read: usize,
+    /// Pictures and videos that were listed this run without being looked at.
+    pub listed: usize,
     pub failed: usize,
     /// Files forgotten because they are gone, or their folder is no longer read.
     pub forgotten: usize,
@@ -394,6 +426,9 @@ pub struct Progress {
     pub needs: Vec<&'static str>,
     /// The last thing to go wrong, and with what.
     pub trouble: Option<String>,
+    /// Pictures and videos are being looked at, which is the slow part,
+    /// and not merely listed.
+    pub looking: bool,
 }
 
 /// Forgets files that are gone, or are not under any of `roots` any more.
@@ -412,25 +447,39 @@ pub fn sweep(store: &mut Store, roots: &[PathBuf]) -> Result<usize, String> {
 }
 
 /// Brings the memory up to date with `roots`: forgets what is gone and
-/// reads what is new or changed. `report` hears how it is going before
-/// each file and at the end; returning false from it stops the run there,
-/// to be taken up again later.
-pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+/// takes in what is new or changed. Everything is listed first, which is
+/// quick; with `look`, every photo and video is then looked at as well,
+/// which is not. `report` hears how it is going before each file and at
+/// the end; returning false from it stops the run there, to be taken up
+/// again later.
+pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], look: bool, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
     let mut p = Progress::default();
     match sweep(store, roots) {
         Ok(n) => p.forgotten = n,
         Err(e) => p.trouble = Some(e),
     }
-    read_files(store, model, walk(roots), p, report)
+    let files = walk(roots);
+    let mut stopped = false;
+    let p = read_files(store, model, files.clone(), p, false, &mut |p| {
+        stopped = !report(p);
+        !stopped
+    });
+    if !look || stopped {
+        return p;
+    }
+    // Then the slow part, newest first, as the files were found.
+    let waiting: Vec<PathBuf> = files.into_iter().filter(|f| matches!(classify(f), Some(What::Photo | What::Video))).collect();
+    read_files(store, model, waiting.clone(), Progress { done: p.total - waiting.len(), ..p }, true, report)
 }
 
 /// Brings the memory up to date with what has changed at `changed`, and
-/// nothing else: a file there is read if it is new or different, what was
-/// remembered of one that has gone is forgotten, and a folder is looked
-/// through. Paths outside `roots`, or in folders that are passed over,
-/// are left alone. For when the system says which files changed, so that
-/// one new screenshot does not mean looking through everything again.
-pub fn update(store: &mut Store, model: &dyn Model, roots: &[PathBuf], changed: &[PathBuf], report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+/// nothing else: a file there is taken in if it is new or different, what
+/// was remembered of one that has gone is forgotten, and a folder is
+/// looked through. Paths outside `roots`, or in folders that are passed
+/// over, are left alone. For when the system says which files changed, so
+/// that one new screenshot does not mean looking through everything
+/// again. With `look`, photos and videos are looked at and not only listed.
+pub fn update(store: &mut Store, model: &dyn Model, roots: &[PathBuf], changed: &[PathBuf], look: bool, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
     let mut p = Progress::default();
     let mut files: Vec<PathBuf> = vec![];
     for path in changed {
@@ -468,20 +517,35 @@ pub fn update(store: &mut Store, model: &dyn Model, roots: &[PathBuf], changed: 
     }
     files.sort();
     files.dedup();
-    read_files(store, model, files, p, report)
+    read_files(store, model, files, p, look, report)
 }
 
-fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: Progress, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
-    p.total = files.len();
+/// Looks at these files now, whatever is known of them: for the photos
+/// and videos that a question or a search has turned up only listed.
+pub fn look_at_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+    read_files(store, model, files, Progress::default(), true, report)
+}
+
+fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: Progress, look: bool, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+    p.total = p.done + files.len();
+    p.looking = look;
     for file in files {
-        let unchanged = std::fs::metadata(&file).ok().map(|m| stamp_of(&file, &m)).is_some_and(|s| store.file_stamp(&file).ok().flatten().as_deref() == Some(s.as_str()));
+        let Ok(meta) = std::fs::metadata(&file) else {
+            p.done += 1;
+            continue;
+        };
+        let had = store.file_stamp(&file).ok().flatten();
+        let seen = matches!(classify(&file), Some(What::Photo | What::Video));
+        // Looked at already, or listed already and that is all that is asked.
+        let unchanged = had.as_deref() == Some(stamp_of(&file, &meta).as_str()) || (seen && !look && had.as_deref() == Some(format!("{}{LISTED}", stamp(&meta)).as_str()));
         if !unchanged {
             p.now = Some(file.clone());
             if !report(&p) {
                 p.now = None;
                 return p;
             }
-            match index_file(store, model, &file) {
+            match if look { index_file(store, model, &file) } else { list_file(store, model, &file) } {
+                Ok(Outcome::Read(_)) if seen && !look => p.listed += 1,
                 Ok(Outcome::Read(_)) => p.read += 1,
                 Ok(Outcome::Needs(tool)) => {
                     if !p.needs.contains(&tool) {
@@ -491,6 +555,11 @@ fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: 
                 Err(e) => {
                     p.failed += 1;
                     p.trouble = Some(format!("{}: {e}", name(&file)));
+                    // One that is listed and cannot be looked at stays listed,
+                    // and is not tried again until it changes.
+                    if look && seen && had.is_some() {
+                        let _ = store.set_file(&file, &stamp_of(&file, &meta), 1);
+                    }
                 }
             }
         }
@@ -572,12 +641,14 @@ mod tests {
         assert_eq!(name(&walk(&roots)[0]), "bill.md", "documents first");
 
         let mut seen = vec![];
-        let p = run(&mut store, &model, &roots, &mut |p| {
+        let p = run(&mut store, &model, &roots, true, &mut |p| {
             seen.extend(p.now.as_deref().map(name));
             true
         });
         assert_eq!((p.done, p.total, p.read, p.failed, p.trouble.clone()), (3, 3, 3, 0, None));
-        assert_eq!(seen.len(), 3);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "each said as it is listed, and the pictures again as they are looked at");
         let stats = store.stats().unwrap();
         assert_eq!((stats.of(Kind::Photo), stats.of(Kind::Document), stats.files), (2, 1, 3));
         // What a picture shows finds it.
@@ -590,7 +661,7 @@ mod tests {
         assert!(store.word_vector("dog").unwrap().is_some());
 
         // Nothing has changed: nothing is read.
-        let p = run(&mut store, &model, &roots, &mut |p| {
+        let p = run(&mut store, &model, &roots, true, &mut |p| {
             assert_eq!(p.now, None, "no file needed reading");
             true
         });
@@ -600,13 +671,13 @@ mod tests {
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         std::fs::File::options().write(true).open(root.join("trip/red.png")).unwrap().set_modified(later).unwrap();
         std::fs::remove_file(root.join("trip/green.png")).unwrap();
-        let p = run(&mut store, &model, &roots, &mut |_| true);
+        let p = run(&mut store, &model, &roots, true, &mut |_| true);
         assert_eq!((p.read, p.forgotten, p.total), (1, 1, 2));
         assert_eq!(store.stats().unwrap().of(Kind::Photo), 1);
         assert_eq!(store.recent(1, Some(Kind::Photo)).unwrap()[0].text, "Waves on the sea.", "read afresh, not added to");
         assert!(store.cloud(50, None).unwrap().iter().all(|w| w.word != "mountain"), "the words of what is gone go with it");
         // A folder no longer read is forgotten.
-        let p = run(&mut store, &model, &[], &mut |_| true);
+        let p = run(&mut store, &model, &[], true, &mut |_| true);
         assert_eq!((p.forgotten, store.stats().unwrap().total()), (2, 0));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -640,7 +711,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".cache")).unwrap();
         std::fs::write(root.join("old.txt"), "An old note about an invoice.").unwrap();
         let roots = vec![root.clone()];
-        assert_eq!(run(&mut store, &model, &roots, &mut |_| true).read, 1);
+        assert_eq!(run(&mut store, &model, &roots, true, &mut |_| true).read, 1);
         // Another file is there that no change was told of: it is not gone looking for.
         std::fs::write(root.join("unseen.txt"), "Nobody said this was here.").unwrap();
         picture(&root.join("trip/red.png"), [220, 40, 40]);
@@ -649,7 +720,7 @@ mod tests {
         std::fs::write(dir.join("outside.txt"), "Not in a folder that is read.").unwrap();
         let told = [root.join("trip/red.png"), root.join(".cache/blue.png"), root.join("program.rs"), dir.join("outside.txt"), root.join("old.txt")];
         let mut seen = vec![];
-        let p = update(&mut store, &model, &roots, &told, &mut |p| {
+        let p = update(&mut store, &model, &roots, &told, true, &mut |p| {
             seen.extend(p.now.as_deref().map(name));
             true
         });
@@ -659,13 +730,61 @@ mod tests {
         std::fs::create_dir_all(root.join("more")).unwrap();
         picture(&root.join("more/green.png"), [40, 220, 40]);
         std::fs::write(root.join("more/note.md"), "Hiking the mountain in the snow.").unwrap();
-        assert_eq!(update(&mut store, &model, &roots, &[root.join("more")], &mut |_| true).read, 2);
+        assert_eq!(update(&mut store, &model, &roots, &[root.join("more")], true, &mut |_| true).read, 2);
         std::fs::remove_dir_all(root.join("more")).unwrap();
         std::fs::remove_file(root.join("trip/red.png")).unwrap();
-        let p = update(&mut store, &model, &roots, &[root.join("more"), root.join("trip/red.png"), root.join("never-was.png")], &mut |_| true);
+        let p = update(&mut store, &model, &roots, &[root.join("more"), root.join("trip/red.png"), root.join("never-was.png")], true, &mut |_| true);
         assert_eq!((p.forgotten, p.read, store.stats().unwrap().total()), (3, 0, 1));
         // A full look afterwards finds what no change told of.
-        assert_eq!(run(&mut store, &model, &roots, &mut |_| true).read, 1);
+        assert_eq!(run(&mut store, &model, &roots, true, &mut |_| true).read, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn photos_and_videos_are_listed_at_once_and_looked_at_when_asked_after() {
+        let dir = scratch("listed");
+        let model = Fake::default();
+        let mut store = Store::open(&dir.join("db/memory.db"), &[1; 32], model.dims().unwrap()).unwrap();
+        let root = dir.join("Trips");
+        std::fs::create_dir_all(&root).unwrap();
+        picture(&root.join("beach dog.png"), [220, 40, 40]);
+        picture(&root.join("IMG_0002.png"), [40, 220, 40]);
+        std::fs::write(root.join("plan.txt"), "Hiking the mountain in the snow.").unwrap();
+        let roots = vec![root.clone()];
+        // Listing: every file is known, the pictures by name and place only, and nothing was looked at.
+        let p = run(&mut store, &model, &roots, false, &mut |p| {
+            assert!(!p.looking);
+            true
+        });
+        assert_eq!((p.read, p.listed, p.total, p.looking), (1, 2, 3, false));
+        let stats = store.stats().unwrap();
+        assert_eq!((stats.of(Kind::Photo), stats.of(Kind::Document), stats.light), (2, 1, 2), "a document is read in full either way");
+        let listed = &store.recent(5, Some(Kind::Photo)).unwrap();
+        let dog = listed.iter().find(|m| m.title == "beach dog.png").unwrap();
+        assert_eq!((dog.light, dog.text.as_str()), (true, "A photo that has not been looked at yet, called beach dog.png, in the folder Trips."));
+        assert_eq!(store.words_of(dog.id).unwrap(), ["beach", "dog", "trips"], "what its name and folder say of it");
+        let ask = |q: &str| model.embed(&[q.to_owned()], true).unwrap().pop().unwrap();
+        assert_eq!(store.search(&ask("dog on a beach"), 1, None).unwrap()[0].memory.title, "beach dog.png", "found by its name");
+        // Listed again, nothing is done.
+        assert_eq!(run(&mut store, &model, &roots, false, &mut |_| true).read, 0);
+        // Asked after, one is looked at: it is described, and no longer only listed.
+        let p = look_at_files(&mut store, &model, vec![root.join("IMG_0002.png")], &mut |p| {
+            assert!(p.looking);
+            true
+        });
+        assert_eq!(p.read, 1);
+        let seen = store.recent(5, Some(Kind::Photo)).unwrap().into_iter().find(|m| m.title == "IMG_0002.png").unwrap();
+        assert_eq!((seen.light, seen.text.as_str(), store.stats().unwrap().light, store.stats().unwrap().of(Kind::Photo)), (false, "A snowy mountain peak.", 1, 2));
+        assert_eq!(store.light_files(5).unwrap(), [root.join("beach dog.png")]);
+        // Listing afterwards leaves what was looked at alone; looking at everything does the rest, once.
+        assert_eq!(run(&mut store, &model, &roots, false, &mut |_| true).read, 0);
+        let p = run(&mut store, &model, &roots, true, &mut |_| true);
+        assert_eq!((p.read, p.done, p.total, p.looking, store.stats().unwrap().light), (1, 3, 3, true, 0));
+        assert_eq!(run(&mut store, &model, &roots, true, &mut |_| true).read, 0);
+        // A new picture told of while only listing is listed, not looked at.
+        picture(&root.join("new.png"), [40, 40, 220]);
+        assert_eq!(update(&mut store, &model, &roots, &[root.join("new.png")], false, &mut |_| true).listed, 1);
+        assert_eq!(store.stats().unwrap().light, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -681,15 +800,17 @@ mod tests {
         std::fs::write(dir.join("broken.png"), vec![0u8; 20_000]).unwrap();
         let roots = vec![dir.clone()];
         let mut asked = 0;
-        let p = run(&mut store, &model, &roots, &mut |_| {
+        let p = run(&mut store, &model, &roots, true, &mut |_| {
             asked += 1;
             asked <= 2
         });
         assert_eq!((p.read, p.done, p.total), (2, 2, 5));
-        let p = run(&mut store, &model, &roots, &mut |_| true);
+        let p = run(&mut store, &model, &roots, true, &mut |_| true);
         assert_eq!((p.read, p.failed, p.done), (2, 1, 5));
         assert!(p.trouble.unwrap().starts_with("broken.png: "));
-        assert_eq!(store.stats().unwrap().total(), 4);
+        assert_eq!((store.stats().unwrap().total(), store.stats().unwrap().light), (5, 1), "the one that could not be looked at stays listed by its name");
+        let p = run(&mut store, &model, &roots, true, &mut |_| true);
+        assert_eq!((p.read, p.failed), (0, 0), "and is not tried again until it changes");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

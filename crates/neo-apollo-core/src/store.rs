@@ -82,6 +82,9 @@ pub struct Memory {
     pub text: String,
     pub part: u32,
     pub created: u64,
+    /// Only listed so far: known by its name and place, and not yet looked
+    /// at. A photo or a video stays so until something asks after it.
+    pub light: bool,
 }
 
 /// A memory found by a search, and how far its meaning is from what was
@@ -122,6 +125,8 @@ pub struct Stats {
     pub memories: [u32; 5],
     pub words: u32,
     pub files: u32,
+    /// Photos and videos that are only listed, not yet looked at.
+    pub light: u32,
 }
 
 impl Stats {
@@ -180,10 +185,10 @@ fn err(e: rusqlite::Error) -> String {
     e.to_string()
 }
 
-const MEMORY: &str = "id, kind, source, title, text, part, created";
+const MEMORY: &str = "id, kind, source, title, text, part, created, light";
 
 fn memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
-    Ok(Memory { id: row.get(0)?, kind: Kind::from_name(&row.get::<_, String>(1)?).unwrap_or(Kind::Note), source: row.get::<_, Option<String>>(2)?.map(PathBuf::from), title: row.get(3)?, text: row.get(4)?, part: row.get(5)?, created: row.get::<_, i64>(6)? as u64 })
+    Ok(Memory { id: row.get(0)?, kind: Kind::from_name(&row.get::<_, String>(1)?).unwrap_or(Kind::Note), source: row.get::<_, Option<String>>(2)?.map(PathBuf::from), title: row.get(3)?, text: row.get(4)?, part: row.get(5)?, created: row.get::<_, i64>(6)? as u64, light: row.get::<_, i64>(7)? != 0 })
 }
 
 impl Store {
@@ -219,7 +224,7 @@ impl Store {
             }
         }
         db.execute_batch(&format!(
-            "create table if not exists memories(id integer primary key, kind text not null, source text, title text not null, text text not null, part integer not null default 0, created integer not null);
+            "create table if not exists memories(id integer primary key, kind text not null, source text, title text not null, text text not null, part integer not null default 0, created integer not null, light integer not null default 0);
              create index if not exists memories_source on memories(source);
              create virtual table if not exists memory_vectors using vec0(embedding float[{dims}] distance_metric=cosine);
              create table if not exists words(id integer primary key, word text unique not null);
@@ -229,7 +234,23 @@ impl Store {
              create table if not exists files(path text primary key, stamp text not null, memories integer not null);"
         ))
         .map_err(err)?;
+        // A memory made before there were listed-only ones has no place to say so.
+        let has_light = db.prepare("select 1 from pragma_table_info('memories') where name = 'light'").and_then(|mut st| st.exists([])).map_err(err)?;
+        if !has_light {
+            db.execute_batch("alter table memories add column light integer not null default 0;").map_err(err)?;
+        }
         Ok(Self { db, dims })
+    }
+
+    /// Marks a memory as only listed: known by name and place, not looked at.
+    pub fn mark_light(&mut self, id: i64) -> Result<(), String> {
+        self.db.execute("update memories set light = 1 where id = ?1", [id]).map(|_| ()).map_err(err)
+    }
+
+    /// The files that are only listed, newest first, at most `most`.
+    pub fn light_files(&self, most: usize) -> Result<Vec<PathBuf>, String> {
+        let mut st = self.db.prepare("select source from memories where light != 0 and source is not null order by created desc, id desc limit ?1").map_err(err)?;
+        st.query_map([most as i64], |r| r.get::<_, String>(0).map(PathBuf::from)).map_err(err)?.collect::<Result<_, _>>().map_err(err)
     }
 
     pub fn dims(&self) -> usize {
@@ -335,7 +356,7 @@ impl Store {
         // more are asked for when only some will do.
         let reach = if kind.is_some() { most * 8 } else { most }.clamp(1, 4000);
         let mut near = self.db.prepare(&format!("select {}, v.distance from memory_vectors v join memories m on m.id = v.rowid where v.embedding match ?1 and k = ?2 order by v.distance", MEMORY.split(", ").map(|c| format!("m.{c}")).collect::<Vec<_>>().join(", "))).map_err(err)?;
-        let hits = near.query_map(params![blob(embedding), reach as i64], |r| Ok(Hit { memory: memory(r)?, distance: r.get::<_, f64>(7)? as f32 })).map_err(err)?;
+        let hits = near.query_map(params![blob(embedding), reach as i64], |r| Ok(Hit { memory: memory(r)?, distance: r.get::<_, f64>(8)? as f32 })).map_err(err)?;
         let mut out = vec![];
         for hit in hits {
             let hit = hit.map_err(err)?;
@@ -361,7 +382,7 @@ impl Store {
         let says_all = (1..=terms.len()).map(|i| format!("(lower(m.title || ' ' || m.text) like ?{i} or exists (select 1 from memory_words mw join words w on w.id = mw.word where mw.memory = m.id and w.word like ?{i}))")).collect::<Vec<_>>().join(" and ");
         let mut st = self.db.prepare(&format!("select {}, (select embedding from memory_vectors v where v.rowid = m.id) from memories m where {says_all} order by m.created desc limit 60", MEMORY.split(", ").map(|c| format!("m.{c}")).collect::<Vec<_>>().join(", "))).map_err(err)?;
         let like: Vec<String> = terms.iter().map(|t| format!("%{}%", t.replace(['%', '_'], ""))).collect();
-        let said = st.query_map(rusqlite::params_from_iter(&like), |r| Ok((memory(r)?, r.get::<_, Option<Vec<u8>>>(7)?))).map_err(err)?;
+        let said = st.query_map(rusqlite::params_from_iter(&like), |r| Ok((memory(r)?, r.get::<_, Option<Vec<u8>>>(8)?))).map_err(err)?;
         for row in said {
             let (m, vector) = row.map_err(err)?;
             if kind.is_none_or(|k| k == m.kind) && !hits.iter().any(|h| h.memory.id == m.id) {
@@ -548,6 +569,7 @@ impl Store {
         }
         stats.words = self.db.query_row("select count(*) from words", [], |r| r.get::<_, i64>(0)).map_err(err)? as u32;
         stats.files = self.db.query_row("select count(*) from files", [], |r| r.get::<_, i64>(0)).map_err(err)? as u32;
+        stats.light = self.db.query_row("select count(*) from memories where light != 0", [], |r| r.get::<_, i64>(0)).map_err(err)? as u32;
         Ok(stats)
     }
 }
@@ -583,7 +605,7 @@ mod tests {
         let found = s.search(&[0.9, 0.1, 0.0], 3, None).unwrap();
         assert_eq!(found.iter().map(|h| h.memory.id).collect::<Vec<_>>(), [a, b, c], "nearest in meaning first");
         assert!(found[0].distance < 0.05 && found[2].distance > 0.9);
-        assert_eq!(found[0].memory, Memory { id: a, kind: Kind::Photo, source: Some("/p/dog.jpg".into()), title: "dog.jpg".into(), text: "A dog running on a beach".into(), part: 0, created: 100 });
+        assert_eq!(found[0].memory, Memory { id: a, kind: Kind::Photo, source: Some("/p/dog.jpg".into()), title: "dog.jpg".into(), text: "A dog running on a beach".into(), part: 0, created: 100, light: false });
         assert_eq!(s.search(&[0.9, 0.1, 0.0], 3, Some(Kind::Video)).unwrap().iter().map(|h| h.memory.id).collect::<Vec<_>>(), [b]);
         assert_eq!(s.search(&[0.9, 0.1, 0.0], 1, None).unwrap().len(), 1);
         assert_eq!(s.about("beach", 10).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), [b, a], "newest first");
@@ -605,6 +627,9 @@ mod tests {
         assert_eq!(c2[0].id, b);
         let stats = s.stats().unwrap();
         assert_eq!((stats.total(), stats.of(Kind::Photo), stats.of(Kind::Note), stats.words), (3, 1, 0, 2));
+        // One only listed is marked so, counted, and found among those waiting to be looked at.
+        s.mark_light(a).unwrap();
+        assert_eq!((s.stats().unwrap().light, s.light_files(5).unwrap(), s.recent(5, Some(Kind::Photo)).unwrap()[0].light), (1, vec![PathBuf::from("/p/dog.jpg")], true));
         // An embedding of the wrong length is refused, not stored askew.
         assert!(s.add(&new(Kind::Note, None, "x", "y", &[]), &[1.0]).is_err());
         assert!(s.search(&[1.0], 1, None).is_err());

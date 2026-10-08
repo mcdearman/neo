@@ -207,6 +207,9 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
 pub struct Aware {
     /// A reading of the folders is under way: files done, of how many.
     pub reading: Option<(usize, usize)>,
+    /// How many photos and videos that are only listed may be looked at
+    /// to answer one question.
+    pub look: usize,
 }
 
 fn now() -> u64 {
@@ -230,6 +233,9 @@ fn recall_of(store: &Store, model: &dyn Model, question: &str, kind: Option<Kind
 fn overview(stats: &Stats, aware: &Aware) -> String {
     let counts: Vec<String> = Kind::ALL.iter().filter(|k| stats.of(**k) > 0).map(|k| format!("{} {}", stats.of(*k), k.plural().to_lowercase())).collect();
     let mut out = if counts.is_empty() { " Your memory is empty so far.".to_owned() } else { format!(" Your memory holds {} (a document counts once for each passage).", counts.join(", ")) };
+    if stats.light > 0 {
+        out.push_str(&format!(" {} of the photos and videos are only listed by name so far and have not been looked at; you know what those show only once they are.", stats.light));
+    }
     if let Some((done, total)) = aware.reading {
         out.push_str(&format!(" You are part-way through reading the user's folders, {done} of {total} files so far, documents first and then photos and videos from the newest back, so some files are not in your memory yet; say so if what is asked for may be among them."));
     }
@@ -306,17 +312,33 @@ pub fn put(question: &str, recalled: &[Hit], listing: Option<(&Wanted, &[Memory]
 /// Answers `question`, which follows `earlier` in the conversation. With
 /// a `store`, from memory; without, the model is told its memory is
 /// locked. `piece` hears the answer as it comes.
-pub fn ask(store: Option<&Store>, model: &dyn Model, earlier: &[Turn], question: &str, aware: &Aware, piece: &mut dyn FnMut(&str) -> bool) -> Result<Answer, String> {
-    let (mut recalled, mut listed, mut total, mut stats) = (vec![], vec![], 0, None);
+pub fn ask(mut store: Option<&mut Store>, model: &dyn Model, earlier: &[Turn], question: &str, aware: &Aware, looking: &mut dyn FnMut(usize, usize) -> bool, piece: &mut dyn FnMut(&str) -> bool) -> Result<Answer, String> {
     let asks = wanted(question, Local::now());
-    if let Some(store) = store {
-        // A question about a kind of thing or a stretch of time is answered
-        // from a list of just those; meaning alone would bring back whatever
-        // reads most like the question.
-        if asks.any() {
-            (listed, total) = store.between(asks.kind, asks.since, asks.until, LISTED)?;
+    // A question about a kind of thing or a stretch of time is answered
+    // from a list of just those; meaning alone would bring back whatever
+    // reads most like the question.
+    let find = |store: &Store| -> Result<(Vec<Hit>, Vec<Memory>, u32), String> {
+        let (listed, total) = if asks.any() { store.between(asks.kind, asks.since, asks.until, LISTED)? } else { (vec![], 0) };
+        Ok((recall_of(store, model, question, asks.kind)?, listed, total))
+    };
+    let (mut recalled, mut listed, mut total, mut stats) = (vec![], vec![], 0, None);
+    if let Some(store) = store.as_deref_mut() {
+        (recalled, listed, total) = find(store)?;
+        // What it turned up that is only listed by name is looked at now,
+        // so that the answer can say what is in it; then it is found again,
+        // by what it shows this time.
+        let waiting: Vec<std::path::PathBuf> = sources(&listed, &recalled).into_iter().filter(|m| m.light).filter_map(|m| m.source.clone()).take(aware.look).collect();
+        if !waiting.is_empty() {
+            for (i, file) in waiting.iter().enumerate() {
+                if !looking(i, waiting.len()) {
+                    break;
+                }
+                // One that cannot be looked at stays as it was listed.
+                let _ = crate::index::look_at_files(store, model, vec![file.clone()], &mut |_| true);
+            }
+            model.rest();
+            (recalled, listed, total) = find(store)?;
         }
-        recalled = recall_of(store, model, question, asks.kind)?;
         stats = Some(store.stats()?);
     }
     let mut turns = vec![Turn::new(Role::System, briefing(stats.as_ref().map(|s| (s, aware))))];
@@ -418,7 +440,7 @@ mod tests {
         crate::index::remember(&mut s, &model, &New { kind: Kind::Photo, source: Some(Path::new("/p/rex.jpg")), title: "rex.jpg", text: "A dog, a retriever puppy.", part: 0, created: 1_790_000_000, words: &dog }).unwrap();
         crate::index::remember(&mut s, &model, &New { kind: Kind::Document, source: Some(Path::new("/d/bill.md")), title: "bill.md", text: "The invoice and the payment to the supplier.", part: 0, created: 1_790_000_000, words: &[] }).unwrap();
         let mut heard = String::new();
-        let answer = ask(Some(&s), &model, &[], "Where is my dog?", &Aware::default(), &mut |p| {
+        let answer = ask(Some(&mut s), &model, &[], "Where is my dog?", &Aware::default(), &mut |_, _| true, &mut |p| {
             heard.push_str(p);
             true
         })
@@ -435,10 +457,10 @@ mod tests {
         assert!(put("How much?", &bill, None).contains("1. A document called \"bill.md\", from "));
         assert_eq!(put("What is the capital of France?", &[], None), "What is the capital of France?");
         // Stopped part-way, what was said so far is the answer.
-        let cut = ask(Some(&s), &model, &[], "dog", &Aware::default(), &mut |_| false).unwrap();
+        let cut = ask(Some(&mut s), &model, &[], "dog", &Aware::default(), &mut |_, _| true, &mut |_| false).unwrap();
         assert_eq!(cut.text, "You");
         // Locked, it is told so and shown nothing.
-        let locked = ask(None, &model, &[], "Where is my dog?", &Aware::default(), &mut |_| true).unwrap();
+        let locked = ask(None, &model, &[], "Where is my dog?", &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
         assert!(locked.recalled.is_empty() && locked.text.ends_with("0 memories."));
         assert!(briefing(None).contains("locked") && briefing(Some((&Stats::default(), &Aware::default()))).contains("Your memory is empty so far"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -488,7 +510,7 @@ mod tests {
         add(Kind::Video, "/m/hike.mp4", "A video of a mountain hiking trail.", now - 60);
         add(Kind::Video, "/m/old.mov", "A video of a cat.", 1_000_000);
         add(Kind::Document, "/d/videos.md", "Notes about videos and films to watch this month.", now - 60);
-        let answer = ask(Some(&s), &model, &[], "What videos do I have from this year?", &Aware { reading: Some((40, 900)) }, &mut |_| true).unwrap();
+        let answer = ask(Some(&mut s), &model, &[], "What videos do I have from this year?", &Aware { reading: Some((40, 900)), look: 0 }, &mut |_, _| true, &mut |_| true).unwrap();
         assert_eq!(answer.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["hike.mp4"], "the video from this year, not the old one, and not the document that talks of videos");
         assert!(answer.recalled.iter().all(|h| h.memory.kind == Kind::Video));
         let wants = wanted("What videos do I have from this year?", Local::now());
@@ -496,11 +518,11 @@ mod tests {
         assert!(told.starts_with("The user asks about videos from this year. There is 1, below.\n\n1. A video, from ") && !told.contains("hike.mp4"), "{told}");
         assert_eq!(told.matches("A video of a mountain hiking trail.").count(), 1, "not listed twice for being near in meaning as well");
         assert!(put("q", &[], Some((&wants, &answer.listed, 40))).contains("There are 40; the newest 1 are below."));
-        let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)) })));
+        let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)), look: 0 })));
         assert!(knows.contains("40 of 900 files so far") && knows.contains("Your memory holds 2 videos, 1 documents"), "{knows}");
         assert_eq!(sources(&answer.listed, &answer.recalled).len(), 1);
         // None of that kind and time: said, and nothing offered in its place.
-        let none = ask(Some(&s), &model, &[], "photos from yesterday", &Aware::default(), &mut |_| true).unwrap();
+        let none = ask(Some(&mut s), &model, &[], "photos from yesterday", &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
         assert!(none.listed.is_empty() && none.recalled.is_empty());
         assert_eq!(put("photos from yesterday", &[], Some((&wanted("photos from yesterday", Local::now()), &[], 0))), "photos from yesterday\n\n(There are no photos from yesterday in your memory. Say so in one sentence, and do not offer other files in their place.)");
         std::fs::remove_dir_all(dir).unwrap();
@@ -511,12 +533,51 @@ mod tests {
         assert_eq!(plain("A dog on a beach [1], and a hike [2, 3]. Nothing else [x] costs 3 [pounds]."), "A dog on a beach, and a hike. Nothing else [x] costs 3 [pounds].");
         assert_eq!(plain("[1] A dog.  "), "A dog.");
         assert_eq!((plain("No marks here."), plain("An open [ bracket")), ("No marks here.".to_owned(), "An open [ bracket".to_owned()));
-        let m = |id, file: &str| Memory { id, kind: Kind::Video, source: Some(file.into()), title: Path::new(file).file_name().unwrap().to_string_lossy().into_owned(), text: String::new(), part: 0, created: 0 };
+        let m = |id, file: &str| Memory { id, kind: Kind::Video, source: Some(file.into()), title: Path::new(file).file_name().unwrap().to_string_lossy().into_owned(), text: String::new(), part: 0, created: 0, light: false };
         let listed = [m(1, "/v/a.mp4"), m(2, "/v/b.mp4")];
         let note = Memory { source: None, ..m(4, "/none") };
         let recalled = [Hit { memory: m(3, "/v/c.mp4"), distance: 0.3 }, Hit { memory: m(1, "/v/a.mp4"), distance: 0.35 }, Hit { memory: note, distance: 0.36 }];
         assert_eq!(sources(&listed, &recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["a.mp4", "b.mp4", "c.mp4"], "the list, then what else bore on it, each file once, and nothing that is of no file");
         assert!(sources(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn what_a_question_turns_up_only_listed_is_looked_at_before_it_is_answered() {
+        let (mut s, dir) = store("look");
+        let model = Fake::default();
+        let folder = dir.join("Trips");
+        std::fs::create_dir_all(&folder).unwrap();
+        // Red is a dog on a beach to the test model, green a mountain, blue the sea.
+        for (file, colour) in [("a.png", [220u8, 40, 40]), ("b.png", [40, 220, 40]), ("c.png", [40, 40, 220])] {
+            image::RgbImage::from_fn(240, 160, |x, y| if x < 8 && y < 8 { image::Rgb(colour) } else { image::Rgb([colour[0] ^ ((x * 7 + y * 13) % 31) as u8, colour[1] ^ ((x * 3 + y * 5) % 29) as u8, colour[2] ^ ((x + y * 11) % 23) as u8]) }).save(folder.join(file)).unwrap();
+        }
+        crate::index::run(&mut s, &model, std::slice::from_ref(&folder), false, &mut |_| true);
+        assert_eq!(s.stats().unwrap().light, 3, "listed, none looked at");
+        // Asked for the photos, two may be looked at: they are, the newest first, and the answer is of what they show.
+        let mut steps = vec![];
+        let answer = ask(
+            Some(&mut s),
+            &model,
+            &[],
+            "What photos do I have?",
+            &Aware { reading: None, look: 2 },
+            &mut |i, n| {
+                steps.push((i, n));
+                true
+            },
+            &mut |_| true,
+        )
+        .unwrap();
+        assert_eq!(steps, [(0, 2), (1, 2)]);
+        assert_eq!((answer.listed.len(), answer.listed.iter().filter(|m| m.light).count(), s.stats().unwrap().light), (3, 1, 1));
+        assert!(answer.listed.iter().any(|m| !m.light && (m.text == "A dog running on a beach." || m.text == "A snowy mountain peak." || m.text == "Waves on the sea.")));
+        assert!(briefing(Some((&s.stats().unwrap(), &Aware::default()))).contains("1 of the photos and videos are only listed by name so far"));
+        // With none allowed, or the looking stopped, it answers from what it has.
+        let before = s.stats().unwrap().light;
+        ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware::default(), &mut |_, _| panic!("none may be looked at"), &mut |_| true).unwrap();
+        ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware { reading: None, look: 5 }, &mut |_, _| false, &mut |_| true).unwrap();
+        assert_eq!(s.stats().unwrap().light, before);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
