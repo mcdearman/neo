@@ -79,6 +79,14 @@ pub trait App: 'static {
         None
     }
 
+    /// Called when the app is asked to open again while it is running: its
+    /// Dock icon clicked, or opened again from the Finder or a launcher.
+    /// An app that keeps running with its window out of sight shows it
+    /// again here. Only macOS tells of this so far.
+    fn on_reopen(&self) -> Option<Self::Message> {
+        None
+    }
+
     /// Called once as the app ends, however it ends: the window closed,
     /// Quit chosen from the menu, or the system shutting it down. The
     /// place to stop anything that would otherwise outlive it, such as a
@@ -124,11 +132,7 @@ impl<A: App> armature::App for Themed<A> {
 
     fn style(&self, system: armature::Scheme) -> Style {
         let theme = self.0.theme(scheme(system));
-        Style::new(theme)
-            .content(theme.palette().text)
-            .text(theme.text(TextRole::Body).style())
-            .window_radius(theme.window_radius())
-            .backdrop_blur(theme.glass.enabled.then_some(theme.glass.blur))
+        Style::new(theme).content(theme.palette().text).text(theme.text(TextRole::Body).style()).window_radius(theme.window_radius()).backdrop_blur(theme.glass.enabled.then_some(theme.glass.blur))
     }
 
     fn fonts(&self) -> armature::Fonts {
@@ -174,6 +178,10 @@ impl<A: App> armature::App for Themed<A> {
 
     fn on_window_focus(&self, focused: bool) -> Option<Self::Message> {
         self.0.on_window_focus(focused)
+    }
+
+    fn on_reopen(&self) -> Option<Self::Message> {
+        self.0.on_reopen()
     }
 
     fn on_exit(&mut self) {

@@ -1172,6 +1172,11 @@ impl App for Apollo {
         self.settings.background.then_some(Msg::Hide)
     }
 
+    /// Its icon in the Dock, clicked while it waits out of sight, brings the window back.
+    fn on_reopen(&self) -> Option<Msg> {
+        Some(Msg::Show)
+    }
+
     fn should_exit(&self) -> bool {
         self.quit
     }
@@ -2554,6 +2559,14 @@ mod tests {
         assert!(matches!(closing, Some(Msg::Hide)));
         a.update(Msg::Hide);
         assert!(!a.window_state().visible && !a.should_exit());
+        // A click on its Dock icon brings the window back, as a question does.
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        assert!(!h.window_state().visible);
+        h.reopen();
+        assert!(h.window_state().visible, "shown again");
+        let mut a = std::mem::replace(h.app_mut(), sample("background-swap", false).0);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-background-swap-{}", std::process::id())));
+        a.update(Msg::Hide);
         // Locked, a question brings up the login check once, and is answered from the memory.
         static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         a.check = Arc::new(|_| {
