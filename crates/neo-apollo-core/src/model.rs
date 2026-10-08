@@ -44,6 +44,10 @@ pub struct Seen {
 /// What Apollo needs of a model. The real one is [`Ollama`]; tests have
 /// their own, which answers at once and the same way every time.
 pub trait Model: Send + Sync {
+    /// What makes its embeddings, by name: embeddings from two different
+    /// makers cannot be compared, so a memory keeps to the one it began with.
+    fn name(&self) -> String;
+
     /// The length of the embeddings it makes.
     fn dims(&self) -> Result<usize, String>;
 
@@ -54,6 +58,10 @@ pub trait Model: Send + Sync {
     /// Says what a picture, given as a JPEG, shows.
     fn describe(&self, jpeg: &[u8]) -> Result<Seen, String>;
 
+    /// Lets go of whatever it holds in memory until it is next asked
+    /// something. A model that holds nothing need do nothing.
+    fn rest(&self) {}
+
     /// Answers a conversation. `piece` is given the answer as it comes;
     /// returning false from it stops the answer there.
     fn chat(&self, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String>;
@@ -63,6 +71,7 @@ pub trait Model: Send + Sync {
 pub struct Ollama {
     server: String,
     chat_model: String,
+    vision_model: String,
     embed_model: String,
     dims: OnceLock<usize>,
 }
@@ -87,12 +96,12 @@ fn agent(wait: Option<Duration>) -> ureq::Agent {
 }
 
 impl Ollama {
-    pub fn new(server: &str, chat_model: &str, embed_model: &str) -> Self {
-        Self { server: server.trim_end_matches('/').to_owned(), chat_model: chat_model.to_owned(), embed_model: embed_model.to_owned(), dims: OnceLock::new() }
+    pub fn new(server: &str, chat_model: &str, vision_model: &str, embed_model: &str) -> Self {
+        Self { server: server.trim_end_matches('/').to_owned(), chat_model: chat_model.to_owned(), vision_model: vision_model.to_owned(), embed_model: embed_model.to_owned(), dims: OnceLock::new() }
     }
 
     pub fn from_settings(s: &crate::settings::Settings) -> Self {
-        Self::new(&s.server, &s.chat_model, &s.embed_model)
+        Self::new(&s.server, &s.chat_model, &s.vision_model, &s.embed_model)
     }
 
     pub fn chat_model(&self) -> &str {
@@ -150,7 +159,38 @@ impl Ollama {
         let have = self.models()?;
         // "nomic-embed-text" is had as "nomic-embed-text:latest".
         let has = |want: &str| have.iter().any(|h| h == want || h.strip_suffix(":latest") == Some(want) || want.strip_suffix(":latest") == Some(h));
-        Ok([&self.chat_model, &self.embed_model].into_iter().filter(|m| !has(m)).cloned().collect())
+        let mut missing: Vec<String> = vec![];
+        for model in [&self.chat_model, &self.vision_model, &self.embed_model] {
+            if !has(model) && !missing.contains(model) {
+                missing.push(model.clone());
+            }
+        }
+        Ok(missing)
+    }
+
+    /// What a model the server has can do: `completion`, `vision`,
+    /// `embedding`, `tools` and the like.
+    pub fn capabilities(&self, model: &str) -> Result<Vec<String>, String> {
+        let mut res = self.post("/api/show", &json!({ "model": model }), Some(Duration::from_secs(10)))?;
+        let v: Value = res.body_mut().read_json().map_err(|e| e.to_string())?;
+        Ok(v["capabilities"].as_array().map(|c| c.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect()).unwrap_or_default())
+    }
+
+    /// Why the models chosen cannot do the jobs they were chosen for, if
+    /// any cannot: a model to describe pictures that cannot see, or one
+    /// to place text by meaning that makes no embeddings. A server too old
+    /// to say what its models can do is taken at its word.
+    pub fn unfit(&self) -> Option<String> {
+        let lacks = |model: &str, need: &str| self.capabilities(model).is_ok_and(|c| !c.is_empty() && !c.iter().any(|c| c == need));
+        if lacks(&self.vision_model, "vision") {
+            Some(format!("{} cannot look at pictures. Choose a model that can see to describe them, such as gemma3 or one of the qwen vision models.", self.vision_model))
+        } else if lacks(&self.embed_model, "embedding") {
+            Some(format!("{} does not make embeddings. Choose an embedding model, such as nomic-embed-text.", self.embed_model))
+        } else if lacks(&self.chat_model, "completion") {
+            Some(format!("{} cannot hold a conversation. Choose a chat model to answer with.", self.chat_model))
+        } else {
+            None
+        }
     }
 
     /// Downloads a model, telling `progress` how far it has got. Returning
@@ -181,6 +221,23 @@ pub fn read_seen(answer: &str) -> Seen {
 }
 
 impl Model for Ollama {
+    fn name(&self) -> String {
+        self.embed_model.clone()
+    }
+
+    /// Has the server unload the models now, which gives their few
+    /// gigabytes back, and not when they have sat idle for a while.
+    fn rest(&self) {
+        let mut done: Vec<&String> = vec![];
+        for model in [&self.chat_model, &self.vision_model, &self.embed_model] {
+            if !done.contains(&model) {
+                // Asking for nothing, to be kept for no time, is how the server is told.
+                let _ = self.post(if model == &self.embed_model { "/api/embed" } else { "/api/generate" }, &json!({ "model": model, "keep_alive": 0 }), Some(Duration::from_secs(5)));
+                done.push(model);
+            }
+        }
+    }
+
     fn dims(&self) -> Result<usize, String> {
         if let Some(d) = self.dims.get() {
             return Ok(*d);
@@ -218,7 +275,7 @@ impl Model for Ollama {
     fn describe(&self, jpeg: &[u8]) -> Result<Seen, String> {
         let picture = base64::engine::general_purpose::STANDARD.encode(jpeg);
         let format = json!({ "type": "object", "properties": { "description": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } } }, "required": ["description", "tags"] });
-        let body = json!({ "model": self.chat_model, "stream": false, "keep_alive": KEEP, "format": format, "options": { "temperature": 0.2 }, "messages": [{ "role": "user", "content": DESCRIBE, "images": [picture] }] });
+        let body = json!({ "model": self.vision_model, "stream": false, "keep_alive": KEEP, "format": format, "options": { "temperature": 0.2 }, "messages": [{ "role": "user", "content": DESCRIBE, "images": [picture] }] });
         let mut res = self.post("/api/chat", &body, Some(Duration::from_secs(600)))?;
         let v: Value = res.body_mut().read_json().map_err(|e| e.to_string())?;
         let seen = read_seen(v["message"]["content"].as_str().unwrap_or_default());
@@ -284,6 +341,10 @@ pub mod fake {
     }
 
     impl Model for Fake {
+        fn name(&self) -> String {
+            "fake".into()
+        }
+
         fn dims(&self) -> Result<usize, String> {
             Ok(SUBJECTS.len() + 2)
         }
@@ -338,10 +399,11 @@ mod tests {
     #[test]
     fn no_server_is_said_plainly_and_not_waited_on() {
         // Nothing listens on the discard port.
-        let m = Ollama::new("http://127.0.0.1:9/", "chat", "embed");
+        let m = Ollama::new("http://127.0.0.1:9/", "chat", "see", "embed");
         assert!(!m.running());
         assert!(m.embed(&["x".into()], false).unwrap_err().contains("did not answer"));
-        assert!(m.models().is_err() && m.missing().is_err() && m.dims().is_err());
+        assert!(m.models().is_err() && m.missing().is_err() && m.dims().is_err() && m.capabilities("chat").is_err());
+        assert_eq!((m.unfit(), m.name()), (None, "embed".to_owned()), "a server that cannot be asked is not held against the models");
         assert_eq!(m.embed(&[], false), Ok(vec![]), "nothing to embed asks nothing");
     }
 

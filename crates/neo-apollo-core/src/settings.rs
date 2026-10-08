@@ -13,21 +13,26 @@ pub struct Folder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub folders: Vec<Folder>,
-    /// The model that describes pictures and answers.
+    /// The model that answers.
     pub chat_model: String,
+    /// The model that describes pictures: one that can see.
+    pub vision_model: String,
     /// The model that turns text into embeddings.
     pub embed_model: String,
     /// Where the model server listens.
     pub server: String,
     /// Whether what is asked and answered is remembered.
     pub remember_conversations: bool,
+    /// Whether the folders are read without being asked: when Apollo
+    /// starts, and now and then while it is open.
+    pub read_automatically: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
         let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
-        Self { folders, chat_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remember_conversations: true }
+        Self { folders, chat_model: "gemma3:4b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remember_conversations: true, read_automatically: true }
     }
 }
 
@@ -56,7 +61,7 @@ impl Settings {
     }
 
     pub fn encode(&self) -> String {
-        let mut out = format!("chat-model={}\nembed-model={}\nserver={}\nremember-conversations={}\n", self.chat_model, self.embed_model, self.server, self.remember_conversations);
+        let mut out = format!("chat-model={}\nvision-model={}\nembed-model={}\nserver={}\nremember-conversations={}\nread-automatically={}\n", self.chat_model, self.vision_model, self.embed_model, self.server, self.remember_conversations, self.read_automatically);
         // Said even when there are none, so that none is not read as the defaults.
         out.push_str("folders=\n");
         for f in &self.folders {
@@ -76,9 +81,11 @@ impl Settings {
             let value = value.trim();
             match key.trim() {
                 "chat-model" if !value.is_empty() => s.chat_model = value.into(),
+                "vision-model" if !value.is_empty() => s.vision_model = value.into(),
                 "embed-model" if !value.is_empty() => s.embed_model = value.into(),
                 "server" if !value.is_empty() => s.server = value.trim_end_matches('/').into(),
                 "remember-conversations" => s.remember_conversations = value != "false",
+                "read-automatically" => s.read_automatically = value != "false",
                 "folder" | "folder-off" => {
                     named = true;
                     if !value.is_empty() && !folders.iter().any(|f: &Folder| f.path == Path::new(value)) {
@@ -109,7 +116,7 @@ mod tests {
     fn settings_are_written_and_read_back() {
         let d = Settings::default();
         assert_eq!((d.folders.len(), d.folders.iter().all(|f| f.on), d.remember_conversations), (3, true, true));
-        let s = Settings { folders: vec![Folder { path: "/a b/c".into(), on: true }, Folder { path: "/d".into(), on: false }], chat_model: "llava".into(), embed_model: "embed".into(), server: "http://box:1".into(), remember_conversations: false };
+        let s = Settings { folders: vec![Folder { path: "/a b/c".into(), on: true }, Folder { path: "/d".into(), on: false }], chat_model: "qwen3".into(), vision_model: "llava".into(), embed_model: "embed".into(), server: "http://box:1".into(), remember_conversations: false, read_automatically: false };
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(s.roots(), [PathBuf::from("/a b/c")]);
         // Nothing said: the defaults. Folders all removed: none, not the defaults back.

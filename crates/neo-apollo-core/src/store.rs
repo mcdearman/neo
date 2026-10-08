@@ -139,6 +139,9 @@ pub struct Store {
     dims: usize,
 }
 
+/// How an error begins that says the memory holds another model's embeddings.
+pub const OTHER_MODEL: &str = "The memory was made with";
+
 /// Words closer than this mean the same for the cloud's purposes: "dog"
 /// and "dogs", "beach" and "seaside".
 const SAME_WORD: f32 = 0.1;
@@ -202,7 +205,7 @@ impl Store {
         db.execute_batch("create table if not exists meta(key text primary key, value text not null);").map_err(err)?;
         let made_for: Option<usize> = db.query_row("select value from meta where key = 'dims'", [], |r| r.get::<_, String>(0)).optional().map_err(err)?.and_then(|v| v.parse().ok());
         match made_for {
-            Some(d) if d != dims => return Err(format!("The memory was made with a model whose embeddings are {d} long, and this one's are {dims}.")),
+            Some(d) if d != dims => return Err(format!("{OTHER_MODEL} a model whose embeddings are {d} long, and this one's are {dims}.")),
             Some(_) => {}
             None => {
                 db.execute("insert into meta(key, value) values ('dims', ?1)", [dims.to_string()]).map_err(err)?;
@@ -224,6 +227,36 @@ impl Store {
 
     pub fn dims(&self) -> usize {
         self.dims
+    }
+
+    /// Opens the database for use with `model`: made for the length of its
+    /// embeddings, and marked as its own. An error beginning with
+    /// [`OTHER_MODEL`] if it already holds another model's embeddings,
+    /// which this one's cannot be compared with.
+    pub fn open_for(path: &Path, key: &[u8; 32], model: &dyn crate::Model) -> Result<Self, String> {
+        let store = Self::open(path, key, model.dims()?)?;
+        let name = model.name();
+        match store.db.query_row("select value from meta where key = 'embedder'", [], |r| r.get::<_, String>(0)).optional().map_err(err)? {
+            Some(made_with) if made_with != name => Err(format!("{OTHER_MODEL} {made_with}, and {name} is chosen now.")),
+            Some(_) => Ok(store),
+            None => {
+                store.db.execute("insert into meta(key, value) values ('embedder', ?1)", [name]).map_err(err)?;
+                Ok(store)
+            }
+        }
+    }
+
+    /// Removes the database at `path`, with the files SQLite keeps beside it.
+    pub fn delete(path: &Path) -> std::io::Result<()> {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            match std::fs::remove_file(&name) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// The length of the embeddings the database at `path` was made for,
@@ -316,6 +349,20 @@ impl Store {
     pub fn recent(&self, most: usize, kind: Option<Kind>) -> Result<Vec<Memory>, String> {
         let mut st = self.db.prepare(&format!("select {MEMORY} from memories where ?1 is null or kind = ?1 order by created desc, id desc limit ?2")).map_err(err)?;
         st.query_map(params![kind.map(Kind::name), most as i64], memory).map_err(err)?.collect::<Result<_, _>>().map_err(err)
+    }
+
+    /// The things remembered from a stretch of time, newest first: each
+    /// file once, however many passages of it there are. Of one kind if
+    /// `kind` is given; from `since` up to but not including `until`,
+    /// where they are. With them, how many there are in all, which may be
+    /// more than the `most` returned.
+    pub fn between(&self, kind: Option<Kind>, since: Option<u64>, until: Option<u64>, most: usize) -> Result<(Vec<Memory>, u32), String> {
+        let which = "part = 0 and (?1 is null or kind = ?1) and (?2 is null or created >= ?2) and (?3 is null or created < ?3)";
+        let (kind, since, until) = (kind.map(Kind::name), since.map(|t| t as i64), until.map(|t| t as i64));
+        let total: i64 = self.db.query_row(&format!("select count(*) from memories where {which}"), params![kind, since, until], |r| r.get(0)).map_err(err)?;
+        let mut st = self.db.prepare(&format!("select {MEMORY} from memories where {which} order by created desc, id desc limit ?4")).map_err(err)?;
+        let found = st.query_map(params![kind, since, until, most as i64], memory).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+        Ok((found, total as u32))
     }
 
     /// The words a memory is about.
@@ -489,6 +536,19 @@ mod tests {
         assert_eq!(s.words_of(a).unwrap(), ["beach", "dog"]);
         assert_eq!(s.recent(2, None).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), [c, b]);
         assert_eq!(s.recent(5, Some(Kind::Photo)).unwrap().len(), 1);
+        // By when, and of what kind.
+        let old = s.add(&New { created: 50, ..new(Kind::Video, Some(Path::new("/v/old.mov")), "old.mov", "An old video", &[]) }, &[0.0, 1.0, 0.0]).unwrap();
+        s.add(&New { created: 100, part: 1, ..new(Kind::Video, Some(Path::new("/v/sea.mov")), "sea.mov", "A second passage", &[]) }, &[0.0, 1.0, 0.0]).unwrap();
+        let ids = |found: (Vec<Memory>, u32)| (found.0.iter().map(|m| m.id).collect::<Vec<_>>(), found.1);
+        assert_eq!(ids(s.between(Some(Kind::Video), None, None, 10).unwrap()), (vec![b, old], 2), "newest first, each file once");
+        assert_eq!(ids(s.between(Some(Kind::Video), Some(60), None, 10).unwrap()), (vec![b], 1));
+        assert_eq!(ids(s.between(None, None, Some(100), 10).unwrap()), (vec![old], 1), "up to, not including");
+        assert_eq!(ids(s.between(None, Some(100), Some(101), 2).unwrap()), (vec![c, b], 3), "no more than asked for, but all counted");
+        s.forget(old).unwrap();
+        s.forget_source(Path::new("/v/sea.mov")).unwrap();
+        let b = s.add(&new(Kind::Video, Some(Path::new("/v/sea.mov")), "sea.mov", "Waves on a beach", &beach), &[0.8, 0.6, 0.0]).unwrap();
+        let c2 = s.recent(2, None).unwrap();
+        assert_eq!(c2[0].id, b);
         let stats = s.stats().unwrap();
         assert_eq!((stats.total(), stats.of(Kind::Photo), stats.of(Kind::Note), stats.words), (3, 1, 0, 2));
         // An embedding of the wrong length is refused, not stored askew.
@@ -555,6 +615,40 @@ mod tests {
         let weight = |word: &str| cloud.iter().find(|w| w.word == word).unwrap().weight;
         assert!(weight("photo") < weight("beach") && weight("beach") > weight("invoice"), "being in every memory counts against a word");
         assert_eq!(s.cloud(2).unwrap().len(), 2);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_memory_keeps_to_the_model_it_began_with() {
+        use crate::model::fake::Fake;
+        struct Other;
+        impl crate::Model for Other {
+            fn name(&self) -> String {
+                "other".into()
+            }
+            fn dims(&self) -> Result<usize, String> {
+                Fake::default().dims()
+            }
+            fn embed(&self, texts: &[String], question: bool) -> Result<Vec<Vec<f32>>, String> {
+                Fake::default().embed(texts, question)
+            }
+            fn describe(&self, jpeg: &[u8]) -> Result<crate::model::Seen, String> {
+                Fake::default().describe(jpeg)
+            }
+            fn chat(&self, turns: &[crate::model::Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+                Fake::default().chat(turns, piece)
+            }
+        }
+        let path = scratch("model");
+        drop(Store::open_for(&path, &KEY, &Fake::default()).unwrap());
+        assert!(Store::open_for(&path, &KEY, &Fake::default()).is_ok(), "the same model again");
+        let refused = Store::open_for(&path, &KEY, &Other).err().unwrap();
+        assert_eq!(refused, "The memory was made with fake, and other is chosen now.", "same length, but not the same embeddings");
+        assert!(refused.starts_with(OTHER_MODEL) && Store::open(&path, &KEY, 3).err().unwrap().starts_with(OTHER_MODEL));
+        // Removed, it can be begun afresh with the other.
+        Store::delete(&path).unwrap();
+        Store::delete(&path).unwrap();
+        assert!(!path.exists() && Store::open_for(&path, &KEY, &Other).is_ok());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

@@ -75,6 +75,8 @@ struct Said {
     text: String,
     /// The memories an answer was given to draw on.
     recalled: Vec<Hit>,
+    /// The things listed for an answer about a kind or a time.
+    listed: Vec<Memory>,
 }
 
 /// The memories listed under the cloud, and what they are.
@@ -133,6 +135,15 @@ struct Apollo {
     stop_reading: Arc<AtomicBool>,
     /// Reading is held off because the computer is short of memory.
     held: bool,
+    /// The models as typed in Sources, before they are put to use: the one
+    /// that answers, the one that sees, the one that embeds.
+    drafts: [String; 3],
+    /// The models the server has.
+    installed: Vec<String>,
+    /// Why the memory cannot be used with the model now chosen, if it was
+    /// made with another.
+    stale: Option<String>,
+    asking_reset: bool,
     /// Says whether it is. Tests say so themselves.
     short_of_memory: fn() -> bool,
     trouble: Option<String>,
@@ -176,11 +187,20 @@ enum Msg {
     ReadDone(Progress),
     /// Reading stopped, or did not start, for want of memory.
     Held,
+    ModelDraft(usize, String),
+    /// Put the models typed to use.
+    UseModels,
+    Installed(Vec<String>),
+    AskReset,
+    CancelReset,
+    /// Forget everything and read it all again with the model now chosen.
+    Reset,
     StopReading,
     AddFolder,
     FolderOn(usize, bool),
     RemoveFolder(usize),
     RememberTalk(bool),
+    ReadAutomatically(bool),
 }
 
 /// A number with its noun: "1 memory", "1,204 memories".
@@ -229,6 +249,7 @@ impl Apollo {
         let server = Arc::new(Ollama::from_settings(&settings));
         let mut app = Self::with(server.clone(), neo_apollo_core::dir().join("memory.db"), None, Arc::new(key::authenticate));
         app.settings = settings;
+        app.drafts = app.chosen();
         app.settings_file = Some(Settings::file());
         app.server = Some(server);
         app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
@@ -272,6 +293,10 @@ impl Apollo {
             progress: Progress::default(),
             stop_reading: Arc::default(),
             held: false,
+            drafts: Default::default(),
+            installed: vec![],
+            stale: None,
+            asking_reset: false,
             short_of_memory: || false,
             trouble: None,
         }
@@ -299,9 +324,50 @@ impl Apollo {
     }
 
     /// What a thread needs to open the memory for itself.
-    fn memory(&self) -> Option<(PathBuf, [u8; 32], usize)> {
-        (self.ready == Engine::Ready && self.dims > 0).then_some(())?;
-        Some((self.db.clone(), self.key?, self.dims))
+    fn memory(&self) -> Option<(PathBuf, [u8; 32])> {
+        (self.ready == Engine::Ready && self.dims > 0 && self.stale.is_none()).then_some(())?;
+        Some((self.db.clone(), self.key?))
+    }
+
+    /// The models in use: the one that answers, the one that sees, the one that embeds.
+    fn chosen(&self) -> [String; 3] {
+        [self.settings.chat_model.clone(), self.settings.vision_model.clone(), self.settings.embed_model.clone()]
+    }
+
+    /// Puts the models typed in Sources to use.
+    fn use_models(&mut self) {
+        let typed = self.drafts.clone().map(|m| m.trim().to_owned());
+        if typed.iter().any(String::is_empty) || typed == self.chosen() {
+            return;
+        }
+        [self.settings.chat_model, self.settings.vision_model, self.settings.embed_model] = typed.clone();
+        self.drafts = typed;
+        self.save_settings();
+        // Tests have a model of their own, and no server to ask for another.
+        if self.server.is_some() {
+            let server = Arc::new(Ollama::from_settings(&self.settings));
+            (self.server, self.model) = (Some(server.clone()), server);
+            // Another model may make embeddings of another length, or ones that
+            // cannot be compared with those kept: found out when it is opened.
+            self.dims = 0;
+            self.stale = None;
+            self.lock();
+            self.check_model();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.asking_reset = false;
+        self.stop_reading.store(true, Ordering::Relaxed);
+        self.lock();
+        match Store::delete(&self.db) {
+            Ok(()) => {
+                self.stale = None;
+                self.progress = Progress::default();
+                self.read();
+            }
+            Err(e) => self.trouble = Some(format!("The memory could not be removed: {e}")),
+        }
     }
 
     fn save_settings(&mut self) {
@@ -317,7 +383,19 @@ impl Apollo {
         let Some(server) = self.server.clone() else { return };
         self.ready = Engine::Checking;
         self.work(move |send| {
-            let found = server.start().and_then(|()| server.missing()).and_then(|missing| if missing.is_empty() { server.dims().map(|d| (Engine::Ready, d)) } else { Ok((Engine::Missing(missing), 0)) });
+            let found = server.start().and_then(|()| server.missing()).and_then(|missing| {
+                if !missing.is_empty() {
+                    return Ok((Engine::Missing(missing), 0));
+                }
+                // There, but can each do what it was chosen for?
+                match server.unfit() {
+                    Some(why) => Ok((Engine::Trouble(why), 0)),
+                    None => server.dims().map(|d| (Engine::Ready, d)),
+                }
+            });
+            if let Ok(have) = server.models() {
+                send(Msg::Installed(have));
+            }
             let (ready, dims) = found.unwrap_or_else(|e| (Engine::Trouble(e), 0));
             send(Msg::Ready(ready, dims));
         });
@@ -351,8 +429,8 @@ impl Apollo {
             return;
         }
         let earlier: Vec<Turn> = self.talk.iter().map(|s| Turn::new(s.role, s.text.clone())).collect();
-        self.talk.push(Said { role: Role::User, text: question.clone(), recalled: vec![] });
-        self.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![] });
+        self.talk.push(Said { role: Role::User, text: question.clone(), recalled: vec![], listed: vec![] });
+        self.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![], listed: vec![] });
         self.draft.clear();
         self.said += 1;
         self.answering = true;
@@ -361,13 +439,14 @@ impl Apollo {
         // Apollo draws on the memory only once it has been unlocked. What
         // it is told and asked is written down either way.
         let (open, keep) = (self.store.is_some(), self.settings.remember_conversations);
+        let aware = assistant::Aware { reading: (self.reading && self.progress.total > 0).then_some((self.progress.done, self.progress.total)) };
         self.work(move |send| {
-            let mut store = memory.and_then(|(db, key, dims)| Store::open(&db, &key, dims).ok());
+            let mut store = memory.and_then(|(db, key)| Store::open_for(&db, &key, &*model).ok());
             if let Some(note) = assistant::told_to_remember(&question) {
                 let kept = store.as_mut().ok_or_else(|| "The memory could not be opened.".to_owned()).and_then(|s| assistant::keep_note(s, &*model, note));
-                return send(Msg::Answered(kept.map(|_| Answer { text: "I'll remember that.".into(), recalled: vec![] })));
+                return send(Msg::Answered(kept.map(|_| Answer { text: "I'll remember that.".into(), recalled: vec![], listed: vec![] })));
             }
-            let answer = assistant::ask(store.as_ref().filter(|_| open), &*model, &earlier, &question, &mut |piece| {
+            let answer = assistant::ask(store.as_ref().filter(|_| open), &*model, &earlier, &question, &aware, &mut |piece| {
                 send(Msg::Piece(piece.to_owned()));
                 !stop.load(Ordering::Relaxed)
             });
@@ -396,16 +475,13 @@ impl Apollo {
             return;
         };
         // Before the model has been asked, the database says what it was made for.
-        let dims = if self.dims > 0 { Some(self.dims) } else { Store::made_for(&self.db, &key) };
-        let Some(dims) = dims else {
-            self.trouble = Some("There is nothing to look through until the model is ready.".into());
-            return;
-        };
-        match Store::open(&self.db, &key, dims) {
+        let opened = if self.ready == Engine::Ready && self.dims > 0 { Store::open_for(&self.db, &key, &*self.model) } else { Store::made_for(&self.db, &key).ok_or_else(|| "There is nothing to look through until the model is ready.".to_owned()).and_then(|dims| Store::open(&self.db, &key, dims)) };
+        match opened {
             Ok(store) => {
                 self.store = Some(store);
                 self.show();
             }
+            Err(e) if e.starts_with(neo_apollo_core::store::OTHER_MODEL) => self.stale = Some(e),
             Err(e) => self.trouble = Some(e),
         }
     }
@@ -502,7 +578,7 @@ impl Apollo {
     }
 
     fn read(&mut self) {
-        let Some((db, key, dims)) = self.memory() else { return };
+        let Some((db, key)) = self.memory() else { return };
         if self.reading {
             return;
         }
@@ -516,7 +592,7 @@ impl Apollo {
         self.progress = Progress::default();
         let (model, roots, stop, short) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory);
         self.work(move |send| {
-            let done = match Store::open(&db, &key, dims) {
+            let done = match Store::open_for(&db, &key, &*model) {
                 Ok(mut store) => index::run(&mut store, &*model, &roots, &mut |p| {
                     send(Msg::Progress(p.clone()));
                     // Between files is where it can stop without losing anything.
@@ -528,6 +604,8 @@ impl Apollo {
                 }),
                 Err(e) => Progress { trouble: Some(e), ..Progress::default() },
             };
+            // Done for now: give the model's memory back.
+            model.rest();
             send(Msg::ReadDone(done));
         });
     }
@@ -541,6 +619,7 @@ impl Apollo {
             Engine::Pulling { .. } => "Downloading the model…".into(),
             Engine::Ready if self.reading && self.progress.total > 0 => format!("Reading {} of {}", (self.progress.done + 1).min(self.progress.total), self.progress.total),
             Engine::Ready if self.reading => "Looking through folders…".into(),
+            Engine::Ready if self.stale.is_some() => "Memory is another model's".into(),
             Engine::Ready if self.held => "Paused: memory is short".into(),
             Engine::Ready => "Up to date".into(),
         }
@@ -595,7 +674,7 @@ impl App for Apollo {
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
         let mut subs = vec![Desktop::subscription(Msg::Poll)];
-        if self.ready == Engine::Ready && !self.reading {
+        if self.ready == Engine::Ready && !self.reading && self.settings.read_automatically {
             subs.push(Subscription::every(if self.held { RETRY_EVERY } else { READ_EVERY }, Msg::Read));
         }
         subs
@@ -605,6 +684,10 @@ impl App for Apollo {
         // Whatever is under way stops at the next file or the next word.
         self.stop_reading.store(true, Ordering::Relaxed);
         self.stop_answer.store(true, Ordering::Relaxed);
+        // And the model's few gigabytes are given back at once.
+        if !cfg!(test) {
+            self.model.rest();
+        }
     }
 
     fn update(&mut self, m: Msg) {
@@ -624,7 +707,7 @@ impl App for Apollo {
                     self.dims = dims;
                 }
                 // The model is there: see what is new in the folders.
-                if first {
+                if first && self.settings.read_automatically {
                     self.read();
                 }
             }
@@ -651,7 +734,7 @@ impl App for Apollo {
                 self.said += 1;
                 let Some(last) = self.talk.last_mut() else { return };
                 match answer {
-                    Ok(a) => (last.text, last.recalled) = (a.text, a.recalled),
+                    Ok(a) => (last.text, last.recalled, last.listed) = (a.text, a.recalled, a.listed),
                     Err(e) => {
                         // What could not be answered is put back to be asked again.
                         self.talk.pop();
@@ -744,12 +827,26 @@ impl App for Apollo {
                     self.show();
                 }
             }
-            Msg::ReadDone(p) => {
+            Msg::ReadDone(mut p) => {
                 self.reading = false;
+                // Made with another model: said once, with what to do about it.
+                if let Some(why) = p.trouble.take_if(|t| t.starts_with(neo_apollo_core::store::OTHER_MODEL)) {
+                    self.stale = Some(why);
+                }
                 self.progress = p;
                 self.show();
             }
             Msg::Held => self.held = true,
+            Msg::ModelDraft(i, name) => {
+                if let Some(draft) = self.drafts.get_mut(i) {
+                    *draft = name;
+                }
+            }
+            Msg::UseModels => self.use_models(),
+            Msg::Installed(have) => self.installed = have,
+            Msg::AskReset => self.asking_reset = self.stale.is_some(),
+            Msg::CancelReset => self.asking_reset = false,
+            Msg::Reset => self.reset(),
             Msg::StopReading => self.stop_reading.store(true, Ordering::Relaxed),
             Msg::AddFolder => {
                 if let Some(dir) = rfd::FileDialog::new().set_title("Add a Folder for Apollo to Read").pick_folder() {
@@ -774,6 +871,13 @@ impl App for Apollo {
                     self.read();
                 }
             }
+            Msg::ReadAutomatically(on) => {
+                self.settings.read_automatically = on;
+                self.save_settings();
+                if on {
+                    self.read();
+                }
+            }
             Msg::RememberTalk(on) => {
                 self.settings.remember_conversations = on;
                 self.save_settings();
@@ -782,7 +886,8 @@ impl App for Apollo {
     }
 
     fn view(&self) -> Element<Msg> {
-        self.desktop.with_settings(self.content(), "Apollo Settings", Msg::Desktop, vec![])
+        let content = if self.asking_reset { self.reset_sheet() } else { self.content() };
+        self.desktop.with_settings(content, "Apollo Settings", Msg::Desktop, vec![])
     }
 }
 
@@ -794,6 +899,19 @@ impl Apollo {
             Page::Sources => self.sources_page(),
         };
         split(self.sidebar(), main)
+    }
+
+    /// Asks before everything remembered is thrown away.
+    fn reset_sheet(&self) -> Element<Msg> {
+        let buttons = row().spacing(8.0).push(Space::new(Length::Fill, 0.0)).push(Button::new(text("Cancel")).on_press(Msg::CancelReset)).push(Button::new(text("Forget and Read Again")).kind(ButtonKind::Accent).on_press(Msg::Reset));
+        let sheet = column()
+            .spacing(10.0)
+            .width(Length::Fill)
+            .push(text("Start Apollo's memory afresh?").role(TextRole::Title))
+            .push(text(format!("Everything Apollo remembers will be forgotten, including notes and conversations, which cannot be read back from any file. Your folders will then be read again with {}, which takes as long as it did the first time.", self.settings.embed_model)).tone(Tone::Muted).width(Length::Fill))
+            .push(Space::new(0.0, 4.0))
+            .push(buttons);
+        neo_desktop::ui::modal(self.content(), sheet, 460.0, Msg::CancelReset)
     }
 
     fn sidebar(&self) -> Element<Msg> {
@@ -830,7 +948,7 @@ impl Apollo {
             Engine::Ready => return None,
             Engine::Checking => card(icons::SPARKLES, "Starting Apollo's model", "It runs on this computer; the first start takes a moment.".into(), None),
             Engine::Trouble(why) => card(icons::TRIANGLE_ALERT, "Apollo's model is not running", why.clone(), Some(Button::new(text("Try Again")).on_press(Msg::CheckModel).into())),
-            Engine::Missing(models) => card(icons::DOWNLOAD, "Apollo needs to download its model", format!("{} will be downloaded once, about 3.6 GB in all, and then run on this computer. Nothing you ask or keep here is sent anywhere.", models.join(" and ")), Some(Button::new(text("Download")).kind(ButtonKind::Accent).on_press(Msg::Pull).into())),
+            Engine::Missing(models) => card(icons::DOWNLOAD, "Apollo needs to download its model", format!("{} will be downloaded once, a few gigabytes, and then run on this computer. Nothing you ask or keep here is sent anywhere.", models.join(" and ")), Some(Button::new(text("Download")).kind(ButtonKind::Accent).on_press(Msg::Pull).into())),
             Engine::Pulling { model, status, done, total } => {
                 let how_far = if *total > 0 { format!("{} of {}", neo_desktop::fs::human_size(*done), neo_desktop::fs::human_size(*total)) } else { status.clone() };
                 card(icons::DOWNLOAD, &format!("Downloading {model}"), how_far, None)
@@ -880,16 +998,11 @@ impl Apollo {
         }
         let waiting = s.text.is_empty() && self.answering;
         let mut answer = column().spacing(8.0).width(Length::Fill).push(text(if waiting { "Thinking…".to_owned() } else { s.text.clone() }).tone(if waiting { Tone::Muted } else { Tone::Inherit }).width(Length::Fill));
-        // Each file once, however many passages of it were looked at.
-        let mut files: Vec<&Memory> = vec![];
-        for hit in &s.recalled {
-            if hit.memory.source.is_some() && !files.iter().any(|m| m.source == hit.memory.source) {
-                files.push(&hit.memory);
-            }
-        }
+        // The files the answer names, of those it was given to draw on.
+        let files = assistant::named(&s.text, &s.listed, &s.recalled);
         if !files.is_empty() {
             let mut chips = row().spacing(6.0);
-            for m in files.into_iter().take(4) {
+            for m in files.into_iter().take(5) {
                 let chip = row().spacing(6.0).align(Align::Center).push(icon(kind_icon(m.kind)).size(13.0)).push(text(snippet(&m.title, 26)).role(TextRole::Caption).no_wrap());
                 chips = chips.push(Button::new(chip).padding([10.0, 5.0]).radius(12.0).on_press_maybe(m.source.clone().map(Msg::Open)));
             }
@@ -1002,6 +1115,7 @@ impl Apollo {
             page = page.push(notice(Tone::Bad, why.clone()));
         }
 
+        page = page.push(setting("Read by itself", "When Apollo opens, and now and then while it is open. Reading keeps a model of a few gigabytes in memory until it is done; turned off, the folders are read only when you press Read Now.", toggle(self.settings.read_automatically, Msg::ReadAutomatically)));
         page = page.push(section("Folders"));
         for (i, f) in self.settings.folders.iter().enumerate() {
             let help = if !f.path.is_dir() {
@@ -1020,11 +1134,20 @@ impl Apollo {
         page = page.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PLUS).size(14.0)).push(text("Add Folder…"))).on_press(Msg::AddFolder)));
 
         page = page.push(section("Conversations")).push(setting("Remember what I ask", "What you ask Apollo and what it answers go into its memory, so it can be brought up later.", toggle(self.settings.remember_conversations, Msg::RememberTalk)));
-        page = page.push(section("Where it all is")).push(setting(
-            "On this computer",
-            &format!("{} describes pictures and answers; {} places text by meaning. Both run here, and nothing is sent anywhere.", self.settings.chat_model, self.settings.embed_model),
-            text(if self.ready == Engine::Ready { "Running" } else { "Not running" }).role(TextRole::Caption).tone(if self.ready == Engine::Ready { Tone::Good } else { Tone::Warn }),
-        ));
+        // The models, which can be any the server has or can get.
+        let running = text(if self.ready == Engine::Ready { "Running" } else { "Not running" }).role(TextRole::Caption).tone(if self.ready == Engine::Ready { Tone::Good } else { Tone::Warn });
+        page = page.push(section("Models")).push(setting("On this computer", "Apollo's models are served by Ollama here, and nothing is sent anywhere. Any model it offers can be used: type its name as Ollama lists it, such as qwen3:8b, and it is downloaded if it is not here yet.", running));
+        let jobs = [("Answers with", "The model that holds the conversation."), ("Describes pictures with", "A model that can see: it is shown each picture and each frame of a video."), ("Places text by meaning with", "An embedding model. Memories made with one cannot be searched with another, so changing it means starting the memory afresh.")];
+        for (i, (title, help)) in jobs.into_iter().enumerate() {
+            page = page.push(setting(title, help, text_input("model name", self.drafts[i].clone()).on_input(move |name| Msg::ModelDraft(i, name)).on_submit(Msg::UseModels).width(230.0)));
+        }
+        let changed = self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() && self.drafts.iter().all(|m| !m.trim().is_empty());
+        let have = if self.installed.is_empty() { "Type a model's name and press Use These Models.".to_owned() } else { format!("Here already: {}", self.installed.join(", ")) };
+        page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(have).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Use These Models")).on_press_maybe(changed.then_some(Msg::UseModels))));
+        if let Some(why) = &self.stale {
+            page = page.push(notice(Tone::Warn, format!("{why} Go back to the model it was made with, or start the memory afresh."))).push(row().push(Button::new(text("Start Memory Afresh…")).on_press(Msg::AskReset)));
+        }
+        page = page.push(section("Where it all is"));
         page = page.push(setting("Encrypted memory", &format!("{}, encrypted with a key in your keychain. Looking through it takes your login.", short_path(&self.db)), text(if self.store.is_some() { "Unlocked" } else { "Locked" }).role(TextRole::Caption).tone(Tone::Muted)));
         scrollable(page).into()
     }
@@ -1040,7 +1163,7 @@ fn read_folders() -> Result<(), String> {
     if !missing.is_empty() {
         return Err(format!("{} must be downloaded first: open Apollo, or run `ollama pull` for each.", missing.join(" and ")));
     }
-    let mut store = Store::open(&neo_apollo_core::dir().join("memory.db"), &key::database_key()?, model.dims()?)?;
+    let mut store = Store::open_for(&neo_apollo_core::dir().join("memory.db"), &key::database_key()?, &model)?;
     let done = index::run(&mut store, &model, &settings.roots(), &mut |p| {
         if let Some(now) = &p.now {
             println!("[{} of {}] {}", p.done + 1, p.total, now.display());
@@ -1115,6 +1238,7 @@ fn sample(name: &str, filed: bool) -> (Apollo, PathBuf) {
     }
     drop(store);
     let mut app = Apollo::with(model, dir.join("memory.db"), Some(key), Arc::new(|_| Ok(())));
+    app.drafts = app.chosen();
     // Shown in snapshots only: a test that reads must not read the real ones.
     if filed {
         app.settings.folders = ["Pictures", "Movies", "Documents"].iter().map(|d| Folder { path: home.join(d), on: true }).collect();
@@ -1361,8 +1485,8 @@ mod tests {
         let (mut a, _scratch) = app("fail");
         a.update(Msg::Draft("Hello".into()));
         a.answering = true;
-        a.talk.push(Said { role: Role::User, text: "Hello".into(), recalled: vec![] });
-        a.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![] });
+        a.talk.push(Said { role: Role::User, text: "Hello".into(), recalled: vec![], listed: vec![] });
+        a.talk.push(Said { role: Role::Assistant, text: String::new(), recalled: vec![], listed: vec![] });
         a.update(Msg::Piece("Hi".into()));
         assert_eq!(a.talk[1].text, "Hi", "an answer shows as it comes");
         a.update(Msg::Answered(Err("The model server did not answer.".into())));
@@ -1447,6 +1571,8 @@ mod tests {
         let mut a = Apollo::with(model, dir.join("memory.db"), Some([9; 32]), Arc::new(|_| Ok(())));
         a.settings.folders = vec![Folder { path: folder, on: true }];
         a.settings.remember_conversations = false;
+        // Not on a computer that is short of memory.
+        a.short_of_memory = neo_apollo_core::pressure::short_of_memory;
         let began = std::time::Instant::now();
         a.update(Msg::Read);
         println!("read in {:?}: {:?}", began.elapsed(), a.progress);
@@ -1482,13 +1608,90 @@ mod tests {
         a.update(Msg::Clear);
         if let Ok(q) = std::env::var("NEO_APOLLO_ASK") {
             let began = std::time::Instant::now();
+            a.update(Msg::Page(Page::Ask));
             a.update(Msg::Suggest(q));
             let said = a.talk.last().unwrap();
             println!("answered in {:?}: {}\n  from {:?}; trouble {:?}", began.elapsed(), said.text, said.recalled.iter().map(|h| (h.memory.title.as_str(), h.distance)).collect::<Vec<_>>(), a.trouble);
+            println!("  listed {:?}; named {:?}", said.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), assistant::named(&said.text, &said.listed, &said.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>());
+            a.model.rest();
             shoot(a, "probe-ask");
         }
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-probe-swap-{}", std::process::id())));
+    }
+
+    /// The test model under another name: its embeddings are the same
+    /// length, but a memory made with one must not be used with the other.
+    struct Renamed(neo_apollo_core::model::fake::Fake);
+    impl Model for Renamed {
+        fn name(&self) -> String {
+            "another".into()
+        }
+        fn dims(&self) -> Result<usize, String> {
+            self.0.dims()
+        }
+        fn embed(&self, texts: &[String], question: bool) -> Result<Vec<Vec<f32>>, String> {
+            self.0.embed(texts, question)
+        }
+        fn describe(&self, jpeg: &[u8]) -> Result<neo_apollo_core::model::Seen, String> {
+            self.0.describe(jpeg)
+        }
+        fn chat(&self, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+            self.0.chat(turns, piece)
+        }
+    }
+
+    #[test]
+    fn models_can_be_changed_and_a_memory_keeps_to_the_one_it_was_made_with() {
+        let (mut a, scratch) = app("models");
+        let file = scratch.0.join("settings");
+        a.settings_file = Some(file.clone());
+        assert_eq!(a.drafts, ["gemma3:4b".to_owned(), "gemma3:4b".to_owned(), "nomic-embed-text".to_owned()]);
+        // Typed and put to use, the choice is saved; one left empty is not taken.
+        a.update(Msg::ModelDraft(0, " qwen3:8b ".into()));
+        a.update(Msg::ModelDraft(1, "   ".into()));
+        a.update(Msg::UseModels);
+        assert_eq!(a.settings.chat_model, "gemma3:4b", "not with one of them empty");
+        a.update(Msg::ModelDraft(1, "qwen3-vl:8b".into()));
+        a.update(Msg::UseModels);
+        assert_eq!((a.settings.chat_model.as_str(), a.settings.vision_model.as_str(), a.settings.embed_model.as_str()), ("qwen3:8b", "qwen3-vl:8b", "nomic-embed-text"));
+        let saved = Settings::load_from(&file);
+        assert_eq!((saved.chat_model, saved.vision_model), ("qwen3:8b".to_owned(), "qwen3-vl:8b".to_owned()));
+        a.update(Msg::Installed(vec!["qwen3:8b".into()]));
+
+        // The memory is marked as the first model's when it is first used.
+        let folder = scratch.0.join("things");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("trail.txt"), "Notes on hiking the mountain trail.").unwrap();
+        a.settings.folders = vec![Folder { path: folder, on: true }];
+        a.update(Msg::Read);
+        assert_eq!((a.progress.read, a.stale.clone()), (1, None));
+        // With another model's embeddings it is not read into, searched or opened.
+        a.model = Arc::new(Renamed(Default::default()));
+        a.update(Msg::Read);
+        let why = a.stale.clone().expect("said to be another model's");
+        assert_eq!(why, "The memory was made with fake, and another is chosen now.");
+        assert_eq!((a.status(), a.progress.trouble.clone()), ("Memory is another model's".to_owned(), None));
+        a.update(Msg::Unlock);
+        assert!(a.store.is_none() && a.memory().is_none());
+        a.update(Msg::Suggest("Where is the dog?".into()));
+        assert!(a.talk.last().unwrap().recalled.is_empty(), "it answers, but not from a memory it cannot read");
+        // Asked first; cancelled, nothing is lost.
+        a.update(Msg::AskReset);
+        assert!(a.asking_reset);
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.app_mut().update(Msg::Page(Page::Sources));
+        h.render(1.0);
+        h.key(Key::Escape, Modifiers::default());
+        let mut a = std::mem::replace(h.app_mut(), sample("models-swap", false).0);
+        assert!(!a.asking_reset && a.stale.is_some() && a.db.is_file());
+        // Agreed to, the memory is begun afresh with the new model and read into.
+        a.update(Msg::AskReset);
+        a.update(Msg::Reset);
+        assert_eq!((a.stale.clone(), a.asking_reset, a.progress.read), (None, false, 1));
+        a.update(Msg::Unlock);
+        assert_eq!((a.stats.total(), a.stats.of(Kind::Document)), (1, 1), "only what was read again; the rest is gone");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-models-swap-{}", std::process::id())));
     }
 
     #[test]

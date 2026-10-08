@@ -69,9 +69,9 @@ fn modified(meta: &std::fs::Metadata) -> u64 {
     meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
 }
 
-/// Every file under `roots` that Apollo reads: documents, then photos,
-/// then videos, and the newest of each first, so that what was just made
-/// is remembered soonest.
+/// Every file under `roots` that Apollo reads: documents, which are quick,
+/// and then photos and videos together, the newest first, so that what
+/// was just made is remembered soonest.
 pub fn walk(roots: &[PathBuf]) -> Vec<PathBuf> {
     fn into(dir: &Path, out: &mut Vec<(What, u64, PathBuf)>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -102,7 +102,10 @@ pub fn walk(roots: &[PathBuf]) -> Vec<PathBuf> {
     for root in roots {
         into(root, &mut found);
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    // Photos and videos take their turn together by age: read by kind, a
+    // large folder of photos would keep every video waiting for days.
+    let turn = |what: What| what != What::Document;
+    found.sort_by(|a, b| turn(a.0).cmp(&turn(b.0)).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
     found.dedup_by(|a, b| a.2 == b.2);
     found.into_iter().map(|f| f.2).collect()
 }
