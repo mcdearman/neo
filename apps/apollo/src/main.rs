@@ -57,6 +57,8 @@ const LOGGED: usize = 60;
 const WATCH_EVERY: Duration = Duration::from_secs(60);
 const LOOK_OVER_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const WARNINGS_KEPT: usize = 20;
+/// The choices for how long the memory stays unlocked unused, in minutes.
+const STAY_UNLOCKED: [(u32, &str); 4] = [(5, "5 minutes"), (15, "15 minutes"), (60, "1 hour"), (0, "Until it quits")];
 /// How wide a model's menu button is in Sources.
 const MODEL_W: f32 = 230.0;
 /// How tall the cloud is, and the graph that takes its place.
@@ -220,6 +222,15 @@ struct Apollo {
     /// Files a search turned up only listed that were sent to be looked at,
     /// so that none is sent twice.
     asked_after: Vec<PathBuf>,
+    /// The window is showing. Closed with Apollo set to stay ready, it is
+    /// only out of sight, and a question brings it back.
+    in_sight: bool,
+    quit: bool,
+    /// When the memory was last used, for locking it again after a while.
+    last_used: std::time::Instant,
+    /// Unlocking was refused for the question that is waiting, which is
+    /// then asked without the memory.
+    declined: bool,
     /// What has been warned of lately, newest last, and when each kind of
     /// thing was last said, so that it is not said over and over.
     warnings: Vec<Warning>,
@@ -318,6 +329,16 @@ enum Msg {
     /// What was found worth warning of.
     Warned(Vec<Warning>),
     WarnMe(bool),
+    /// Put the window out of sight, with Apollo still running.
+    Hide,
+    Show,
+    Quit,
+    /// Time to see whether the memory has sat unused long enough to lock.
+    Tick,
+    Background(bool),
+    /// How long the memory stays unlocked unused, in minutes; nothing for
+    /// until Apollo quits.
+    StayUnlocked(u32),
     AskReset,
     CancelReset,
     /// Forget everything and read it all again with the model now chosen.
@@ -506,6 +527,10 @@ impl Apollo {
             remote_draft: String::new(),
             choosing: None,
             typing: None,
+            in_sight: true,
+            quit: false,
+            last_used: std::time::Instant::now(),
+            declined: false,
             warnings: vec![],
             warned: HashMap::new(),
             looked_over: None,
@@ -599,6 +624,21 @@ impl Apollo {
         self.remote_draft = self.settings.remote.clone();
         self.save_settings();
         self.serve_anew();
+    }
+
+    /// Takes up a change in how long the models are kept, which needs no
+    /// checking of them again and no locking of the memory.
+    fn serve_anew_quietly(&mut self) {
+        if self.server.is_some() {
+            let server = Arc::new(Ollama::from_settings(&self.settings));
+            (self.server, self.model) = (Some(server.clone()), server.clone());
+            if self.settings.background && self.ready == Engine::Ready {
+                self.work(move |_| server.warm());
+            } else if !self.settings.background {
+                // Not kept any longer: they go when they have sat idle a few minutes.
+                self.work(move |_| server.rest_all());
+            }
+        }
     }
 
     /// Takes up the models and servers as they are now set.
@@ -711,6 +751,11 @@ impl Apollo {
                 continue;
             }
             self.warned.insert(w.key.clone(), now);
+            // Short of memory, Apollo gives back what it holds; it is a second or two in coming back.
+            if w.key == "memory" && self.server.is_some() && !self.reading && !self.answering {
+                let model = self.model.clone();
+                self.work(move |_| model.rest_all());
+            }
             (self.tell)(&w);
             self.warnings.push(w);
             if self.warnings.len() > WARNINGS_KEPT {
@@ -747,10 +792,17 @@ impl Apollo {
     fn ask_what_waits(&mut self) {
         let Some(question) = self.waiting_question.clone() else { return };
         self.draft = question;
-        if self.ready == Engine::Ready && !self.answering {
-            self.waiting_question = None;
-            self.send();
+        if self.ready != Engine::Ready || self.answering || self.unlocking {
+            return;
         }
+        // Locked, the memory is asked for first, so that the answer can be
+        // from it: the check comes up once, and not again while it stays
+        // unlocked. Refused, the question is asked all the same.
+        if self.store.is_none() && self.key.is_some() && !self.declined {
+            return self.unlock();
+        }
+        (self.waiting_question, self.declined) = (None, false);
+        self.send();
     }
 
     fn send(&mut self) {
@@ -764,6 +816,7 @@ impl Apollo {
         self.draft.clear();
         self.said += 1;
         self.answering = true;
+        self.last_used = std::time::Instant::now();
         self.stop_answer = Arc::default();
         let (model, memory, stop) = (self.model.clone(), self.memory(), self.stop_answer.clone());
         // Apollo draws on the memory only once it has been unlocked. What
@@ -967,6 +1020,7 @@ impl Apollo {
             return;
         }
         self.searching = true;
+        self.last_used = std::time::Instant::now();
         let model = self.model.clone();
         self.work(move |send| {
             let vector = model.embed(std::slice::from_ref(&question), true).and_then(|mut v| v.pop().ok_or_else(|| "no embedding".to_owned()));
@@ -1108,6 +1162,20 @@ impl App for Apollo {
         self.desktop.app_menu(Msg::Desktop)
     }
 
+    fn window_state(&self) -> WindowState {
+        WindowState { visible: self.in_sight, ..WindowState::default() }
+    }
+
+    /// Set to stay ready, closing the window only puts it out of sight:
+    /// Apollo goes on answering the search bar, and Quit ends it.
+    fn on_close(&self) -> Option<Msg> {
+        self.settings.background.then_some(Msg::Hide)
+    }
+
+    fn should_exit(&self) -> bool {
+        self.quit
+    }
+
     fn theme(&self, system: Scheme) -> Theme {
         self.desktop.theme(system)
     }
@@ -1115,7 +1183,13 @@ impl App for Apollo {
     fn menus(&self) -> Vec<Menu<Msg>> {
         let ready = self.ready == Engine::Ready;
         vec![
-            Menu::new("File").push(MenuEntry::new("New Conversation", Msg::NewTalk).shortcut(Shortcut::command("n")).enabled(!self.talk.is_empty() && !self.answering)).separator().push(MenuEntry::new("Add Folder…", Msg::AddFolder)).push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading)),
+            Menu::new("File")
+                .push(MenuEntry::new("New Conversation", Msg::NewTalk).shortcut(Shortcut::command("n")).enabled(!self.talk.is_empty() && !self.answering))
+                .separator()
+                .push(MenuEntry::new("Add Folder…", Msg::AddFolder))
+                .push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading))
+                .separator()
+                .push(MenuEntry::new("Quit Apollo", Msg::Quit)),
             Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))).push(MenuEntry::new("Activity", Msg::Page(Page::Activity)).shortcut(Shortcut::command("4"))),
             Menu::new("Memory")
                 .push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking))
@@ -1141,14 +1215,19 @@ impl App for Apollo {
         self.watch();
         if self.proxy.is_some() {
             self.keep_watch();
+            keep_at_startup(self.settings.background);
         }
         // Questions from the search bar, and from an Apollo started with one
         // while this is running.
         if let Some(proxy) = self.proxy.clone() {
             std::thread::spawn(move || {
                 let Ok(questions) = neo_desktop::apollo::Questions::open() else { return };
-                while let Ok(question) = questions.next() {
-                    if !question.trim().is_empty() && !proxy.send(Msg::Ask(question)) {
+                while let Ok(asked) = questions.next() {
+                    let heard = match asked {
+                        neo_desktop::apollo::Asked::Question(question) if !question.trim().is_empty() => Msg::Ask(question),
+                        _ => Msg::Show,
+                    };
+                    if !proxy.send(heard) {
                         break;
                     }
                 }
@@ -1160,6 +1239,9 @@ impl App for Apollo {
         let mut subs = vec![Desktop::subscription(Msg::Poll)];
         if self.settings.warn {
             subs.push(Subscription::every(WATCH_EVERY, Msg::Watch));
+        }
+        if self.store.is_some() && self.settings.stay_unlocked > 0 {
+            subs.push(Subscription::every(Duration::from_secs(20), Msg::Tick));
         }
         if self.ready == Engine::Ready && !self.reading && self.settings.read_automatically {
             subs.push(Subscription::every(if self.held { RETRY_EVERY } else { READ_EVERY }, Msg::Read));
@@ -1195,6 +1277,11 @@ impl App for Apollo {
                 }
                 // The model is there: see what is new in the folders.
                 if first {
+                    // Ahead of the first question, so that it does not wait on a model coming in.
+                    if self.settings.background && self.server.is_some() {
+                        let model = self.model.clone();
+                        self.work(move |_| model.warm());
+                    }
                     self.ask_what_waits();
                 }
                 if first && self.settings.read_automatically {
@@ -1211,6 +1298,7 @@ impl App for Apollo {
                 self.send();
             }
             Msg::Ask(question) => {
+                self.in_sight = true;
                 self.page = Page::Ask;
                 self.waiting_question = Some(question);
                 self.ask_what_waits();
@@ -1228,6 +1316,7 @@ impl App for Apollo {
                 }
                 self.answering = false;
                 self.looking = None;
+                self.last_used = std::time::Instant::now();
                 self.said += 1;
                 // One that came in the meantime is asked when this is dealt with.
                 let waits = self.waiting_question.is_some();
@@ -1265,9 +1354,16 @@ impl App for Apollo {
             Msg::Unlocked(outcome) => {
                 self.unlocking = false;
                 match outcome {
-                    Ok(()) => self.open_memory(),
-                    Err(e) => self.trouble = Some(e),
+                    Ok(()) => {
+                        self.last_used = std::time::Instant::now();
+                        self.open_memory();
+                    }
+                    Err(e) => {
+                        self.trouble = Some(e);
+                        self.declined = true;
+                    }
                 }
+                self.ask_what_waits();
             }
             Msg::Lock => self.lock(),
             Msg::Query(text) => self.query = text,
@@ -1295,6 +1391,7 @@ impl App for Apollo {
                     None => trail.push(word),
                 }
                 self.go(trail);
+                self.last_used = std::time::Instant::now();
                 self.asked = None;
                 self.query.clear();
                 self.show();
@@ -1343,6 +1440,27 @@ impl App for Apollo {
             }
 
             Msg::Read => self.read(),
+            Msg::Hide => self.in_sight = false,
+            Msg::Show => self.in_sight = true,
+            Msg::Quit => self.quit = true,
+            Msg::Tick => {
+                // Unused for long enough, the memory is locked again.
+                let keep = self.settings.stay_unlocked;
+                if self.store.is_some() && keep > 0 && !self.answering && self.last_used.elapsed() >= Duration::from_secs(u64::from(keep) * 60) {
+                    self.lock();
+                }
+            }
+            Msg::Background(on) => {
+                self.settings.background = on;
+                self.save_settings();
+                keep_at_startup(on);
+                self.serve_anew_quietly();
+            }
+            Msg::StayUnlocked(minutes) => {
+                self.settings.stay_unlocked = minutes;
+                self.last_used = std::time::Instant::now();
+                self.save_settings();
+            }
             Msg::Watch => self.keep_watch(),
             Msg::Warned(found) => self.warn(found),
             Msg::WarnMe(on) => {
@@ -1882,6 +2000,15 @@ impl Apollo {
         }
         page = page.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PLUS).size(14.0)).push(text("Add Folder…"))).on_press(Msg::AddFolder)));
 
+        let unlocked_for = segmented(STAY_UNLOCKED.iter().map(|(_, label)| *label), STAY_UNLOCKED.iter().position(|(m, _)| *m == self.settings.stay_unlocked), |i| Msg::StayUnlocked(STAY_UNLOCKED[i.min(3)].0));
+        page = page
+            .push(section("Ready when asked"))
+            .push(setting(
+                "Stay ready in the background",
+                &format!("Closing the window leaves Apollo running out of sight, with the model that answers kept in memory (about a gigabyte), so a question from the search bar ({}) is answered at once. It starts at login the same way. Quit Apollo, in the File menu, ends it.", if cfg!(target_os = "macos") { "⌘⇧A" } else { "Ctrl+Shift+A" }),
+                toggle(self.settings.background, Msg::Background),
+            ))
+            .push(setting("Keep the memory unlocked for", "Unlocked once, the memory stays so while questions keep coming, and locks again when it has gone unused this long. A question asked while it is locked brings up the login check first.", unlocked_for));
         page = page.push(section("Warnings")).push(setting(
             "Warn me",
             "While it is open Apollo keeps an eye on the computer and says, through NeoShell, when memory or the disk is running out and what is using it, and when something stands open: a disk that is not encrypted, a firewall that is off, a model server the whole network can use, a key or a token lying in a file it reads. It looks and tells; it changes nothing.",
@@ -1926,6 +2053,22 @@ impl Apollo {
         page = page.push(section("Where it all is"));
         page = page.push(setting("Encrypted memory", &format!("{}, encrypted with a key in your keychain. Looking through it takes your login.", short_path(&self.db)), text(if self.store.is_some() { "Unlocked" } else { "Locked" }).role(TextRole::Caption).tone(Tone::Muted)));
         scrollable(page).into()
+    }
+}
+
+/// Has Apollo start at login, out of sight, for an installed copy that
+/// is set to stay ready; and not, once it is set not to.
+fn keep_at_startup(wanted: bool) {
+    let installed = std::env::current_exe().is_ok_and(|p| !p.components().any(|c| c.as_os_str() == "target"));
+    let Ok(program) = std::env::current_exe() else { return };
+    if !installed || cfg!(test) {
+        return;
+    }
+    let entry = neo_desktop::autostart::Entry { id: "org.neo.Apollo", name: "Apollo", program: &program, args: &["--hidden"] };
+    match (wanted, neo_desktop::autostart::is_enabled(&entry)) {
+        (true, false) => drop(neo_desktop::autostart::enable(&entry)),
+        (false, true) => drop(neo_desktop::autostart::disable(&entry)),
+        _ => {}
     }
 }
 
@@ -1974,7 +2117,13 @@ fn main() {
     {
         return;
     }
+    // Opened again while it runs out of sight, the one that is running shows itself.
+    if question.is_none() && !args.iter().any(|a| a == "--hidden") && neo_desktop::apollo::show() {
+        return;
+    }
     let mut app = Apollo::new();
+    // Started at login, it waits out of sight for the search bar.
+    app.in_sight = !args.iter().any(|a| a == "--hidden") || question.is_some();
     app.waiting_question = question.clone();
     app.draft = question.unwrap_or_default();
     if let Err(e) = neo::run(app) {
@@ -2393,6 +2542,59 @@ mod tests {
         assert_eq!((a.talk.len(), a.waiting_question.as_deref()), (6, Some("Second")));
         a.update(Msg::Answered(Ok(Answer { text: "Done.".into(), recalled: vec![], listed: vec![] })));
         assert_eq!((a.talk.len(), a.talk[6].text.as_str(), a.talk[5].text.as_str(), a.waiting_question.clone()), (8, "Second", "Done.", None));
+    }
+
+    #[test]
+    fn apollo_waits_out_of_sight_and_the_memory_locks_itself_when_left() {
+        let (mut a, scratch) = app("background");
+        a.settings_file = Some(scratch.0.join("settings"));
+        assert!(a.settings.background && a.settings.stay_unlocked == 15 && a.window_state().visible);
+        // Closing the window only puts it away; a question brings it back.
+        let closing = a.on_close();
+        assert!(matches!(closing, Some(Msg::Hide)));
+        a.update(Msg::Hide);
+        assert!(!a.window_state().visible && !a.should_exit());
+        // Locked, a question brings up the login check once, and is answered from the memory.
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        a.check = Arc::new(|_| {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        a.update(Msg::Ask("Which photos show a dog on the beach?".into()));
+        assert!(a.window_state().visible && a.store.is_some());
+        assert_eq!((CHECKS.load(Ordering::Relaxed), a.talk.len(), a.talk[1].recalled.is_empty() && a.talk[1].listed.is_empty()), (1, 2, false));
+        // Another soon after needs no check.
+        a.update(Msg::Hide);
+        a.update(Msg::Ask("And the mountain?".into()));
+        assert_eq!((CHECKS.load(Ordering::Relaxed), a.talk.len()), (1, 4));
+        // Left unused for as long as it is set to stay unlocked, it locks; not before, and not mid-answer.
+        a.update(Msg::Tick);
+        assert!(a.store.is_some());
+        a.last_used = std::time::Instant::now().checked_sub(Duration::from_secs(16 * 60)).unwrap();
+        a.answering = true;
+        a.update(Msg::Tick);
+        assert!(a.store.is_some());
+        a.answering = false;
+        a.update(Msg::Tick);
+        assert!(a.store.is_none(), "locked again");
+        // The next question asks for the login again; refused, it is answered without the memory.
+        a.check = Arc::new(|_| Err("Authentication was cancelled.".into()));
+        a.update(Msg::Ask("What about the cat?".into()));
+        assert_eq!((a.talk.len(), a.store.is_none(), a.declined, a.waiting_question.clone()), (6, true, false, None));
+        assert!(a.talk[5].text.ends_with("0 memories."));
+        // Set to stay unlocked until it quits, time does not lock it.
+        a.check = Arc::new(|_| Ok(()));
+        a.update(Msg::Unlock);
+        a.update(Msg::StayUnlocked(0));
+        a.last_used = std::time::Instant::now().checked_sub(Duration::from_secs(3 * 3600)).unwrap();
+        a.update(Msg::Tick);
+        assert!(a.store.is_some() && Settings::load_from(&scratch.0.join("settings")).stay_unlocked == 0);
+        // Set not to stay ready, closing the window ends it; and Quit always does.
+        a.update(Msg::Background(false));
+        assert!(a.on_close().is_none() && !Settings::load_from(&scratch.0.join("settings")).background);
+        a.update(Msg::Show);
+        a.update(Msg::Quit);
+        assert!(a.should_exit());
     }
 
     #[test]

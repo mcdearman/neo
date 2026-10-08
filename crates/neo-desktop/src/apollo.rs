@@ -28,10 +28,30 @@ impl Questions {
         Inbox::open_at(port_file).map(Self)
     }
 
-    /// Waits for the next question.
-    pub fn next(&self) -> std::io::Result<String> {
-        self.0.recv().map(|note| note.title)
+    /// Waits for the next thing asked of it.
+    pub fn next(&self) -> std::io::Result<Asked> {
+        self.0.recv().map(|note| if note.title == SHOW { Asked::Show } else { Asked::Question(note.title) })
     }
+}
+
+/// What a running Apollo is asked from outside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    Question(String),
+    /// Only to show its window: it was opened again while running out of sight.
+    Show,
+}
+
+/// What stands for "show yourself", which no question is.
+const SHOW: &str = "\u{1}show";
+
+/// Has the running Apollo show its window. False if none is running.
+pub fn show() -> bool {
+    let shown = send_to(&port_file(), SHOW);
+    if shown && cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn();
+    }
+    shown
 }
 
 /// Sends a question to the Apollo that noted its port in `port_file`.
@@ -70,7 +90,12 @@ mod tests {
         let heard = std::thread::spawn(move || (questions.next().unwrap(), questions.next().unwrap()));
         assert!(send_to(&file, "Which photos show a dog?"));
         assert!(send_to(&file, "Two lines\nand an = sign"));
-        assert_eq!(heard.join().unwrap(), ("Which photos show a dog?".to_owned(), "Two lines\nand an = sign".to_owned()));
+        assert_eq!(heard.join().unwrap(), (Asked::Question("Which photos show a dog?".to_owned()), Asked::Question("Two lines\nand an = sign".to_owned())));
+        // Asked only to show itself, it hears that and not a question.
+        let questions = Questions::open_at(file.clone()).unwrap();
+        let heard = std::thread::spawn(move || questions.next().unwrap());
+        assert!(send_to(&file, SHOW));
+        assert_eq!(heard.join().unwrap(), Asked::Show);
         assert!(!send_to(&file, "gone now"), "once it has stopped listening, too");
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }

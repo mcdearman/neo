@@ -42,13 +42,20 @@ pub struct Settings {
     /// Whether Apollo warns, through NeoShell, of memory or disk running
     /// out and of what stands open.
     pub warn: bool,
+    /// Whether Apollo stays running out of sight when its window is
+    /// closed, with the model that answers kept in memory, so that a
+    /// question from the search bar is answered at once.
+    pub background: bool,
+    /// How long the memory stays unlocked after it was last used, in
+    /// minutes. Nothing, to stay unlocked until Apollo quits.
+    pub stay_unlocked: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
         let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
-        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remote: String::new(), chat_remote: false, vision_remote: false, embed_remote: false, remember_conversations: true, read_automatically: true, look_ahead: false, warn: true }
+        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remote: String::new(), chat_remote: false, vision_remote: false, embed_remote: false, remember_conversations: true, read_automatically: true, look_ahead: false, warn: true, background: true, stay_unlocked: 15 }
     }
 }
 
@@ -77,7 +84,7 @@ impl Settings {
     }
 
     pub fn encode(&self) -> String {
-        let mut out = format!("chat-model={}\nvision-model={}\nembed-model={}\nserver={}\nremember-conversations={}\nread-automatically={}\nlook-ahead={}\nwarnings={}\n", self.chat_model, self.vision_model, self.embed_model, self.server, self.remember_conversations, self.read_automatically, self.look_ahead, self.warn);
+        let mut out = format!("chat-model={}\nvision-model={}\nembed-model={}\nserver={}\nremember-conversations={}\nread-automatically={}\nlook-ahead={}\nwarnings={}\nbackground={}\nstay-unlocked-minutes={}\n", self.chat_model, self.vision_model, self.embed_model, self.server, self.remember_conversations, self.read_automatically, self.look_ahead, self.warn, self.background, self.stay_unlocked);
         // Said even when there are none, so that none is not read as the defaults.
         out.push_str("folders=\n");
         out.push_str(&format!("remote-server={}\nchat-remote={}\nvision-remote={}\nembed-remote={}\n", self.remote, self.chat_remote, self.vision_remote, self.embed_remote));
@@ -109,6 +116,8 @@ impl Settings {
                 "read-automatically" => s.read_automatically = value != "false",
                 "look-ahead" => s.look_ahead = value == "true",
                 "warnings" => s.warn = value != "false",
+                "background" => s.background = value != "false",
+                "stay-unlocked-minutes" => s.stay_unlocked = value.parse().unwrap_or(s.stay_unlocked),
                 "folder" | "folder-off" => {
                     named = true;
                     if !value.is_empty() && !folders.iter().any(|f: &Folder| f.path == Path::new(value)) {
@@ -153,6 +162,8 @@ mod tests {
             read_automatically: false,
             look_ahead: true,
             warn: false,
+            background: false,
+            stay_unlocked: 60,
         };
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(s.roots(), [PathBuf::from("/a b/c")]);

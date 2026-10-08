@@ -63,6 +63,10 @@ pub trait Model: Send + Sync {
     /// nothing need do nothing.
     fn rest(&self) {}
 
+    /// Brings into memory what answering needs, ahead of being asked, so
+    /// that the first answer does not wait on it.
+    fn warm(&self) {}
+
     /// Lets go of everything it holds in memory, for when Apollo closes.
     fn rest_all(&self) {
         self.rest();
@@ -86,6 +90,9 @@ pub struct Ollama {
     embed_model: String,
     /// Whether each job (answering, seeing, embedding) is done on the other computer.
     away: [bool; 3],
+    /// Whether the model that answers is kept in memory between
+    /// questions, to answer at once, and not let go after a few minutes.
+    kept_ready: bool,
     dims: OnceLock<usize>,
 }
 
@@ -111,6 +118,9 @@ const KEEP_ANSWERING: &str = "5m";
 /// The embedding model is a few hundred megabytes and every search needs
 /// it, so it stays: this is what Apollo holds while it waits to be asked.
 const KEEP_EMBEDDING: &str = "30m";
+/// With Apollo set to stay ready, the two models that answering needs
+/// stay for as long as it runs: about a gigabyte and a third between them.
+const KEEP_READY: &str = "24h";
 
 const DESCRIBE: &str = "Describe this image for someone who will search for it later by what is in it. In `description`, say in two to four plain sentences what it shows: the people, animals, objects, place, activity, and any text that can be read. For each person or character, say whether they look like a man, woman, boy or girl, the colour and style of their hair, what they are wearing and its colours, and their expression, since searches are often for such details. Name a well-known person or character only if you are sure who it is. If it is a screenshot, say what app or page it shows and what is on it. In `tags`, give six to ten single words or short phrases for what is actually in this image, most important first, lower case; where there are people, include their telling details, such as the colour of their hair. Describe only what you can see.";
 
@@ -120,7 +130,7 @@ fn agent(wait: Option<Duration>) -> ureq::Agent {
 
 impl Ollama {
     pub fn new(server: &str, chat_model: &str, vision_model: &str, embed_model: &str) -> Self {
-        Self { server: server.trim_end_matches('/').to_owned(), remote: None, chat_model: chat_model.to_owned(), vision_model: vision_model.to_owned(), embed_model: embed_model.to_owned(), away: [false; 3], dims: OnceLock::new() }
+        Self { server: server.trim_end_matches('/').to_owned(), remote: None, chat_model: chat_model.to_owned(), vision_model: vision_model.to_owned(), embed_model: embed_model.to_owned(), away: [false; 3], kept_ready: false, dims: OnceLock::new() }
     }
 
     /// Has the jobs marked in `away` (answering, seeing, embedding) done by
@@ -139,7 +149,15 @@ impl Ollama {
     }
 
     pub fn from_settings(s: &crate::settings::Settings) -> Self {
-        Self::new(&s.server, &s.chat_model, &s.vision_model, &s.embed_model).with_remote(&s.remote, [s.chat_remote, s.vision_remote, s.embed_remote])
+        let mut model = Self::new(&s.server, &s.chat_model, &s.vision_model, &s.embed_model).with_remote(&s.remote, [s.chat_remote, s.vision_remote, s.embed_remote]);
+        model.kept_ready = s.background;
+        model
+    }
+
+    /// How long the model that answers, and the one that embeds, stay in
+    /// memory after they were last asked something.
+    fn keep(&self, otherwise: &'static str) -> &'static str {
+        if self.kept_ready { KEEP_READY } else { otherwise }
     }
 
     /// The other computer's address as it is used, if one is.
@@ -352,6 +370,12 @@ impl Model for Ollama {
         self.unload(&[ANSWER, SEE, EMBED]);
     }
 
+    fn warm(&self) {
+        // Asked for nothing, a model is loaded and kept.
+        let _ = self.post(self.at(ANSWER), "/api/generate", &json!({ "model": self.chat_model, "keep_alive": self.keep(KEEP_ANSWERING) }), Some(Duration::from_secs(120)));
+        let _ = self.post(self.at(EMBED), "/api/embed", &json!({ "model": self.embed_model, "input": "ready", "keep_alive": self.keep(KEEP_EMBEDDING) }), Some(Duration::from_secs(120)));
+    }
+
     fn dims(&self) -> Result<usize, String> {
         if let Some(d) = self.dims.get() {
             return Ok(*d);
@@ -377,7 +401,7 @@ impl Model for Ollama {
             "search_document: "
         };
         let input: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-        let mut res = self.post(self.at(EMBED), "/api/embed", &json!({ "model": self.embed_model, "input": input, "keep_alive": KEEP_EMBEDDING, "truncate": true }), Some(Duration::from_secs(300)))?;
+        let mut res = self.post(self.at(EMBED), "/api/embed", &json!({ "model": self.embed_model, "input": input, "keep_alive": self.keep(KEEP_EMBEDDING), "truncate": true }), Some(Duration::from_secs(300)))?;
         let v: Value = res.body_mut().read_json().map_err(|e| e.to_string())?;
         let out: Vec<Vec<f32>> = v["embeddings"].as_array().map(|all| all.iter().map(|e| e.as_array().map(|e| e.iter().map(|f| f.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default()).collect()).unwrap_or_default();
         if out.len() != texts.len() {
@@ -408,7 +432,7 @@ impl Model for Ollama {
                 json!({ "role": role, "content": t.text })
             })
             .collect();
-        let mut res = self.post(self.at(ANSWER), "/api/chat", &json!({ "model": self.chat_model, "stream": true, "keep_alive": KEEP_ANSWERING, "messages": messages }), Some(Duration::from_secs(600)))?;
+        let mut res = self.post(self.at(ANSWER), "/api/chat", &json!({ "model": self.chat_model, "stream": true, "keep_alive": self.keep(KEEP_ANSWERING), "messages": messages }), Some(Duration::from_secs(600)))?;
         let mut said = String::new();
         for line in BufReader::new(res.body_mut().as_reader()).lines() {
             let line = line.map_err(|e| format!("The answer stopped: {e}"))?;
@@ -591,10 +615,12 @@ mod tests {
         assert_eq!(m.describe(b"jpeg").unwrap(), Seen { text: "A hill.".into(), words: vec!["hill".into()] });
         assert_eq!(m.embed(&["x".into()], false).unwrap(), vec![vec![0.5, 0.5]]);
         m.rest_all();
+        m.warm();
         let (here_log, there_log) = (asked_here.lock().unwrap().clone(), asked_there.lock().unwrap().clone());
         assert!(there_log.contains(&"/api/chat large".to_owned()) && there_log.contains(&"/api/chat sees".to_owned()) && there_log.contains(&"/api/generate large".to_owned()), "{there_log:?}");
         assert!(here_log.contains(&"/api/embed embed".to_owned()) && here_log.iter().all(|a| !a.contains("large") && !a.contains("sees")), "nothing of what was given away is asked here: {here_log:?}");
         assert!(there_log.iter().all(|a| !a.contains("/api/embed")), "and the embedding never leaves: {there_log:?}");
+        assert_eq!((there_log.last().map(String::as_str), here_log.last().map(String::as_str)), (Some("/api/generate large"), Some("/api/embed embed")), "warmed, each where it runs");
         assert_eq!((m.models_at(true).unwrap(), m.models().unwrap()), (vec!["large".to_owned(), "sees".to_owned()], vec!["small:latest".to_owned(), "embed".to_owned()]));
         // A model the other computer lacks is missing though this one has it, and the other way about.
         let m = Ollama::new(&here, "small", "sees", "embed").with_remote(&there, [true, false, false]);
