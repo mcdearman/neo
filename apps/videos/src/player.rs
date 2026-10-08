@@ -1,12 +1,18 @@
-//! Video playback behind one interface.
+//! Video playback behind one interface, with two ways of doing it.
 //!
-//! - macOS: AVFoundation, through `mac_player.m`. It decodes with hardware
-//!   help, plays the sound, and seeks exactly.
-//! - Linux and Windows: `ffmpeg` decodes frames into a pipe and `ffplay`
-//!   plays the sound. Pausing and seeking restart both at the new position.
-//!   A Neo session would use PipeWire and GStreamer instead.
+//! - The system's player, on macOS: AVFoundation, through `mac_player.m`.
+//!   It decodes with hardware help, plays the sound, and seeks exactly,
+//!   but reads only the kinds of file Apple's software does.
+//! - `ffmpeg`, everywhere: it decodes frames into a pipe and `ffplay`
+//!   plays the sound. Pausing and seeking restart both at the new
+//!   position. It reads everything. A Neo session would use PipeWire and
+//!   GStreamer instead.
+//!
+//! On macOS a file the system reads is played by the system, and
+//! anything else, or anything the system turns out not to manage, by
+//! `ffmpeg`. Elsewhere it is always `ffmpeg`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use neo::Image;
 
@@ -14,7 +20,8 @@ use neo::Image;
 const MAX_WIDTH: i32 = 1920;
 
 /// Whether the file is ready to play.
-// ffmpeg reports problems when the file is opened, so only macOS loads later.
+// ffmpeg reports problems when the file is opened, so only the system's
+// player loads later.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -23,18 +30,126 @@ pub enum Status {
     Failed(String),
 }
 
-pub use imp::Player;
-
 /// Lets a headless run make progress. Windowed apps never need it.
 pub fn pump(seconds: f64) {
     #[cfg(target_os = "macos")]
-    imp::pump(seconds);
+    system::pump(seconds);
     #[cfg(not(target_os = "macos"))]
     std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
 }
 
+/// The kinds of file the system's own player reads. Anything else goes
+/// straight to ffmpeg, without waiting for the system to give up on it.
 #[cfg(target_os = "macos")]
-mod imp {
+const SYSTEM_READS: &[&str] = &["mov", "mp4", "m4v", "3gp", "3g2", "qt"];
+
+enum Backend {
+    #[cfg(target_os = "macos")]
+    System(system::Player),
+    Ffmpeg(ff::Player),
+}
+
+/// An open video, played by whichever of the two can. Use it from the
+/// main thread only.
+pub struct Player {
+    /// Kept for handing the file to the other player.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    path: PathBuf,
+    backend: Backend,
+}
+
+/// Does the same thing with whichever player is behind it.
+macro_rules! either {
+    ($self:expr, $p:ident => $body:expr) => {
+        match &mut $self.backend {
+            #[cfg(target_os = "macos")]
+            Backend::System($p) => $body,
+            Backend::Ffmpeg($p) => $body,
+        }
+    };
+}
+
+/// The same, for what only looks.
+macro_rules! either_ref {
+    ($self:expr, $p:ident => $body:expr) => {
+        match &$self.backend {
+            #[cfg(target_os = "macos")]
+            Backend::System($p) => $body,
+            Backend::Ffmpeg($p) => $body,
+        }
+    };
+}
+
+impl Player {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        if neo_desktop::fs::has_extension(path, SYSTEM_READS) {
+            return system::Player::open(path).map(|p| Self { path: path.to_path_buf(), backend: Backend::System(p) });
+        }
+        ff::Player::open(path).map(|p| Self { path: path.to_path_buf(), backend: Backend::Ffmpeg(p) })
+    }
+
+    /// Which of the two is playing it, for saying so.
+    pub fn by_ffmpeg(&self) -> bool {
+        matches!(self.backend, Backend::Ffmpeg(_))
+    }
+
+    /// Whether the file is ready. A file the system's player gives up on
+    /// is handed to ffmpeg, which reads more, before it is called a failure.
+    pub fn status(&mut self) -> Status {
+        let status = either_ref!(self, p => p.status());
+        #[cfg(target_os = "macos")]
+        if let (Status::Failed(why), Backend::System(_)) = (&status, &self.backend) {
+            return match ff::Player::open(&self.path) {
+                Ok(p) => {
+                    self.backend = Backend::Ffmpeg(p);
+                    Status::Ready
+                }
+                // What the system said is the more telling of the two.
+                Err(_) => Status::Failed(why.clone()),
+            };
+        }
+        status
+    }
+
+    pub fn set_playing(&mut self, playing: bool) {
+        either!(self, p => p.set_playing(playing))
+    }
+
+    pub fn playing(&self) -> bool {
+        either_ref!(self, p => p.playing())
+    }
+
+    pub fn seek(&mut self, seconds: f64) {
+        either!(self, p => p.seek(seconds))
+    }
+
+    pub fn position(&self) -> f64 {
+        either_ref!(self, p => p.position())
+    }
+
+    pub fn duration(&self) -> Option<f64> {
+        either_ref!(self, p => p.duration())
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        either!(self, p => p.set_volume(volume))
+    }
+
+    /// Quarter turns clockwise to draw frames with, for video recorded sideways.
+    pub fn turns(&self) -> u8 {
+        either_ref!(self, p => p.turns())
+    }
+
+    /// The frame for this moment, if it differs from the last one given.
+    /// Pass the previous frame so its texture is reused.
+    pub fn frame(&mut self, previous: Option<&Image>) -> Option<Image> {
+        either!(self, p => p.frame(previous))
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod system {
     use super::*;
     use std::ffi::{c_char, c_int, c_void, CString};
 
@@ -140,11 +255,9 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod imp {
+mod ff {
     use super::*;
     use std::io::Read;
-    use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -213,7 +326,7 @@ mod imp {
 
     impl Player {
         pub fn open(path: &Path) -> Result<Self, String> {
-            let out = Command::new("ffprobe")
+            let out = Command::new(neo_desktop::fs::tool("ffprobe"))
                 .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "default=noprint_wrappers=1"])
                 .arg(path)
                 .output()
@@ -236,7 +349,7 @@ mod imp {
         /// the video's own speed; otherwise it writes one frame and stops.
         fn decode_from(&mut self, at: f64, playing: bool) {
             let (w, h) = self.size;
-            let mut cmd = Command::new("ffmpeg");
+            let mut cmd = Command::new(neo_desktop::fs::tool("ffmpeg"));
             cmd.args(["-loglevel", "error", "-noautorotate"]);
             if playing {
                 // -re reads the input in real time, so frames arrive when due.
@@ -266,7 +379,7 @@ mod imp {
 
         fn play_audio_from(&mut self, at: f64) {
             let volume = (self.volume * 100.0).round() as u32;
-            self.audio = Command::new("ffplay")
+            self.audio = Command::new(neo_desktop::fs::tool("ffplay"))
                 .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-vn"])
                 .arg("-ss")
                 .arg(format!("{at:.3}"))
@@ -380,5 +493,104 @@ mod imp {
             assert_eq!(output_size(&Info { width: 853, height: 481, ..info }), (852, 480), "sizes are made even");
             assert!(parse_info("duration=3.0\n").is_none(), "no video stream");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A second of test pattern in a container of the kind named, made
+    /// with ffmpeg itself. `None` where there is no ffmpeg to make it.
+    fn clip(name: &str) -> Option<PathBuf> {
+        let path = std::env::temp_dir().join(format!("neo-videos-{}-{name}", std::process::id()));
+        let made = Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=24", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
+        made.then_some(path)
+    }
+
+    /// Waits for the player to have a frame to show.
+    fn first_frame(player: &mut Player) -> Option<Image> {
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            pump(0.05);
+            if let Status::Failed(why) = player.status() {
+                panic!("it would not play: {why}");
+            }
+            if let Some(frame) = player.frame(None) {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_kind_the_system_cannot_read_is_played_by_ffmpeg() {
+        let Some(path) = clip("pattern.mkv") else { return };
+        let mut player = Player::open(&path).expect("ffmpeg reads Matroska");
+        assert!(player.by_ffmpeg(), "not the system's player, which does not");
+        assert!(first_frame(&mut player).is_some(), "a picture before anything is played");
+        assert!(player.duration().is_some_and(|d| (1.5..2.5).contains(&d)), "{:?}", player.duration());
+        assert!(!player.playing() && player.position() == 0.0);
+        // Playing moves the clock, and brings new frames.
+        player.set_playing(true);
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut frames = 0;
+        while Instant::now() < until && (player.position() < 0.5 || frames < 2) {
+            pump(0.03);
+            frames += player.frame(None).is_some() as u32;
+        }
+        assert!(player.playing() && player.position() >= 0.5 && frames >= 2, "position {}, frames {frames}", player.position());
+        // Pausing holds it; seeking goes where asked.
+        player.set_playing(false);
+        let held = player.position();
+        pump(0.2);
+        assert_eq!(player.position(), held);
+        player.seek(1.0);
+        assert!((player.position() - 1.0).abs() < 0.01);
+        drop(player);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The system's player answers on the main thread's run loop, which a
+    // test does not have: `neo-videos --snapshot DIR VIDEO` checks this.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn a_kind_the_system_reads_is_played_by_the_system() {
+        let Some(path) = clip("pattern.mp4") else { return };
+        let mut player = Player::open(&path).expect("the system reads MPEG-4");
+        assert!(!player.by_ffmpeg());
+        assert!(first_frame(&mut player).is_some());
+        drop(player);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The system's player answers on the main thread's run loop, which a
+    // test does not have: `neo-videos --snapshot DIR VIDEO` checks this.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn what_the_system_gives_up_on_is_handed_to_ffmpeg() {
+        // Matroska inside, whatever the name says: the system starts on
+        // it, fails, and ffmpeg takes over without the app being told.
+        let Some(made) = clip("really.mkv") else { return };
+        let path = made.with_extension("mov");
+        std::fs::rename(&made, &path).unwrap();
+        let mut player = Player::open(&path).expect("opened by the system, to begin with");
+        assert!(!player.by_ffmpeg());
+        assert!(first_frame(&mut player).is_some(), "a picture all the same");
+        assert!(player.by_ffmpeg(), "by ffmpeg, in the end");
+        drop(player);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_file_nothing_can_read_says_so() {
+        let path = std::env::temp_dir().join(format!("neo-videos-{}-notes.mkv", std::process::id()));
+        std::fs::write(&path, "not a video at all").unwrap();
+        assert!(Player::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 }

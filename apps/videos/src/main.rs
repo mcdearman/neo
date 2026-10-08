@@ -324,7 +324,8 @@ fn snapshots(dir: PathBuf, video: Option<PathBuf>) {
                 h.app_mut().update(Msg::Tick);
             }
             let a = h.app();
-            println!("position {:.2} of {:?}, playing {}, frame {:?}, error {:?}", a.position, a.duration, a.playing, a.frame.as_ref().map(|f| (f.width(), f.height())), a.error);
+            let by = a.player.as_ref().map(|p| if p.by_ffmpeg() { "ffmpeg" } else { "the system's player" });
+            println!("played by {by:?}: position {:.2} of {:?}, playing {}, frame {:?}, error {:?}", a.position, a.duration, a.playing, a.frame.as_ref().map(|f| (f.width(), f.height())), a.error);
         }
         let path = dir.join(format!("{name}.png"));
         h.save_png(&path, 1.0).expect("write png");
