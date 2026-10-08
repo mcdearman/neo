@@ -54,6 +54,9 @@ const LOOK_FOR_ANSWER: usize = 6;
 const LOOK_FOR_SEARCH: usize = 12;
 /// How many files the Activity page's list goes back.
 const LOGGED: usize = 60;
+/// The place among the model menus of the one that listens, after the
+/// three that answer, see and embed.
+const HEARS: usize = 3;
 /// How often memory and disk are looked at, how often what stands open
 /// is, and how many warnings the Activity page keeps.
 const WATCH_EVERY: Duration = Duration::from_secs(60);
@@ -142,6 +145,8 @@ enum Reading {
     Changed(Vec<PathBuf>),
     /// Files that are only listed, to be looked at now.
     LookAt(Vec<PathBuf>),
+    /// The rest of recordings that go on past their first stretch.
+    HearMore,
 }
 
 /// Asks the user to prove who they are; an error says why they did not.
@@ -489,6 +494,7 @@ impl Apollo {
         let mut app = Self::with(server.clone(), neo_apollo_core::dir().join("memory.db"), None, Arc::new(key::authenticate));
         app.settings = settings;
         app.drafts = app.chosen();
+        neo_apollo_core::hear::use_listener(&app.settings.hear_model);
         app.drafts_away = app.away();
         app.remote_draft = app.settings.remote.clone();
         app.settings_file = Some(Settings::file());
@@ -1088,6 +1094,21 @@ impl Apollo {
         }
     }
 
+    /// Sets runners to listening to the rest of recordings that go on
+    /// past their first stretch, if there are any and nothing else is
+    /// being read. They take up again from where they stopped.
+    fn hear_the_rest(&mut self) {
+        if self.reading || !self.settings.read_automatically {
+            return;
+        }
+        let Some((db, key)) = self.memory() else { return };
+        // Asked of a store of its own, as this may be while the memory is locked.
+        let waiting = Store::open_for(&db, &key, &*self.model).and_then(|s| s.unheard_count()).unwrap_or(0);
+        if waiting > 0 {
+            self.read_some(Reading::HearMore);
+        }
+    }
+
     /// Brings the memory up to date: with everything in the folders, with
     /// what changed, or by looking at some files that are only listed.
     fn read_some(&mut self, what: Reading) {
@@ -1122,6 +1143,7 @@ impl Apollo {
                 (Ok(mut store), Reading::All) => index::run(&mut store, &*model, &roots, ahead, &mut report),
                 (Ok(mut store), Reading::Changed(changed)) => index::update(&mut store, &*model, &roots, &changed, ahead, &mut report),
                 (Ok(mut store), Reading::LookAt(files)) => index::look_at_files(&mut store, &*model, files, &mut report),
+                (Ok(mut store), Reading::HearMore) => index::hear_more(&mut store, &*model, neo_apollo_core::hear::listener().runners(), &mut report),
                 (Err(e), _) => Progress { trouble: Some(e), ..Progress::default() },
             };
             // Done for now: give the memory of the model that sees back.
@@ -1165,6 +1187,7 @@ impl Apollo {
             Engine::Trouble(_) => "The model is not running".into(),
             Engine::Missing(_) => "The model needs downloading".into(),
             Engine::Pulling { .. } => "Downloading the model…".into(),
+            Engine::Ready if self.reading && self.progress.listening => format!("Listening to the rest of {}", count(self.progress.total.saturating_sub(self.progress.done).max(1) as u32, "recording", "recordings")),
             Engine::Ready if self.reading && self.progress.total > 0 => format!("{} {} of {}", if self.progress.looking { "Looking at" } else { "Listing" }, (self.progress.done + 1).min(self.progress.total), self.progress.total),
             Engine::Ready if self.reading => "Looking through folders…".into(),
             Engine::Ready if self.stale.is_some() => "Memory is another model's".into(),
@@ -1558,7 +1581,7 @@ impl Apollo {
             }
             Msg::GetHearing => {
                 if self.hearing.is_none() {
-                    self.hearing = Some((0, neo_apollo_core::hear::MODEL_BYTES));
+                    self.hearing = Some((0, neo_apollo_core::hear::listener().bytes));
                     self.work(|send| {
                         let mut last = std::time::Instant::now();
                         let fetched = neo_apollo_core::hear::download(&mut |done, total| {
@@ -1616,6 +1639,8 @@ impl Apollo {
                 // Whatever changed while that was going on.
                 self.catch_up();
                 self.look_into_the_list();
+                // And with nothing else to do, the rest of what is long is listened to.
+                self.hear_the_rest();
             }
             Msg::Held => self.held = true,
             Msg::ModelDraft(i, name) => {
@@ -1633,6 +1658,16 @@ impl Apollo {
                 self.choosing = Some((i, Point::new(under.x, under.bottom() + 4.0)));
             }
             Msg::CloseChoice => self.choosing = None,
+            Msg::PickModel(HEARS, id, _) => {
+                self.choosing = None;
+                self.settings.hear_model = id;
+                neo_apollo_core::hear::use_listener(&self.settings.hear_model);
+                self.save_settings();
+                // Not here yet: fetched now, so that it is in use and not only chosen.
+                if !cfg!(test) && !neo_apollo_core::hear::listener().here() {
+                    self.update(Msg::GetHearing);
+                }
+            }
             Msg::PickModel(i, name, away) => {
                 self.choosing = None;
                 if i < 3 {
@@ -1733,6 +1768,11 @@ impl Apollo {
     }
 
     fn model_menu(&self, job: usize) -> Vec<MenuItem<Msg>> {
+        // The models that listen are a few known ones, fetched by Apollo itself.
+        if job == HEARS {
+            let now = neo_apollo_core::hear::listener();
+            return neo_apollo_core::hear::LISTENERS.iter().map(|l| if *l == now { MenuItem::new(l.name, Msg::CloseChoice).icon(icons::CHECK) } else { MenuItem::new(format!("{}  ·  {}{}", l.name, neo_desktop::fs::human_size(l.bytes), if l.here() { "" } else { ", to fetch" }), Msg::PickModel(HEARS, l.id.to_owned(), false)) }).collect();
+        }
         let job = job.min(2);
         let (now, now_away) = (self.chosen()[job].clone(), self.away()[job]);
         // Had as "name:latest", chosen as "name": the same model.
@@ -1971,7 +2011,7 @@ impl Apollo {
                 .spacing(12.0)
                 .align(Align::Center)
                 .width(Length::Fill)
-                .push(text(format!("What is said in videos and recordings is not being listened to yet. The model that writes it down is fetched once, about {}, and runs on this computer.", neo_desktop::fs::human_size(hear::MODEL_BYTES))).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
+                .push(text(format!("What is said in videos and recordings is not being listened to yet. The model that writes it down is fetched once, about {}, and runs on this computer.", neo_desktop::fs::human_size(hear::listener().bytes))).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
                 .push(Button::new(text("Fetch It")).on_press(Msg::GetHearing))
                 .into(),
         })
@@ -2185,6 +2225,10 @@ impl Apollo {
             };
             page = page.push(setting(title, help, control));
         }
+        // The one that listens: a few sizes of Whisper, the larger the surer of the words.
+        let listens = neo_apollo_core::hear::listener();
+        let face = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text(listens.name).no_wrap().width(Length::Fill)).push(icon(icons::CHEVRONS_UP_DOWN).size(14.0).tone(Tone::Muted));
+        page = page.push(setting("Listens with", &format!("The model that writes down what is said in videos and recordings. {} It is fetched once and runs on this computer; what was listened to before stays as it was heard.", listens.note), mouse_area(container(face).surface(Surface::Raised).radius(8.0).padding([12.0, 7.0]).width(MODEL_W)).on_press_in(|at| Msg::ChooseModel(HEARS, at))));
         if let Some(i) = self.typing {
             let changed = (self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() || self.drafts_away != away) && self.drafts.iter().all(|m| !m.trim().is_empty());
             let onto = if self.drafts_away[i.min(2)] { format!("Type a model's name and press Return. It is downloaded onto {} if it is not there yet.", self.remote_name()) } else { "Type a model's name and press Return. It is downloaded if it is not here yet.".to_owned() };
@@ -3183,6 +3227,23 @@ mod tests {
         assert_eq!(told.iter().filter(|p| p.ends_with("inner/new.txt")).count(), 1, "a file written twice in a burst is told of once");
         drop(watcher);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_model_that_listens_can_be_chosen() {
+        let (mut a, scratch) = app("listens");
+        a.settings_file = Some(scratch.0.join("settings"));
+        a.update(Msg::ChooseModel(HEARS, Rect::new(700.0, 500.0, 230.0, 32.0)));
+        let menu = a.model_menu(HEARS);
+        assert_eq!(menu.len(), neo_apollo_core::hear::LISTENERS.len(), "one entry for each size there is");
+        // Picked, it is saved; and it is the one in use (put back after, as other tests listen with it).
+        let before = neo_apollo_core::hear::listener();
+        a.update(Msg::PickModel(HEARS, "turbo".into(), false));
+        assert_eq!((a.choosing, a.settings.hear_model.as_str(), Settings::load_from(&scratch.0.join("settings")).hear_model.as_str(), neo_apollo_core::hear::listener().id), (None, "turbo", "turbo", "turbo"));
+        neo_apollo_core::hear::use_listener(before.id);
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.app_mut().update(Msg::Page(Page::Sources));
+        h.render(1.0);
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct Settings {
     pub vision_model: String,
     /// The model that turns text into embeddings.
     pub embed_model: String,
+    /// The model that writes down what is said: one of `hear::LISTENERS`, by its id.
+    pub hear_model: String,
     /// Where the model server on this computer listens.
     pub server: String,
     /// The address of a model server on another computer, for models too
@@ -55,7 +57,24 @@ impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
         let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
-        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remote: String::new(), chat_remote: false, vision_remote: false, embed_remote: false, remember_conversations: true, read_automatically: true, look_ahead: false, warn: true, background: true, stay_unlocked: 15 }
+        Self {
+            folders,
+            chat_model: "gemma3:1b".into(),
+            vision_model: "gemma3:4b".into(),
+            embed_model: "nomic-embed-text".into(),
+            hear_model: "base".into(),
+            server: "http://127.0.0.1:11434".into(),
+            remote: String::new(),
+            chat_remote: false,
+            vision_remote: false,
+            embed_remote: false,
+            remember_conversations: true,
+            read_automatically: true,
+            look_ahead: false,
+            warn: true,
+            background: true,
+            stay_unlocked: 15,
+        }
     }
 }
 
@@ -88,6 +107,7 @@ impl Settings {
         // Said even when there are none, so that none is not read as the defaults.
         out.push_str("folders=\n");
         out.push_str(&format!("remote-server={}\nchat-remote={}\nvision-remote={}\nembed-remote={}\n", self.remote, self.chat_remote, self.vision_remote, self.embed_remote));
+        out.push_str(&format!("hear-model={}\n", self.hear_model));
         for f in &self.folders {
             out.push_str(&format!("{}={}\n", if f.on { "folder" } else { "folder-off" }, f.path.display()));
         }
@@ -107,6 +127,7 @@ impl Settings {
                 "chat-model" if !value.is_empty() => s.chat_model = value.into(),
                 "vision-model" if !value.is_empty() => s.vision_model = value.into(),
                 "embed-model" if !value.is_empty() => s.embed_model = value.into(),
+                "hear-model" if !value.is_empty() => s.hear_model = value.into(),
                 "server" if !value.is_empty() => s.server = value.trim_end_matches('/').into(),
                 "remote-server" => s.remote = value.trim_end_matches('/').into(),
                 "chat-remote" => s.chat_remote = value == "true",
@@ -153,6 +174,7 @@ mod tests {
             chat_model: "qwen3".into(),
             vision_model: "llava".into(),
             embed_model: "embed".into(),
+            hear_model: "turbo".into(),
             server: "http://box:1".into(),
             remote: "http://studio.local:11434".into(),
             chat_remote: true,

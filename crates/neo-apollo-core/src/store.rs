@@ -241,6 +241,7 @@ impl Store {
              create virtual table if not exists word_vectors using vec0(embedding float[{dims}] distance_metric=cosine);
              create table if not exists memory_words(memory integer not null, word integer not null, primary key(memory, word)) without rowid;
              create index if not exists memory_words_word on memory_words(word);
+             create table if not exists unheard(path text primary key, heard integer not null);
              create table if not exists files(path text primary key, stamp text not null, memories integer not null);"
         ))
         .map_err(err)?;
@@ -250,6 +251,38 @@ impl Store {
             db.execute_batch("alter table memories add column light integer not null default 0;").map_err(err)?;
         }
         Ok(Self { db, dims })
+    }
+
+    /// Notes that a recording has been listened to as far as `heard`
+    /// seconds of its sound, and that there is more of it.
+    pub fn set_unheard(&mut self, path: &Path, heard: u32) -> Result<(), String> {
+        self.db.execute("insert into unheard(path, heard) values (?1, ?2) on conflict(path) do update set heard = ?2", params![path.to_string_lossy(), heard]).map(|_| ()).map_err(err)
+    }
+
+    /// Notes that a recording has been listened to to its end.
+    pub fn all_heard(&mut self, path: &Path) -> Result<(), String> {
+        self.db.execute("delete from unheard where path = ?1", [path.to_string_lossy()]).map(|_| ()).map_err(err)
+    }
+
+    /// The recordings with more to listen to, and how far each has been
+    /// listened to, at most `most`: the ones nearest done first.
+    pub fn unheard(&self, most: usize) -> Result<Vec<(PathBuf, u32)>, String> {
+        let mut st = self.db.prepare("select path, heard from unheard order by heard desc, path limit ?1").map_err(err)?;
+        st.query_map([most as i64], |r| Ok((PathBuf::from(r.get::<_, String>(0)?), r.get::<_, i64>(1)? as u32))).map_err(err)?.collect::<Result<_, _>>().map_err(err)
+    }
+
+    /// How many recordings have more to listen to.
+    pub fn unheard_count(&self) -> Result<u32, String> {
+        self.db.query_row("select count(*) from unheard", [], |r| r.get::<_, i64>(0)).map(|n| n as u32).map_err(err)
+    }
+
+    /// The memory of a file itself, as against of its later passages, and
+    /// the number its next passage would have.
+    pub fn first_of(&self, path: &Path) -> Result<Option<(Memory, u32)>, String> {
+        let source = path.to_string_lossy();
+        let first = self.db.query_row(&format!("select {MEMORY} from memories where source = ?1 order by part limit 1"), [&*source], memory).optional().map_err(err)?;
+        let next: i64 = self.db.query_row("select coalesce(max(part), -1) + 1 from memories where source = ?1", [&*source], |r| r.get(0)).map_err(err)?;
+        Ok(first.map(|m| (m, next as u32)))
     }
 
     /// Marks a memory as only listed: known by name and place, not looked at.
@@ -531,6 +564,7 @@ impl Store {
         tx.execute("delete from memory_words where memory in (select id from memories where source = ?1)", [&*source]).map_err(err)?;
         let n = tx.execute("delete from memories where source = ?1", [&*source]).map_err(err)?;
         tx.execute("delete from files where path = ?1", [&*source]).map_err(err)?;
+        tx.execute("delete from unheard where path = ?1", [&*source]).map_err(err)?;
         tx.commit().map_err(err)?;
         Ok(n as u32)
     }
@@ -640,6 +674,16 @@ mod tests {
         // One only listed is marked so, counted, and found among those waiting to be looked at.
         s.mark_light(a).unwrap();
         assert_eq!((s.stats().unwrap().light, s.light_files(5).unwrap(), s.recent(5, Some(Kind::Photo)).unwrap()[0].light), (1, vec![PathBuf::from("/p/dog.jpg")], true));
+        // A recording with more to listen to is kept note of, and how far it has got.
+        s.set_unheard(Path::new("/v/sea.mov"), 1200).unwrap();
+        s.set_unheard(Path::new("/v/long.mov"), 2400).unwrap();
+        s.set_unheard(Path::new("/v/sea.mov"), 3600).unwrap();
+        assert_eq!((s.unheard(5).unwrap(), s.unheard(1).unwrap().len(), s.unheard_count().unwrap()), (vec![(PathBuf::from("/v/sea.mov"), 3600), (PathBuf::from("/v/long.mov"), 2400)], 1, 2));
+        assert_eq!(s.first_of(Path::new("/v/sea.mov")).unwrap().map(|(m, next)| (m.title, next)), Some(("sea.mov".to_owned(), 1)));
+        assert_eq!(s.first_of(Path::new("/nowhere")).unwrap(), None);
+        s.all_heard(Path::new("/v/long.mov")).unwrap();
+        s.all_heard(Path::new("/v/sea.mov")).unwrap();
+        assert_eq!(s.unheard_count().unwrap(), 0);
         // An embedding of the wrong length is refused, not stored askew.
         assert!(s.add(&new(Kind::Note, None, "x", "y", &[]), &[1.0]).is_err());
         assert!(s.search(&[1.0], 1, None).is_err());

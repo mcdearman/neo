@@ -472,16 +472,72 @@ pub fn list_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<Ou
     Ok(Outcome::Read(1))
 }
 
-/// Remembers the rest of what is said in a video or a recording, a
-/// passage to a memory, after the first, which is kept with the memory
-/// of the thing itself. Returns how many memories the file has in all.
-fn remember_said(store: &mut Store, model: &dyn Model, kind: Kind, path: &Path, title: &str, created: u64, rest: &[String]) -> Result<u32, String> {
-    for (i, passage) in rest.iter().enumerate() {
+/// Remembers more of what is said in a video or a recording, a passage
+/// to a memory, numbered from `from`. Returns how many it made.
+fn remember_said(store: &mut Store, model: &dyn Model, of: &Recording, from: u32, passages: &[String]) -> Result<u32, String> {
+    for (i, passage) in passages.iter().enumerate() {
         let text = format!("Said further on: {passage}");
         let about = words::keywords(passage, 5);
-        remember(store, model, &New { kind, source: Some(path), title, text: &text, part: i as u32 + 1, created, words: &about })?;
+        remember(store, model, &New { kind: of.kind, source: Some(of.path), title: of.title, text: &text, part: from + i as u32, created: of.created, words: &about })?;
     }
-    Ok(rest.len() as u32 + 1)
+    Ok(passages.len() as u32)
+}
+
+/// The video or recording that passages of speech are of.
+struct Recording<'a> {
+    kind: Kind,
+    path: &'a Path,
+    title: &'a str,
+    created: u64,
+}
+
+/// Listens to the rest of the recordings that go on past their first
+/// stretch, a stretch at a time, `runners` of them at once, until there
+/// is no more or `report` says to stop. Listening is the slow part and
+/// needs nothing from the memory, so each runner does only that; what
+/// they heard is then remembered here, one after another.
+pub fn hear_more(store: &mut Store, model: &dyn Model, runners: usize, report: &mut dyn FnMut(&Progress) -> bool) -> Progress {
+    let mut p = Progress { listening: true, ..Progress::default() };
+    loop {
+        let waiting = store.unheard(runners.max(1)).unwrap_or_default();
+        p.total = p.done + store.unheard_count().unwrap_or(0) as usize;
+        p.now = waiting.first().map(|(path, _)| path.clone());
+        if waiting.is_empty() || crate::hear::missing().is_some() || !report(&p) {
+            break;
+        }
+        let stretch = crate::hear::stretch();
+        let heard: Vec<(PathBuf, u32, Result<crate::hear::Heard, String>)> = std::thread::scope(|scope| {
+            let listening: Vec<_> = waiting.iter().map(|(path, from)| scope.spawn(move || crate::hear::transcribe_from(path, *from))).collect();
+            waiting.iter().zip(listening).map(|((path, from), runner)| (path.clone(), *from, runner.join().unwrap_or_else(|_| Err("The listener stopped.".into())))).collect()
+        });
+        for (path, from, heard) in heard {
+            let kept = (|| -> Result<bool, String> {
+                let heard = heard?;
+                // Gone, or forgotten, since it was begun: nothing to add to.
+                let Some((first, next)) = store.first_of(&path)? else { return Ok(false) };
+                remember_said(store, model, &Recording { kind: first.kind, path: &path, title: &first.title, created: first.created }, next, &passages(&heard.text))?;
+                Ok(heard.more(stretch))
+            })();
+            match kept {
+                Ok(true) => drop(store.set_unheard(&path, from + stretch)),
+                Ok(false) => {
+                    let _ = store.all_heard(&path);
+                    p.done += 1;
+                }
+                // One that cannot be listened to further is left at what was heard.
+                Err(e) => {
+                    let _ = store.all_heard(&path);
+                    p.done += 1;
+                    p.failed += 1;
+                    p.trouble = Some(format!("{}: {e}", name(&path)));
+                }
+            }
+            p.read += 1;
+        }
+    }
+    p.now = None;
+    report(&p);
+    p
 }
 
 /// Reads one file into the memory, in place of whatever was remembered of
@@ -515,14 +571,20 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
             let mut all = video_text(seconds, &seen);
             // And what is said in it, where there is hearing: the start of
             // it with what is seen, and the rest in passages after.
-            let said = if crate::hear::missing().is_none() { passages(&crate::hear::transcribe(path).unwrap_or_default()) } else { vec![] };
+            // The first stretch now; the rest, if it goes on, is listened to behind.
+            let heard = if crate::hear::missing().is_none() { crate::hear::transcribe(path).unwrap_or_default() } else { crate::hear::Heard::default() };
+            let said = passages(&heard.text);
             if let Some(first) = said.first() {
                 all.text.push_str(&format!(" What is said: {first}"));
                 all.words = words::clean_all(all.words.iter().cloned().chain(words::keywords(&said.join(" "), 4)), 12);
             }
             store.forget_source(path)?;
             remember(store, model, &New { kind: Kind::Video, source: Some(path), title: &title, text: &all.text, part: 0, created, words: &all.words })?;
-            remember_said(store, model, Kind::Video, path, &title, created, said.get(1..).unwrap_or_default())?
+            let made = remember_said(store, model, &Recording { kind: Kind::Video, path, title: &title, created }, 1, said.get(1..).unwrap_or_default())?;
+            if heard.more(crate::hear::stretch()) {
+                store.set_unheard(path, crate::hear::stretch())?;
+            }
+            made + 1
         }
         What::Audio => {
             match crate::hear::missing() {
@@ -531,7 +593,8 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
                 Some(crate::hear::Missing::Model) => return Ok(Outcome::Needs("whisper-model")),
                 None => {}
             }
-            let said = passages(&crate::hear::transcribe(path)?);
+            let heard = crate::hear::transcribe(path)?;
+            let said = passages(&heard.text);
             let long = duration(path).map_or(String::new(), |d| format!(" {} long", clock(d)));
             let text = match said.first() {
                 Some(first) => format!("An audio recording{long}. What is said: {first}"),
@@ -540,7 +603,11 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
             let about = words::keywords(&said.join(" "), 6);
             store.forget_source(path)?;
             remember(store, model, &New { kind: Kind::Audio, source: Some(path), title: &title, text: &text, part: 0, created, words: &about })?;
-            remember_said(store, model, Kind::Audio, path, &title, created, said.get(1..).unwrap_or_default())?
+            let made = remember_said(store, model, &Recording { kind: Kind::Audio, path, title: &title, created }, 1, said.get(1..).unwrap_or_default())?;
+            if heard.more(crate::hear::stretch()) {
+                store.set_unheard(path, crate::hear::stretch())?;
+            }
+            made + 1
         }
         What::Document => {
             let text = match text_of(path)? {
@@ -594,6 +661,9 @@ pub struct Progress {
     /// Files read this run that hold what looks like a key or a token, and
     /// what kind.
     pub secrets: Vec<(PathBuf, &'static str)>,
+    /// The rest of long recordings is being listened to: `done` and
+    /// `total` are then of recordings, and `read` of stretches heard.
+    pub listening: bool,
     /// Pictures and videos are being looked at, which is the slow part,
     /// and not merely listed.
     pub looking: bool,
@@ -1055,6 +1125,40 @@ mod tests {
         let seen = &store.recent(1, Some(Kind::Video)).unwrap()[0];
         assert!(seen.text.starts_with("A video 0:0") && seen.text.contains("Waves on the sea.") && seen.text.to_lowercase().contains("what is said: we take the ferry"), "{}", seen.text);
         assert!(store.file_stamp(&clip).unwrap().unwrap().ends_with("-d2-h1") && store.file_stamp(&spoken).unwrap().unwrap().ends_with("-h1"));
+        // A recording longer than a stretch: its first stretch is heard when it is read, with the
+        // silences left out, and the rest behind, by runners, until all of it is in the memory.
+        let long = dir.join("long.aiff");
+        let part = |name: &str, words: &str| {
+            let out = dir.join(name);
+            assert!(Command::new(voice).arg("-o").arg(&out).arg(words).status().unwrap().success());
+            out
+        };
+        let (a, b, c) = (part("a.aiff", "The ferry to the island leaves on Friday morning."), part("b.aiff", "We stay two nights at the harbour inn."), part("c.aiff", "On Saturday we walk the coast path to the lighthouse."));
+        // Twelve seconds of nothing between each.
+        let made = Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-v", "error", "-i"]).arg(&a).args(["-f", "lavfi", "-t", "12", "-i", "anullsrc=r=22050:cl=mono", "-i"]).arg(&b).args(["-f", "lavfi", "-t", "12", "-i", "anullsrc=r=22050:cl=mono", "-i"]).arg(&c).args(["-filter_complex", "[0:a][1:a][2:a][3:a][4:a]concat=n=5:v=0:a=1"]).arg(&long).status().unwrap();
+        assert!(made.success());
+        for scrap in [a, b, c] {
+            std::fs::remove_file(scrap).unwrap();
+        }
+        assert!(duration(&long).unwrap() > 30.0, "more than half of it silence");
+        crate::hear::set_stretch(4);
+        assert!(matches!(index_file(&mut store, &model, &long), Ok(Outcome::Read(_))));
+        let first = store.first_of(&long).unwrap().unwrap().0;
+        assert!(first.text.to_lowercase().contains("ferry") && !first.text.to_lowercase().contains("lighthouse"), "{}", first.text);
+        assert_eq!(store.unheard(5).unwrap(), [(long.clone(), 4)], "and there is more of it");
+        let mut steps = 0;
+        let p = hear_more(&mut store, &model, 2, &mut |p| {
+            assert!(p.listening);
+            steps += 1;
+            true
+        });
+        crate::hear::set_stretch(20 * 60);
+        let all: String = store.recent(50, Some(Kind::Audio)).unwrap().into_iter().filter(|m| m.source.as_deref() == Some(long.as_path())).map(|m| m.text.to_lowercase()).collect::<Vec<_>>().join(" | ");
+        assert!(all.contains("ferry") && all.contains("harbo") && all.contains("lighthouse"), "all of it is heard in the end: {all}");
+        assert_eq!((store.unheard_count().unwrap(), p.done, p.failed), (0, 1, 0));
+        assert!(p.read >= 1 && p.read <= 4, "the silence was not sat through: {} stretches of four seconds for forty of recording", p.read);
+        // Nothing left: the runners have nothing to do.
+        assert_eq!(hear_more(&mut store, &model, 2, &mut |_| true).read, 0);
         // One looked at before there was hearing is listened to when there is, even where
         // files are only being listed: it is not put back to being a name and a place.
         let meta = std::fs::metadata(&clip).unwrap();
