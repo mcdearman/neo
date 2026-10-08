@@ -23,7 +23,7 @@ const LISTED: usize = 15;
 /// How much of the conversation so far the model is shown.
 const EARLIER: usize = 8;
 
-const WHO: &str = "You are Apollo, the assistant built into the Neo desktop, running on this computer. Answer plainly and briefly, in full sentences. You keep a memory of the user's pictures, videos and documents, made by reading the folders chosen in the Sources page; you cannot read a file on request in this conversation. Any files you draw on are shown to the user as pictures under your answer, so never write file names, paths or entry numbers.";
+const WHO: &str = "You are Apollo, the assistant built into the Neo desktop, running on this computer. Answer plainly and briefly, in full sentences. You keep a memory of the user's pictures, videos and documents, made by reading the folders chosen in the Sources page; you cannot read a file on request in this conversation. Any files you draw on are shown to the user as pictures under your answer, so do not write the names of files or the numbers of entries. Say which folder something is in when asked where it is.";
 
 /// An answer, and the memories it was given to draw on.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +69,7 @@ impl Wanted {
             Kind::Document => "documents",
             Kind::Conversation => "conversations",
             Kind::Note => "notes",
+            Kind::Folder => "folders",
         });
         match &self.span {
             Some(span) => format!("{things} from {span}"),
@@ -95,6 +96,8 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
         Some(Kind::Photo)
     } else if has(&["document", "documents", "docs", "pdf", "pdfs", "papers"]) {
         Some(Kind::Document)
+    } else if has(&["folder", "folders", "directory", "directories", "vault", "vaults", "repo", "repos", "repository", "repositories", "project", "projects"]) {
+        Some(Kind::Folder)
     } else {
         None
     };
@@ -125,6 +128,10 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
         "pdf",
         "pdfs",
         "papers",
+        "folder",
+        "folders",
+        "directory",
+        "directories",
         "file",
         "files",
         "show",
@@ -225,8 +232,18 @@ fn recall_of(store: &Store, model: &dyn Model, question: &str, kind: Option<Kind
     let asked = model.embed(&[question.to_owned()], true)?.pop().ok_or("no embedding")?;
     // One that says the question's own words is let in from a little further off.
     let terms = crate::words::terms(question);
-    let says = |h: &Hit| !terms.is_empty() && terms.iter().all(|t| format!("{} {}", h.memory.title, h.memory.text).to_lowercase().contains(t.as_str()));
-    Ok(store.search_for(&asked, &terms, RECALLED, kind)?.into_iter().filter(|h| h.distance < NEAR || (says(h) && h.distance < NEAR + crate::store::SAID)).collect())
+    let said = |h: &Hit| {
+        let text = format!("{} {}", h.memory.title, h.memory.text).to_lowercase();
+        terms.iter().filter(|t| text.contains(t.as_str())).count()
+    };
+    let mut found: Vec<Hit> = store.search_for(&asked, &terms, RECALLED, kind)?.into_iter().filter(|h| h.distance < NEAR || (!terms.is_empty() && said(h) == terms.len() && h.distance < NEAR + crate::store::SAID)).collect();
+    // With something found that says every word asked for, what says none
+    // of them is only near by the shape of its words, as one folder's
+    // description is near any other's: it is left out.
+    if !terms.is_empty() && found.iter().any(|h| said(h) == terms.len()) {
+        found.retain(|h| said(h) > 0);
+    }
+    Ok(found)
 }
 
 /// What is in the memory and how the reading stands, for the model to know.
@@ -254,8 +271,15 @@ fn entry(n: usize, m: &Memory) -> String {
         Kind::Document => format!("A document called \"{}\"", m.title),
         Kind::Conversation => "An earlier conversation".to_owned(),
         Kind::Note => "A note the user asked you to keep".to_owned(),
+        // A folder says what and where it is itself.
+        Kind::Folder => return format!("{n}. {}\n", m.text),
     };
-    format!("{n}. {what}, from {when}: {}\n", m.text)
+    // Where it is, for when that is what is asked: the folder, not the file.
+    let place = m.source.as_deref().and_then(std::path::Path::parent).map(|dir| match dir.strip_prefix(neo_desktop::fs::home_dir()) {
+        Ok(rest) => format!(", in the folder ~/{}", rest.display()),
+        Err(_) => format!(", in the folder {}", dir.display()),
+    });
+    format!("{n}. {what}{}, from {when}: {}\n", place.unwrap_or_default(), m.text)
 }
 
 /// What the model is told before the conversation: who it is, and how
@@ -450,11 +474,11 @@ mod tests {
         assert_eq!(sources(&answer.listed, &answer.recalled).iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["rex.jpg"], "and that is what is shown beneath the answer");
         assert_eq!(heard.trim(), answer.text, "heard as it came");
         let told = put("Where is my dog?", &answer.recalled, None);
-        assert!(told.starts_with("From your memory of the user's files:\n\n1. A photo, from ") && !told.contains("rex.jpg") && told.contains(": A dog, a retriever puppy.\n\nQuestion: Where is my dog?\n\nAnswer in"), "{told}");
+        assert!(told.starts_with("From your memory of the user's files:\n\n1. A photo, in the folder /p, from ") && !told.contains("rex.jpg") && told.contains(": A dog, a retriever puppy.\n\nQuestion: Where is my dog?\n\nAnswer in"), "{told}");
         assert!(briefing(Some((&s.stats().unwrap(), &Aware::default()))).contains("Your memory holds 1 photos, 1 documents"));
         // A document goes by its name, and a question nothing bears on is put as it was asked.
         let bill = recall(&s, &model, "the invoice payment").unwrap();
-        assert!(put("How much?", &bill, None).contains("1. A document called \"bill.md\", from "));
+        assert!(put("How much?", &bill, None).contains("1. A document called \"bill.md\", in the folder /d, from "));
         assert_eq!(put("What is the capital of France?", &[], None), "What is the capital of France?");
         // Stopped part-way, what was said so far is the answer.
         let cut = ask(Some(&mut s), &model, &[], "dog", &Aware::default(), &mut |_, _| true, &mut |_| false).unwrap();
@@ -502,6 +526,29 @@ mod tests {
     }
 
     #[test]
+    fn where_a_thing_is_can_be_asked() {
+        let now = Local.with_ymd_and_hms(2026, 10, 8, 11, 30, 0).unwrap();
+        let w = wanted("where is my obsidian vault", now);
+        assert_eq!((w.kind, w.about, w.any()), (Some(Kind::Folder), true, false), "a search among the folders, for the one that is that");
+        assert!(wanted("what folders do I have?", now).any() && wanted("list my projects", now).kind == Some(Kind::Folder));
+        let (mut s, dir) = store("where");
+        let model = Fake::default();
+        let about = ["obsidian".to_owned(), "vault".to_owned()];
+        let home = neo_desktop::fs::home_dir();
+        crate::index::remember(&mut s, &model, &New { kind: Kind::Folder, source: Some(&home.join("Documents/vaultobs")), title: "vaultobs", text: "A folder that is an Obsidian vault, called vaultobs, in ~/Documents. It holds 40 things.", part: 0, created: 1_790_000_000, words: &about }).unwrap();
+        crate::index::remember(&mut s, &model, &New { kind: Kind::Folder, source: Some(&home.join("Documents/Invoices")), title: "Invoices", text: "A folder called Invoices, in ~/Documents. It holds 3 things.", part: 0, created: 1_790_000_000, words: &[] }).unwrap();
+        crate::index::remember(&mut s, &model, &New { kind: Kind::Document, source: Some(&home.join("Documents/vaultobs/Daily/today.md")), title: "today.md", text: "The invoice from the supplier.", part: 0, created: 1_790_000_000, words: &[] }).unwrap();
+        let answer = ask(Some(&mut s), &model, &[], "where is my obsidian vault", &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
+        assert_eq!(answer.recalled.iter().map(|h| h.memory.title.as_str()).collect::<Vec<_>>(), ["vaultobs"], "the folder that is one, and not the other, nor a file in it");
+        let told = put("where is my obsidian vault", &answer.recalled, None);
+        assert!(told.contains("1. A folder that is an Obsidian vault, called vaultobs, in ~/Documents. It holds 40 things.\n"), "{told}");
+        // And a file says which folder it is in.
+        let bill = recall(&s, &model, "the invoice from the supplier").unwrap();
+        assert!(put("where is the invoice?", &bill, None).contains("A document called \"today.md\", in the folder ~/Documents/vaultobs/Daily, from "));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_list_is_answered_from_what_is_of_that_kind_and_time() {
         let (mut s, dir) = store("list");
         let model = Fake::default();
@@ -515,7 +562,7 @@ mod tests {
         assert!(answer.recalled.iter().all(|h| h.memory.kind == Kind::Video));
         let wants = wanted("What videos do I have from this year?", Local::now());
         let told = put("What videos do I have from this year?", &answer.recalled, Some((&wants, &answer.listed, 1)));
-        assert!(told.starts_with("The user asks about videos from this year. There is 1, below.\n\n1. A video, from ") && !told.contains("hike.mp4"), "{told}");
+        assert!(told.starts_with("The user asks about videos from this year. There is 1, below.\n\n1. A video, in the folder /m, from ") && !told.contains("hike.mp4"), "{told}");
         assert_eq!(told.matches("A video of a mountain hiking trail.").count(), 1, "not listed twice for being near in meaning as well");
         assert!(put("q", &[], Some((&wants, &answer.listed, 40))).contains("There are 40; the newest 1 are below."));
         let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)), look: 0 })));

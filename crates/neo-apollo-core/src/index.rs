@@ -325,6 +325,109 @@ fn learn_words(store: &mut Store, model: &dyn Model, words: &[String]) -> Result
     Ok(())
 }
 
+/// A folder worth knowing of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub path: PathBuf,
+    /// What it is, if it can be told: "an Obsidian vault", "a Rust project".
+    pub what: Option<&'static str>,
+    /// How many things are in it, not counting what is in its folders.
+    pub holds: usize,
+}
+
+/// What a folder is, from what is found in it.
+fn what_folder(dir: &Path) -> Option<&'static str> {
+    let has = |name: &str| dir.join(name).exists();
+    if has(".obsidian") {
+        Some("an Obsidian vault")
+    } else if has("Cargo.toml") {
+        Some("a Rust project")
+    } else if has("package.json") {
+        Some("a JavaScript project")
+    } else if has("pyproject.toml") || has("requirements.txt") {
+        Some("a Python project")
+    } else if has("go.mod") {
+        Some("a Go project")
+    } else if has(".git") {
+        Some("a git repository")
+    } else {
+        None
+    }
+}
+
+/// How far below a folder that is read plain folders are remembered.
+/// One that is something in particular is remembered however deep.
+const PLAIN_DEPTH: usize = 2;
+/// And how deep anything is looked for at all.
+const DEEPEST: usize = 6;
+
+/// The folders under `roots` worth knowing of: those near the top, by
+/// name, and those anywhere that are something in particular, such as a
+/// vault of notes or a project. What is inside a project is the
+/// project's business and is not gone into.
+pub fn places(roots: &[PathBuf]) -> Vec<Place> {
+    fn into(dir: &Path, depth: usize, out: &mut Vec<Place>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) || passed_over(&name) {
+                continue;
+            }
+            let what = what_folder(&path);
+            if what.is_some() || depth < PLAIN_DEPTH {
+                let holds = std::fs::read_dir(&path).map(|d| d.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')).count()).unwrap_or(0);
+                out.push(Place { path: path.clone(), what, holds });
+            }
+            // A vault of notes has folders of its own worth knowing; a project's are its workings.
+            if depth + 1 < DEEPEST && what.is_none_or(|w| w == "an Obsidian vault") {
+                into(&path, depth + 1, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for root in roots {
+        into(root, 0, &mut out);
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
+}
+
+/// A path with the home folder written as `~`.
+fn from_home(path: &Path) -> String {
+    match path.strip_prefix(neo_desktop::fs::home_dir()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Remembers the folders worth knowing of, so that "where is my vault"
+/// has an answer: one memory each, of its name, what it is and where.
+/// Those already remembered as they are now are left alone.
+pub fn list_places(store: &mut Store, model: &dyn Model, roots: &[PathBuf]) -> Result<usize, String> {
+    let mut listed = 0;
+    for place in places(roots) {
+        let stamp = format!("folder-{}-{}", place.what.unwrap_or("plain"), place.holds);
+        if store.file_stamp(&place.path)?.as_deref() == Some(stamp.as_str()) {
+            continue;
+        }
+        let title = name(&place.path);
+        let within = place.path.parent().map(from_home).unwrap_or_default();
+        let text = match place.what {
+            Some(what) => format!("A folder that is {what}, called {title}, in {within}. It holds {} things.", place.holds),
+            None => format!("A folder called {title}, in {within}. It holds {} things.", place.holds),
+        };
+        let about = words::clean_all(words::terms(&format!("{title} {}", place.what.unwrap_or_default())), 6);
+        let created = std::fs::metadata(&place.path).map(|m| modified(&m)).unwrap_or(0);
+        store.forget_source(&place.path)?;
+        remember(store, model, &New { kind: Kind::Folder, source: Some(&place.path), title: &title, text: &text, part: 0, created, words: &about })?;
+        store.set_file(&place.path, &stamp, 1)?;
+        listed += 1;
+    }
+    Ok(listed)
+}
+
 /// What a listed-only file's stamp ends with.
 const LISTED: &str = "-l";
 
@@ -448,7 +551,8 @@ pub struct Progress {
 pub fn sweep(store: &mut Store, roots: &[PathBuf]) -> Result<usize, String> {
     let mut gone = 0;
     for file in store.files()? {
-        if !file.is_file() || !roots.iter().any(|r| file.starts_with(r)) {
+        // (A folder that is remembered is among them, which is why not `is_file`.)
+        if !file.exists() || !roots.iter().any(|r| file.starts_with(r)) {
             store.forget_source(&file)?;
             gone += 1;
         }
@@ -470,6 +574,10 @@ pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], look: bool, 
     match sweep(store, roots) {
         Ok(n) => p.forgotten = n,
         Err(e) => p.trouble = Some(e),
+    }
+    // The folders themselves, which is quick: a memory each of the few worth knowing.
+    if let Err(e) = list_places(store, model, roots) {
+        p.trouble = Some(e);
     }
     let files = walk(roots);
     let mut stopped = false;
@@ -667,7 +775,7 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), 3, "each said as it is listed, and the pictures again as they are looked at");
         let stats = store.stats().unwrap();
-        assert_eq!((stats.of(Kind::Photo), stats.of(Kind::Document), stats.files), (2, 1, 3));
+        assert_eq!((stats.of(Kind::Photo), stats.of(Kind::Document), stats.files - stats.of(Kind::Folder)), (2, 1, 3));
         // What a picture shows finds it.
         let ask = |q: &str| model.embed(&[q.to_owned()], true).unwrap().pop().unwrap();
         let found = store.search(&ask("a dog at the beach"), 1, None).unwrap();
@@ -695,7 +803,7 @@ mod tests {
         assert!(store.cloud(50, None).unwrap().iter().all(|w| w.word != "mountain"), "the words of what is gone go with it");
         // A folder no longer read is forgotten.
         let p = run(&mut store, &model, &[], true, &mut |_| true);
-        assert_eq!((p.forgotten, store.stats().unwrap().total()), (2, 0));
+        assert_eq!((p.forgotten, store.stats().unwrap().total()), (3, 0), "its two files, and the folder in it that was remembered");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -742,7 +850,8 @@ mod tests {
             true
         });
         assert_eq!((p.read, p.total, seen), (1, 2, vec!["red.png".to_owned()]), "the new picture is read; the note is looked at and found the same; the rest are not Apollo's to read");
-        assert_eq!((store.stats().unwrap().total(), store.file_stamp(&root.join("unseen.txt")).unwrap()), (2, None));
+        let known = |store: &Store| store.stats().unwrap().total() - store.stats().unwrap().of(Kind::Folder);
+        assert_eq!((known(&store), store.file_stamp(&root.join("unseen.txt")).unwrap()), (2, None));
         // A folder that appears is looked through; one that goes takes its memories with it.
         std::fs::create_dir_all(root.join("more")).unwrap();
         picture(&root.join("more/green.png"), [40, 220, 40]);
@@ -751,7 +860,7 @@ mod tests {
         std::fs::remove_dir_all(root.join("more")).unwrap();
         std::fs::remove_file(root.join("trip/red.png")).unwrap();
         let p = update(&mut store, &model, &roots, &[root.join("more"), root.join("trip/red.png"), root.join("never-was.png")], true, &mut |_| true);
-        assert_eq!((p.forgotten, p.read, store.stats().unwrap().total()), (3, 0, 1));
+        assert_eq!((p.forgotten, p.read, known(&store)), (3, 0, 1));
         // A full look afterwards finds what no change told of.
         assert_eq!(run(&mut store, &model, &roots, true, &mut |_| true).read, 1);
         std::fs::remove_dir_all(dir).unwrap();
@@ -824,6 +933,43 @@ mod tests {
     }
 
     #[test]
+    fn folders_worth_knowing_of_are_remembered_by_what_and_where_they_are() {
+        let dir = scratch("places");
+        let model = Fake::default();
+        let mut store = Store::open(&dir.join("db/memory.db"), &[1; 32], model.dims().unwrap()).unwrap();
+        let root = dir.join("Documents");
+        for sub in ["vaultobs/.obsidian", "vaultobs/Daily", "Invoices/2026", "code/tool/src", "code/tool/.git", "a/b/c/d", "a/b/deep-vault/.obsidian", ".hidden/x", "node_modules/y"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        std::fs::write(root.join("vaultobs/Welcome.md"), "Notes begin here.").unwrap();
+        std::fs::write(root.join("code/tool/Cargo.toml"), "[package]").unwrap();
+        let roots = vec![root.clone()];
+        let found = places(&roots);
+        let named = |name: &str| found.iter().find(|p| p.path.ends_with(name)).map(|p| p.what);
+        assert_eq!(named("vaultobs"), Some(Some("an Obsidian vault")), "told by what is in it, not by its name");
+        assert_eq!((named("tool"), named("Invoices"), named("2026"), named("Daily")), (Some(Some("a Rust project")), Some(None), Some(None), Some(None)));
+        assert_eq!((named("deep-vault"), named("c"), named("src"), named(".hidden"), named("node_modules")), (Some(Some("an Obsidian vault")), None, None, None, None), "one that is something is known however deep; plain ones only near the top; a project's workings and hidden folders not at all");
+        assert_eq!(found.iter().find(|p| p.path.ends_with("vaultobs")).unwrap().holds, 2);
+        // Read, each is a memory that says what and where; asked after by what it is, it is found.
+        run(&mut store, &model, &roots, false, &mut |_| true);
+        let folders = store.recent(50, Some(Kind::Folder)).unwrap();
+        let vault = folders.iter().find(|m| m.title == "vaultobs").unwrap();
+        assert!(vault.text.starts_with("A folder that is an Obsidian vault, called vaultobs, in ") && vault.text.ends_with("/Documents. It holds 2 things."), "{}", vault.text);
+        assert_eq!((vault.source.clone(), vault.light), (Some(root.join("vaultobs")), false));
+        assert!(store.words_of(vault.id).unwrap().contains(&"obsidian".to_owned()));
+        let asked = model.embed(&["where is my obsidian vault".to_owned()], true).unwrap().pop().unwrap();
+        let first = &store.search_for(&asked, &words::terms("where is my obsidian vault"), 3, Some(Kind::Folder)).unwrap()[0];
+        assert!(first.memory.text.contains("Obsidian vault"), "{}", first.memory.text);
+        // Unchanged, they are not remembered again; one that goes is forgotten.
+        let before = store.stats().unwrap().of(Kind::Folder);
+        assert_eq!(list_places(&mut store, &model, &roots).unwrap(), 0);
+        std::fs::remove_dir_all(root.join("Invoices")).unwrap();
+        run(&mut store, &model, &roots, false, &mut |_| true);
+        assert_eq!(store.stats().unwrap().of(Kind::Folder), before - 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_run_can_be_stopped_and_taken_up_again() {
         let dir = scratch("stop");
         let model = Fake::default();
@@ -843,7 +989,7 @@ mod tests {
         let p = run(&mut store, &model, &roots, true, &mut |_| true);
         assert_eq!((p.read, p.failed, p.done), (2, 1, 5));
         assert!(p.trouble.unwrap().starts_with("broken.png: "));
-        assert_eq!((store.stats().unwrap().total(), store.stats().unwrap().light), (5, 1), "the one that could not be looked at stays listed by its name");
+        assert_eq!((store.stats().unwrap().total() - store.stats().unwrap().of(Kind::Folder), store.stats().unwrap().light), (5, 1), "the one that could not be looked at stays listed by its name");
         let p = run(&mut store, &model, &roots, true, &mut |_| true);
         assert_eq!((p.read, p.failed), (0, 0), "and is not tried again until it changes");
         std::fs::remove_dir_all(dir).unwrap();

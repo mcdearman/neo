@@ -70,8 +70,8 @@ mod imp {
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &status, &read, &lock, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
             let (open_id, read_id, lock_id, quit_id) = (open.id().clone(), read.id().clone(), lock.id().clone(), quit.id().clone());
-            MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-                let id = e.id();
+            // What was chosen, by the entry's ID.
+            let chosen = move |id: &tray_icon::menu::MenuId| {
                 let action = if *id == open_id {
                     TrayAction::Open
                 } else if *id == read_id {
@@ -84,7 +84,14 @@ mod imp {
                     return;
                 };
                 send(action);
-            }));
+            };
+            // On macOS the framework has the program's one menu handler, for the
+            // menu bar, and passes on what is chosen; elsewhere it is ours to set.
+            if cfg!(target_os = "macos") {
+                neo::on_menu_chosen(move |id| chosen(&tray_icon::menu::MenuId::new(id)));
+            } else {
+                MenuEvent::set_event_handler(Some(move |e: MenuEvent| chosen(e.id())));
+            }
             let glyph = icon(include_bytes!("../../../dist/icons/tray/apollo.png"))?;
             let icon = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Apollo");
             // A template icon is tinted by the system to suit a light or dark menu bar.

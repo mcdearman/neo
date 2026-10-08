@@ -460,6 +460,7 @@ fn kind_icon(kind: Kind) -> neo::theme::Icon {
         Kind::Document => icons::FILE_TEXT,
         Kind::Conversation => icons::MESSAGES_SQUARE,
         Kind::Note => icons::STICKY_NOTE,
+        Kind::Folder => icons::FOLDER,
     }
 }
 
@@ -796,6 +797,17 @@ impl Apollo {
                 send(Msg::Warned(found));
             }
         });
+    }
+
+    /// Brings Apollo's window in front of whatever else is open. Keeping
+    /// out of the Dock, Apollo is not brought forward by the system on
+    /// its own: not when its window is shown again, and not when the
+    /// login check has been and gone and left another app in front.
+    fn come_forward(&mut self) {
+        self.in_sight = true;
+        if cfg!(target_os = "macos") && !cfg!(test) {
+            let _ = std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn();
+        }
     }
 
     /// Asks the question that came from outside the window, once the
@@ -1414,11 +1426,17 @@ impl Apollo {
                     Ok(()) => {
                         self.last_used = std::time::Instant::now();
                         self.open_memory();
+                        // Checked, but the memory would not open: not asked for again for this question.
+                        self.declined = self.store.is_none();
                     }
                     Err(e) => {
                         self.trouble = Some(e);
                         self.declined = true;
                     }
+                }
+                // The check came up over everything and has gone; the answer is here.
+                if self.waiting_question.is_some() {
+                    self.come_forward();
                 }
                 self.ask_what_waits();
             }
@@ -1498,7 +1516,7 @@ impl Apollo {
 
             Msg::Read => self.read(),
             Msg::Tray(action) => match action {
-                TrayAction::Open => self.in_sight = true,
+                TrayAction::Open => self.come_forward(),
                 TrayAction::Lock => self.lock(),
                 TrayAction::Read => self.read(),
                 TrayAction::Quit => self.quit = true,
@@ -1893,6 +1911,8 @@ impl Apollo {
         let inside: Element<Msg> = container(line).padding([10.0, 8.0]).width(Length::Fill).into();
         // The row opens the file, anywhere its buttons are not.
         match m.source.clone() {
+            // A folder is shown in Files; anything else is opened.
+            Some(path) if m.kind == Kind::Folder => mouse_area(inside).on_press(move || Msg::Reveal(path.clone())).into(),
             Some(path) => mouse_area(inside).on_press(move || Msg::Open(path.clone())).into(),
             None => inside,
         }
