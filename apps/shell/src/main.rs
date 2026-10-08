@@ -4,7 +4,8 @@
 //! the dock and the rest. For now it does one job everywhere, which is to
 //! show notifications from other Neo apps. They appear at the top right,
 //! stay for the time set in Settings, and go again. With motion reduced
-//! in Settings they appear and vanish without sliding.
+//! in Settings they appear and vanish without sliding. One can be put aside
+//! to be shown again later: in ten minutes, an hour, or tomorrow.
 //!
 //!     cargo run -p neo-shell
 //!     cargo run -p neo-shell -- --snapshot target/snapshots
@@ -14,8 +15,11 @@ use std::time::{Duration, Instant};
 
 use neo::prelude::*;
 use neo::{Cx, DrawCx, Event, EventCx, Image, Limits, Point, Proxy, Rect, Size, Status, Widget, WindowGeometry};
-use neo_desktop::notify::{Inbox, Notification};
 use neo_desktop::Desktop;
+use neo_desktop::notify::{Inbox, Notification};
+
+mod reminders;
+use reminders::{Later, Reminder};
 
 const CARD_W: f32 = 400.0;
 const CARD_H: f32 = 112.0;
@@ -37,6 +41,10 @@ struct Card {
     /// When it appeared, and when it started to leave.
     born: Instant,
     leaving: Option<Instant>,
+    /// Being asked when to show it again, which keeps it on screen.
+    choosing: bool,
+    /// Shown again after being put aside.
+    reminder: bool,
 }
 
 struct Shell {
@@ -46,6 +54,10 @@ struct Shell {
     /// The time the cards are drawn for.
     now: Instant,
     screen: Rect,
+    /// Notifications put aside to show again, and the file they are kept in.
+    reminders: Vec<Reminder>,
+    kept_in: Option<PathBuf>,
+    proxy: Option<Proxy<Msg>>,
 }
 
 /// A picture read and shrunk off the main thread: its size and pixels.
@@ -54,6 +66,12 @@ type Pixels = (u32, u32, Vec<u8>);
 #[derive(Clone, Debug)]
 enum Msg {
     Notify(Notification, Option<Pixels>),
+    /// A notification that was put aside, shown again now its time has come.
+    Remind(Notification, Option<Pixels>),
+    /// Ask when to show a card again, or stop asking.
+    Choose(u64),
+    /// Put a card aside to show again later.
+    Later(u64, Later),
     /// Time has passed: move the cards along.
     Tick,
     Dismiss(u64),
@@ -108,7 +126,51 @@ fn ease(t: f32) -> f32 {
 
 impl Shell {
     fn new() -> Self {
-        Self { desktop: Desktop::load(), cards: vec![], next_id: 1, now: Instant::now(), screen: Rect::ZERO }
+        // Tests and snapshots keep clear of the reminders that are really set.
+        let kept_in = (!cfg!(test)).then(reminders::file);
+        Self { desktop: Desktop::load(), cards: vec![], next_id: 1, now: Instant::now(), screen: Rect::ZERO, reminders: vec![], kept_in, proxy: None }
+    }
+
+    /// Puts a card aside, to be shown again `later` after `wall`.
+    fn remind(&mut self, id: u64, later: Later, wall: u64, now: Instant) {
+        let Some(c) = self.cards.iter_mut().find(|c| c.id == id && c.leaving.is_none()) else { return };
+        c.choosing = false;
+        self.reminders.push(Reminder { due: wall + later.seconds(), note: c.note.clone() });
+        self.keep();
+        self.dismiss(id, now);
+    }
+
+    fn keep(&self) {
+        if let Some(path) = &self.kept_in {
+            reminders::save(path, &self.reminders);
+        }
+    }
+
+    /// Takes out the reminders whose time has come by `wall`, soonest first.
+    fn due(&mut self, wall: u64) -> Vec<Notification> {
+        let (mut due, waiting): (Vec<Reminder>, Vec<Reminder>) = std::mem::take(&mut self.reminders).into_iter().partition(|r| r.due <= wall);
+        self.reminders = waiting;
+        if !due.is_empty() {
+            self.keep();
+        }
+        due.sort_by_key(|r| r.due);
+        due.into_iter().map(|r| r.note).collect()
+    }
+
+    /// Shows the reminders that are due. Their pictures are read off the
+    /// main thread, as a new notification's is.
+    fn wake(&mut self, wall: u64, now: Instant) {
+        for note in self.due(wall) {
+            match self.proxy.clone() {
+                Some(proxy) if note.image.is_some() => {
+                    std::thread::spawn(move || {
+                        let pixels = note.image.as_deref().and_then(thumbnail);
+                        proxy.send(Msg::Remind(note, pixels));
+                    });
+                }
+                _ => self.show(note, None, true, now),
+            }
+        }
     }
 
     fn still(&self) -> bool {
@@ -121,8 +183,12 @@ impl Shell {
     }
 
     fn add(&mut self, note: Notification, pixels: Option<Pixels>, now: Instant) {
+        self.show(note, pixels, false, now);
+    }
+
+    fn show(&mut self, note: Notification, pixels: Option<Pixels>, reminder: bool, now: Instant) {
         let picture = pixels.map(|(w, h, rgba)| Image::new(w, h, rgba));
-        self.cards.push(Card { id: self.next_id, note, picture, born: now, leaving: None });
+        self.cards.push(Card { id: self.next_id, note, picture, born: now, leaving: None, choosing: false, reminder });
         self.next_id += 1;
         // Too many to show: the oldest that is not already going goes.
         let staying: Vec<usize> = (0..self.cards.len()).filter(|i| self.cards[*i].leaving.is_none()).collect();
@@ -145,7 +211,7 @@ impl Shell {
         self.now = now;
         let (stay, out) = (self.stay(), if self.still() { Duration::ZERO } else { SLIDE_OUT });
         for c in &mut self.cards {
-            if c.leaving.is_none() && now.saturating_duration_since(c.born) >= stay {
+            if c.leaving.is_none() && !c.choosing && now.saturating_duration_since(c.born) >= stay {
                 c.leaving = Some(now);
             }
         }
@@ -176,12 +242,19 @@ impl Shell {
     }
 
     fn card(&self, c: &Card) -> Element<Msg> {
-        let mut words = column().spacing(2.0).width(Length::Fill).push(text(c.note.title.clone()).role(TextRole::Strong).no_wrap());
-        if !c.note.body.is_empty() {
+        let title = text(c.note.title.clone()).role(TextRole::Strong).no_wrap();
+        let mut words = column().spacing(2.0).width(Length::Fill);
+        // One that was put aside says so, with a bell before its title.
+        words = if c.reminder { words.push(row().spacing(6.0).align(Align::Center).push(icon(icons::BELL).size(13.0).tone(Tone::Accent)).push(title)) } else { words.push(title) };
+        if c.choosing {
+            // In place of what it says: when to say it again.
+            let choices = Later::ALL.iter().fold(row().spacing(4.0), |r, l| r.push(Button::new(text(l.label()).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([8.0, 3.0]).radius(6.0).on_press(Msg::Later(c.id, *l))));
+            words = words.push(text("Remind me in").role(TextRole::Caption).tone(Tone::Muted).no_wrap()).push(Space::new(0.0, 4.0)).push(choices);
+        } else if !c.note.body.is_empty() {
             // Written as a link where clicking the card opens the file.
             words = words.push(text(c.note.body.clone()).role(TextRole::Caption).tone(if c.note.open.is_some() { Tone::Accent } else { Tone::Muted }).no_wrap());
         }
-        if c.note.reveal.is_some() {
+        if c.note.reveal.is_some() && !c.choosing {
             let link = row().spacing(5.0).align(Align::Center).push(icon(icons::FOLDER_OPEN).size(13.0)).push(text("Show in Files").role(TextRole::Caption));
             words = words.push(Space::new(0.0, 4.0)).push(Button::new(link).kind(ButtonKind::Ghost).padding([8.0, 3.0]).radius(6.0).on_press(Msg::Reveal(c.id)));
         }
@@ -189,11 +262,12 @@ impl Shell {
         if let Some(p) = &c.picture {
             body = body.push(container(picture(p).fit(Fit::Cover).width(52.0).height(52.0)).width(52.0).height(52.0));
         }
-        body = body.push(words).push(icon_button(icons::X, 24.0).kind(ButtonKind::Ghost).on_press(Msg::Dismiss(c.id)));
+        let later = icon_button(icons::ALARM_CLOCK, 24.0).kind(if c.choosing { ButtonKind::Raised } else { ButtonKind::Ghost }).on_press(Msg::Choose(c.id));
+        body = body.push(words).push(row().spacing(2.0).push(later).push(icon_button(icons::X, 24.0).kind(ButtonKind::Ghost).on_press(Msg::Dismiss(c.id))));
         let inside: Element<Msg> = container(body).height(CARD_H - 40.0).align_y(Align::Center).into();
         // The card itself opens the file, anywhere its buttons are not.
         let id = c.id;
-        let inside = if c.note.open.is_some() { mouse_area(inside).on_press(move || Msg::Open(id)).into() } else { inside };
+        let inside = if c.note.open.is_some() && !c.choosing { mouse_area(inside).on_press(move || Msg::Open(id)).into() } else { inside };
         container(neo_desktop::ui::sheet(inside, CARD_W)).height(CARD_H).into()
     }
 }
@@ -230,6 +304,12 @@ impl App for Shell {
     }
 
     fn start(&mut self, proxy: Proxy<Msg>) {
+        self.proxy = Some(proxy.clone());
+        // Those set before, with any whose time came while this was not running.
+        if let Some(path) = &self.kept_in {
+            self.reminders = reminders::load(path);
+        }
+        self.wake(reminders::wall(), Instant::now());
         std::thread::spawn(move || {
             let inbox = match Inbox::open() {
                 Ok(inbox) => inbox,
@@ -251,6 +331,9 @@ impl App for Shell {
         } else if !self.cards.is_empty() {
             // Nothing is sliding: only the wait for a card's time to be up.
             subs.push(Subscription::every(Duration::from_millis(100), Msg::Tick));
+        } else if !self.reminders.is_empty() {
+            // Nothing on screen: only the wait for a reminder to come due.
+            subs.push(Subscription::every(Duration::from_secs(5), Msg::Tick));
         }
         subs
     }
@@ -259,7 +342,19 @@ impl App for Shell {
         let now = Instant::now();
         match m {
             Msg::Notify(note, pixels) => self.add(note, pixels, now),
-            Msg::Tick => self.step(now),
+            Msg::Remind(note, pixels) => self.show(note, pixels, true, now),
+            Msg::Choose(id) => {
+                if let Some(c) = self.cards.iter_mut().find(|c| c.id == id && c.leaving.is_none()) {
+                    c.choosing = !c.choosing;
+                    // Changing its mind, it stays as long as a new one would.
+                    c.born = now.checked_sub(SLIDE_IN).unwrap_or(now);
+                }
+            }
+            Msg::Later(id, later) => self.remind(id, later, reminders::wall(), now),
+            Msg::Tick => {
+                self.step(now);
+                self.wake(reminders::wall(), now);
+            }
             Msg::Dismiss(id) => self.dismiss(id, now),
             Msg::Reveal(id) => {
                 if let Some(path) = self.cards.iter().find(|c| c.id == id).and_then(|c| c.note.reveal.clone()) {
@@ -287,10 +382,7 @@ impl App for Shell {
         // Each card starts to the right of its place and slides in; the
         // window's edge hides the part that has not arrived.
         let slide = CARD_W + MARGIN;
-        self.cards
-            .iter()
-            .fold(column().spacing(GAP).padding(MARGIN).width(Length::Fill), |col, c| col.push(Element::new(Shifted { card: [self.card(c)], by: (self.offset(c) * slide).round() })))
-            .into()
+        self.cards.iter().fold(column().spacing(GAP).padding(MARGIN).width(Length::Fill), |col, c| col.push(Element::new(Shifted { card: [self.card(c)], by: (self.offset(c) * slide).round() }))).into()
     }
 }
 
@@ -327,6 +419,18 @@ fn main() {
         }
         return;
     }
+    // `neo-shell --reminders` lists the notifications put aside for later.
+    if args.iter().any(|a| a == "--reminders") {
+        let (mut all, now) = (reminders::load(&reminders::file()), reminders::wall());
+        all.sort_by_key(|r| r.due);
+        for r in &all {
+            println!("{}: {}{}", reminders::when(r.due, now), r.note.title, if r.note.body.is_empty() { String::new() } else { format!(" ({})", r.note.body) });
+        }
+        if all.is_empty() {
+            println!("No reminders are set.");
+        }
+        return;
+    }
     // One is enough: a second would take the notifications from the first.
     if neo_desktop::notify::shell_running() {
         return;
@@ -355,6 +459,8 @@ fn snapshots(dir: PathBuf) {
         app.add(Notification::new("Screenshot copied to clipboard", "Neo Screenshot 2026-10-06 at 09.41.07.png").reveal("/tmp/shot.png"), Some(sample_pixels()), start);
         app.add(Notification::new("Recording saved", "Neo Recording 2026-10-06 at 09.42.30.mov").reveal("/tmp/rec.mov"), None, start);
         // Settled, with a third half-way in.
+        app.cards[1].choosing = true;
+        app.cards[0].reminder = true;
         app.add(Notification::new("Backup finished", ""), None, start + Duration::from_secs(1));
         app.step(start + Duration::from_secs(1) + SLIDE_IN / 3);
         let size = app.size();
@@ -527,6 +633,78 @@ mod tests {
         // The file travels with the notification.
         let sent = Notification::new("Screenshot saved", "shot.png").open("/tmp/a shot.png");
         assert_eq!(Notification::decode(&sent.encode()).and_then(|n| n.open), Some("/tmp/a shot.png".into()));
+    }
+
+    #[test]
+    fn a_notification_put_aside_comes_back_when_its_time_is_up() {
+        use neo::testing::Harness;
+        let (mut s, t) = shell();
+        let path = std::env::temp_dir().join(format!("neo-shell-later-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        s.kept_in = Some(path.clone());
+        s.add(Notification::new("Recording saved", "clip.mov").reveal("/tmp/clip.mov").open("/tmp/clip.mov"), None, t);
+        s.step(t + SLIDE_IN * 2);
+        let size = s.size();
+        let mut h = Harness::new(s, size).unwrap();
+        h.render(1.0);
+        // The clock, left of the close button.
+        h.click(neo::Point::new(MARGIN + CARD_W - 58.0, MARGIN + CARD_H / 2.0));
+        assert!(h.app().cards[0].choosing, "asked when");
+        // While it asks, it does not go on its own, and clicking it opens nothing.
+        h.app_mut().step(t + Duration::from_secs(60));
+        assert_eq!((h.app().cards.len(), h.app().cards[0].leaving), (1, None));
+        h.render(1.0);
+        h.click(neo::Point::new(MARGIN + 200.0, MARGIN + 30.0));
+        assert_eq!(h.app().cards[0].leaving, None);
+        // The clock again takes the question away, and the card stays a while.
+        let id = h.app().cards[0].id;
+        h.app_mut().update(Msg::Choose(id));
+        assert!(!h.app().cards[0].choosing);
+        h.app_mut().step(Instant::now() + Duration::from_secs(4));
+        assert_eq!(h.app().cards[0].leaving, None);
+        h.app_mut().update(Msg::Choose(id));
+        h.render(1.0);
+        // The first of the choices, under the words.
+        h.click(neo::Point::new(MARGIN + 60.0, MARGIN + 74.0));
+        let s = h.app_mut();
+        assert!(s.cards[0].leaving.is_some(), "put aside, and on its way out");
+        assert_eq!(s.reminders.len(), 1);
+        let due = s.reminders[0].due;
+        assert!(due.abs_diff(reminders::wall() + 600) <= 2, "ten minutes from now");
+        assert_eq!(reminders::load(&path), s.reminders, "and written down");
+
+        // A NeoShell started later finds it, and shows it when it is due.
+        let (mut s, t) = shell();
+        s.kept_in = Some(path.clone());
+        s.reminders = reminders::load(&path);
+        s.wake(due - 1, t);
+        assert!(s.cards.is_empty() && !s.window_state().visible, "not yet");
+        assert!(!s.subscriptions().is_empty(), "but watching the time");
+        s.wake(due, t);
+        assert_eq!(s.cards.iter().map(|c| (c.note.title.as_str(), c.reminder, c.note.open.is_some())).collect::<Vec<_>>(), [("Recording saved", true, true)]);
+        assert!(s.reminders.is_empty() && !path.exists(), "shown once, and no more kept");
+        s.wake(due + 600, t);
+        assert_eq!(s.cards.len(), 1);
+    }
+
+    #[test]
+    fn reminders_come_back_soonest_first_and_can_be_put_aside_again() {
+        let (mut s, t) = shell();
+        s.add(note("Later"), None, t);
+        s.add(note("Sooner"), None, t);
+        let (later, sooner) = (s.cards[0].id, s.cards[1].id);
+        s.remind(later, Later::Tomorrow, 1000, t);
+        s.remind(sooner, Later::Hour, 1000, t);
+        // Putting aside one that has gone does nothing.
+        s.remind(sooner, Later::Hour, 1000, t);
+        assert_eq!(s.reminders.iter().map(|r| r.due).collect::<Vec<_>>(), [1000 + 86_400, 1000 + 3600]);
+        s.step(t + SLIDE_OUT);
+        assert!(s.cards.is_empty());
+        s.wake(1000 + 86_400, t);
+        assert_eq!(s.cards.iter().map(|c| c.note.title.as_str()).collect::<Vec<_>>(), ["Sooner", "Later"]);
+        let again = s.cards[0].id;
+        s.remind(again, Later::TenMinutes, 90_000, t);
+        assert_eq!(s.reminders.iter().map(|r| (r.note.title.as_str(), r.due)).collect::<Vec<_>>(), [("Sooner", 90_600)]);
     }
 
     #[test]
