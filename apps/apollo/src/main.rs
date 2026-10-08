@@ -215,6 +215,8 @@ struct Apollo {
     choosing: Option<(usize, Point)>,
     /// Which model's name is being typed, for one that is not here yet.
     typing: Option<usize>,
+    /// The model that writes speech down is being fetched: how far it has got.
+    hearing: Option<(u64, u64)>,
     /// What has been done with files lately, newest last, for the Activity page.
     log: std::collections::VecDeque<Logged>,
     /// The file being worked on, since when, and whether it is being looked at.
@@ -331,6 +333,10 @@ enum Msg {
     /// A question is looking at a file before it answers: which, of how many.
     Looking(usize, usize),
     LookAhead(bool),
+    /// Fetch the model that writes down what is said.
+    GetHearing,
+    /// How far that has got: bytes of how many; or how it ended.
+    Hearing(Result<Option<(u64, u64)>, String>),
     /// Time to look at how the computer is doing.
     Watch,
     /// What was found worth warning of.
@@ -461,6 +467,7 @@ fn kind_icon(kind: Kind) -> neo::theme::Icon {
         Kind::Conversation => icons::MESSAGES_SQUARE,
         Kind::Note => icons::STICKY_NOTE,
         Kind::Folder => icons::FOLDER,
+        Kind::Audio => icons::AUDIO_LINES,
     }
 }
 
@@ -550,6 +557,7 @@ impl Apollo {
             tell: |_| false,
             waiting_question: None,
             pending: vec![],
+            hearing: None,
             log: Default::default(),
             working: None,
             looking: None,
@@ -1548,6 +1556,34 @@ impl Apollo {
                 self.settings.warn = on;
                 self.save_settings();
             }
+            Msg::GetHearing => {
+                if self.hearing.is_none() {
+                    self.hearing = Some((0, neo_apollo_core::hear::MODEL_BYTES));
+                    self.work(|send| {
+                        let mut last = std::time::Instant::now();
+                        let fetched = neo_apollo_core::hear::download(&mut |done, total| {
+                            if last.elapsed() > Duration::from_millis(300) {
+                                last = std::time::Instant::now();
+                                send(Msg::Hearing(Ok(Some((done, total)))));
+                            }
+                            true
+                        });
+                        send(Msg::Hearing(fetched.map(|()| None)));
+                    });
+                }
+            }
+            Msg::Hearing(how) => match how {
+                Ok(Some(far)) => self.hearing = Some(far),
+                // There now: what was left unlistened to is gone back to.
+                Ok(None) => {
+                    self.hearing = None;
+                    self.read();
+                }
+                Err(e) => {
+                    self.hearing = None;
+                    self.trouble = Some(e);
+                }
+            },
             Msg::Looking(i, n) => self.looking = Some((i, n)),
             Msg::LookAhead(on) => {
                 self.settings.look_ahead = on;
@@ -1918,6 +1954,29 @@ impl Apollo {
         }
     }
 
+    /// What stands in the way of listening to videos and recordings, said
+    /// with what to do about it; nothing when there is hearing.
+    fn hearing_notice(&self) -> Option<Element<Msg>> {
+        use neo_apollo_core::hear::{self, Missing};
+        if let Some((done, total)) = self.hearing {
+            let words = column().spacing(6.0).width(Length::Fill).push(text(format!("Fetching the model that writes down what is said: {} of {}", neo_desktop::fs::human_size(done), neo_desktop::fs::human_size(total))).role(TextRole::Caption).tone(Tone::Muted)).push(progress_bar(if total > 0 { done as f32 / total as f32 } else { 0.0 }).width(Length::Fill));
+            return Some(container(words).surface(Surface::Well).radius(10.0).padding([14.0, 10.0]).width(Length::Fill).into());
+        }
+        // Tests are not to depend on what this computer has installed.
+        let missing = if cfg!(test) { None } else { hear::missing() };
+        Some(match missing? {
+            Missing::Tool => notice(Tone::Warn, "What is said in videos and recordings is not being listened to. For that, install whisper-cli: cargo xtask deps --install"),
+            Missing::Ffmpeg => notice(Tone::Warn, "What is said in videos and recordings is not being listened to. For that, install ffmpeg: cargo xtask deps --install"),
+            Missing::Model => row()
+                .spacing(12.0)
+                .align(Align::Center)
+                .width(Length::Fill)
+                .push(text(format!("What is said in videos and recordings is not being listened to yet. The model that writes it down is fetched once, about {}, and runs on this computer.", neo_desktop::fs::human_size(hear::MODEL_BYTES))).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
+                .push(Button::new(text("Fetch It")).on_press(Msg::GetHearing))
+                .into(),
+        })
+    }
+
     /// What Apollo is doing and has done: how the reading stands, why it
     /// takes the time it does, and the files it has been through lately.
     fn activity_page(&self) -> Element<Msg> {
@@ -1978,7 +2037,10 @@ impl Apollo {
         } else {
             page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("How much has been taken in is part of the memory, and shown once it is unlocked.").tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Unlock…")).on_press_maybe((!self.unlocking).then_some(Msg::Unlock))));
         }
-        for tool in &p.needs {
+        if let Some(hearing) = self.hearing_notice() {
+            page = page.push(hearing);
+        }
+        for tool in p.needs.iter().filter(|t| !t.starts_with("whisper")) {
             page = page.push(notice(Tone::Warn, format!("Some files are being left for want of {tool}: cargo xtask deps --install")));
         }
 
@@ -2004,7 +2066,7 @@ impl Apollo {
         for done in self.log.iter().rev() {
             let name = done.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let place = done.path.parent().map(short_path).unwrap_or_default();
-            let photo_or_video = matches!(index::classify(&done.path), Some(index::What::Photo | index::What::Video));
+            let photo_or_video = matches!(index::classify(&done.path), Some(index::What::Photo | index::What::Video | index::What::Audio));
             let (said, tone) = match (&done.trouble, done.looked, photo_or_video) {
                 (Some(why), _, _) => (format!("Could not be read: {why}"), Tone::Bad),
                 (None, true, _) => (format!("Looked at, {:.0} s", done.seconds.max(1.0)), Tone::Good),
@@ -2022,7 +2084,7 @@ impl Apollo {
     fn sources_page(&self) -> Element<Msg> {
         let p = &self.progress;
         let mut page = column().spacing(14.0).padding(22.0).width(Length::Fill);
-        page = page.push(text("Sources").role(TextRole::Heading)).push(text("The folders Apollo reads. Each picture is described, each video looked at in a few places along its length, and each document read in passages; what it finds goes into its memory.").tone(Tone::Muted).width(Length::Fill));
+        page = page.push(text("Sources").role(TextRole::Heading)).push(text("The folders Apollo reads. Each picture is described, each video looked at in a few places along its length and listened to, each recording listened to, and each document read in passages; what it finds goes into its memory.").tone(Tone::Muted).width(Length::Fill));
 
         // How the reading is going.
         let (what, detail) = if self.ready != Engine::Ready {
@@ -2049,10 +2111,15 @@ impl Apollo {
         if let Some(setup) = self.setup() {
             page = page.push(setup);
         }
+        if let Some(hearing) = self.hearing_notice() {
+            page = page.push(hearing);
+        }
         for tool in &p.needs {
             let what = match *tool {
                 "pdftotext" => "PDFs are being left unread. To read them, install pdftotext: cargo xtask deps --install",
                 "ffmpeg" => "Videos are being left unread. To read them, install ffmpeg: cargo xtask deps --install",
+                // Said once, with what to do about it, by the notice above.
+                t if t.starts_with("whisper") => continue,
                 _ => "Some documents are being left unread. To read them, install pandoc.",
             };
             page = page.push(notice(Tone::Warn, what));

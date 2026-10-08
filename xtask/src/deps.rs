@@ -29,6 +29,8 @@ pub const DEPENDENCIES: &[Dependency] = &[
     Dependency { program: "ffmpeg", why: "thumbnails of videos in Files, and Apollo's look at them; on Linux and Windows, playing in Videos and recording in NeoCap", brew: "ffmpeg", winget: Some("Gyan.FFmpeg"), linux: |_| Some("ffmpeg") },
     // Linux distributions do not package it; it has an installer of its own.
     Dependency { program: "ollama", why: "Apollo, whose model it runs on this computer (https://ollama.com/download)", brew: "ollama", winget: Some("Ollama.Ollama"), linux: |manager| (manager == "pacman").then_some("ollama") },
+    // Packaged for Homebrew; elsewhere it is built from whisper.cpp's source.
+    Dependency { program: "whisper-cli", why: "Apollo's hearing of what is said in videos and recordings (https://github.com/ggml-org/whisper.cpp)", brew: "whisper-cpp", winget: None, linux: |_| None },
     Dependency {
         program: "pdftotext",
         why: "Apollo's reading of PDFs",

@@ -20,9 +20,11 @@ pub enum What {
     Document,
     Photo,
     Video,
+    Audio,
 }
 
 const PHOTOS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif"];
+const AUDIO: &[&str] = &["mp3", "m4a", "wav", "flac", "ogg", "oga", "opus", "aac", "aiff", "aif", "wma", "caf"];
 const VIDEOS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "3gp", "ts"];
 /// Text as it stands.
 const PLAIN: &[&str] = &["txt", "md", "markdown", "org", "rst", "tex", "text"];
@@ -52,6 +54,8 @@ pub fn classify(path: &Path) -> Option<What> {
         Some(What::Photo)
     } else if VIDEOS.contains(&ext) {
         Some(What::Video)
+    } else if AUDIO.contains(&ext) {
+        Some(What::Audio)
     } else if PLAIN.contains(&ext) || RICH.contains(&ext) || ext == "pdf" {
         Some(What::Document)
     } else {
@@ -69,11 +73,18 @@ pub fn stamp(meta: &std::fs::Metadata) -> String {
 /// those described the old way are read again.
 const DESCRIBED: u32 = 2;
 
+/// What a stamp carries for a file whose sound has been listened to.
+const HEARD: &str = "-h1";
+
 /// A file's stamp, with how it was read: a photo or a video described an
 /// older way does not count as read.
 fn stamp_of(path: &Path, meta: &std::fs::Metadata) -> String {
     match classify(path) {
-        Some(What::Photo | What::Video) => format!("{}-d{DESCRIBED}", stamp(meta)),
+        Some(What::Photo) => format!("{}-d{DESCRIBED}", stamp(meta)),
+        // A video looked at before there was hearing has not been listened
+        // to: once there is, it counts as not yet read.
+        Some(What::Video) => format!("{}-d{DESCRIBED}{}", stamp(meta), if crate::hear::missing().is_none() { HEARD } else { "" }),
+        Some(What::Audio) => format!("{}{HEARD}", stamp(meta)),
         _ => stamp(meta),
     }
 }
@@ -258,7 +269,7 @@ pub fn thumbnail(path: &Path, side: u32) -> Option<(u32, u32, Vec<u8>)> {
         What::Photo => look_at(path).ok()?,
         // Not the very start, which is so often black.
         What::Video => frame(path, duration(path).map_or(0.0, |d| (d * 0.15).min(10.0)))?,
-        What::Document => return None,
+        What::Document | What::Audio => return None,
     };
     let small = image::load_from_memory(&jpeg).ok()?.thumbnail(side, side).into_rgba8();
     let (w, h) = small.dimensions();
@@ -443,11 +454,15 @@ pub fn list_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<Ou
     let kind = match classify(path) {
         Some(What::Photo) => Kind::Photo,
         Some(What::Video) => Kind::Video,
+        Some(What::Audio) => Kind::Audio,
         _ => return index_file(store, model, path),
     };
     let (title, folder) = (name(path), path.parent().and_then(Path::file_name).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default());
-    let what = if kind == Kind::Photo { "A photo" } else { "A video" };
-    let text = format!("{what} that has not been looked at yet, called {title}, in the folder {folder}.");
+    let text = match kind {
+        Kind::Audio => format!("An audio recording that has not been listened to yet, called {title}, in the folder {folder}."),
+        Kind::Photo => format!("A photo that has not been looked at yet, called {title}, in the folder {folder}."),
+        _ => format!("A video that has not been looked at yet, called {title}, in the folder {folder}."),
+    };
     // What its name and folder say of it: "Neo Recording", "Trips".
     let about = words::clean_all(words::terms(&format!("{} {folder}", path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())), 6);
     store.forget_source(path)?;
@@ -455,6 +470,18 @@ pub fn list_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<Ou
     store.mark_light(id)?;
     store.set_file(path, &format!("{}{LISTED}", stamp(&meta)), 1)?;
     Ok(Outcome::Read(1))
+}
+
+/// Remembers the rest of what is said in a video or a recording, a
+/// passage to a memory, after the first, which is kept with the memory
+/// of the thing itself. Returns how many memories the file has in all.
+fn remember_said(store: &mut Store, model: &dyn Model, kind: Kind, path: &Path, title: &str, created: u64, rest: &[String]) -> Result<u32, String> {
+    for (i, passage) in rest.iter().enumerate() {
+        let text = format!("Said further on: {passage}");
+        let about = words::keywords(passage, 5);
+        remember(store, model, &New { kind, source: Some(path), title, text: &text, part: i as u32 + 1, created, words: &about })?;
+    }
+    Ok(rest.len() as u32 + 1)
 }
 
 /// Reads one file into the memory, in place of whatever was remembered of
@@ -485,10 +512,35 @@ pub fn index_file(store: &mut Store, model: &dyn Model, path: &Path) -> Result<O
             if seen.is_empty() {
                 return Err("No picture could be taken from it.".into());
             }
-            let all = video_text(seconds, &seen);
+            let mut all = video_text(seconds, &seen);
+            // And what is said in it, where there is hearing: the start of
+            // it with what is seen, and the rest in passages after.
+            let said = if crate::hear::missing().is_none() { passages(&crate::hear::transcribe(path).unwrap_or_default()) } else { vec![] };
+            if let Some(first) = said.first() {
+                all.text.push_str(&format!(" What is said: {first}"));
+                all.words = words::clean_all(all.words.iter().cloned().chain(words::keywords(&said.join(" "), 4)), 12);
+            }
             store.forget_source(path)?;
             remember(store, model, &New { kind: Kind::Video, source: Some(path), title: &title, text: &all.text, part: 0, created, words: &all.words })?;
-            1
+            remember_said(store, model, Kind::Video, path, &title, created, said.get(1..).unwrap_or_default())?
+        }
+        What::Audio => {
+            match crate::hear::missing() {
+                Some(crate::hear::Missing::Tool) => return Ok(Outcome::Needs(crate::hear::TOOL)),
+                Some(crate::hear::Missing::Ffmpeg) => return Ok(Outcome::Needs("ffmpeg")),
+                Some(crate::hear::Missing::Model) => return Ok(Outcome::Needs("whisper-model")),
+                None => {}
+            }
+            let said = passages(&crate::hear::transcribe(path)?);
+            let long = duration(path).map_or(String::new(), |d| format!(" {} long", clock(d)));
+            let text = match said.first() {
+                Some(first) => format!("An audio recording{long}. What is said: {first}"),
+                None => format!("An audio recording{long}, in which no speech could be made out."),
+            };
+            let about = words::keywords(&said.join(" "), 6);
+            store.forget_source(path)?;
+            remember(store, model, &New { kind: Kind::Audio, source: Some(path), title: &title, text: &text, part: 0, created, words: &about })?;
+            remember_said(store, model, Kind::Audio, path, &title, created, said.get(1..).unwrap_or_default())?
         }
         What::Document => {
             let text = match text_of(path)? {
@@ -589,7 +641,7 @@ pub fn run(store: &mut Store, model: &dyn Model, roots: &[PathBuf], look: bool, 
         return p;
     }
     // Then the slow part, newest first, as the files were found.
-    let waiting: Vec<PathBuf> = files.into_iter().filter(|f| matches!(classify(f), Some(What::Photo | What::Video))).collect();
+    let waiting: Vec<PathBuf> = files.into_iter().filter(|f| matches!(classify(f), Some(What::Photo | What::Video | What::Audio))).collect();
     read_files(store, model, waiting.clone(), Progress { done: p.total - waiting.len(), ..p }, true, report)
 }
 
@@ -656,9 +708,15 @@ fn read_files(store: &mut Store, model: &dyn Model, files: Vec<PathBuf>, mut p: 
             continue;
         };
         let had = store.file_stamp(&file).ok().flatten();
-        let seen = matches!(classify(&file), Some(What::Photo | What::Video));
+        let seen = matches!(classify(&file), Some(What::Photo | What::Video | What::Audio));
         // Looked at already, or listed already and that is all that is asked.
-        let unchanged = had.as_deref() == Some(stamp_of(&file, &meta).as_str()) || (seen && !look && had.as_deref() == Some(format!("{}{LISTED}", stamp(&meta)).as_str()));
+        let (base, listed_stamp) = (stamp(&meta), format!("{}{LISTED}", stamp(&meta)));
+        let unchanged = had.as_deref() == Some(stamp_of(&file, &meta).as_str()) || (seen && !look && had.as_deref() == Some(listed_stamp.as_str()));
+        // The file is as it was, and was looked at, but in an older way
+        // (before pictures were described as they are now, or before there
+        // was hearing). It is looked at again, not put back to being only
+        // listed: what was known of it is not to be lost for being improved on.
+        let look = look || (seen && had.as_deref().is_some_and(|h| h.starts_with(&base) && h != listed_stamp));
         if !unchanged {
             p.now = Some(file.clone());
             if !report(&p) {
@@ -718,6 +776,7 @@ mod tests {
         assert_eq!(classify(Path::new("/a/IMG_1.HEIC")), Some(What::Photo));
         assert_eq!(classify(Path::new("clip.MKV")), Some(What::Video));
         assert_eq!((classify(Path::new("notes.md")), classify(Path::new("paper.pdf")), classify(Path::new("letter.docx"))), (Some(What::Document), Some(What::Document), Some(What::Document)));
+        assert_eq!((classify(Path::new("memo.M4A")), classify(Path::new("talk.mp3"))), (Some(What::Audio), Some(What::Audio)));
         assert_eq!((classify(Path::new("main.rs")), classify(Path::new("data.bin")), classify(Path::new("README"))), (None, None, None));
     }
 
@@ -966,6 +1025,43 @@ mod tests {
         std::fs::remove_dir_all(root.join("Invoices")).unwrap();
         run(&mut store, &model, &roots, false, &mut |_| true);
         assert_eq!(store.stats().unwrap().of(Kind::Folder), before - 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn what_is_said_in_a_video_and_in_a_recording_is_remembered() {
+        // Needs the real hearing, and a voice to hear: macOS has one to hand.
+        let voice = Path::new("/usr/bin/say");
+        if crate::hear::missing().is_some() || !voice.is_file() || !have("ffprobe") {
+            return;
+        }
+        let dir = scratch("heard");
+        let spoken = dir.join("memo.aiff");
+        assert!(Command::new(voice).arg("-o").arg(&spoken).arg("We take the ferry to the island on Friday morning. The ferry back leaves at four on Sunday.").status().unwrap().success());
+        let clip = dir.join("trip.mp4");
+        assert!(Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-v", "error", "-f", "lavfi", "-i", "color=c=0x2828DC:s=160x120:d=7", "-i"]).arg(&spoken).args(["-shortest", "-pix_fmt", "yuv420p"]).arg(&clip).status().unwrap().success());
+        let model = Fake::default();
+        let mut store = Store::open(&dir.join("db/memory.db"), &[1; 32], model.dims().unwrap()).unwrap();
+        // Listed first, as a photo is; then listened to.
+        assert_eq!(list_file(&mut store, &model, &spoken), Ok(Outcome::Read(1)));
+        let listed = &store.recent(1, Some(Kind::Audio)).unwrap()[0];
+        assert!(listed.light && listed.text.starts_with("An audio recording that has not been listened to yet, called memo.aiff"));
+        assert_eq!(index_file(&mut store, &model, &spoken), Ok(Outcome::Read(1)));
+        let heard = &store.recent(1, Some(Kind::Audio)).unwrap()[0];
+        assert!(!heard.light && heard.text.starts_with("An audio recording 0:0") && heard.text.to_lowercase().contains("what is said: we take the ferry to the island"), "{}", heard.text);
+        assert!(store.words_of(heard.id).unwrap().contains(&"ferry".to_owned()));
+        // A video is what is seen in it and what is said in it.
+        assert_eq!(index_file(&mut store, &model, &clip), Ok(Outcome::Read(1)));
+        let seen = &store.recent(1, Some(Kind::Video)).unwrap()[0];
+        assert!(seen.text.starts_with("A video 0:0") && seen.text.contains("Waves on the sea.") && seen.text.to_lowercase().contains("what is said: we take the ferry"), "{}", seen.text);
+        assert!(store.file_stamp(&clip).unwrap().unwrap().ends_with("-d2-h1") && store.file_stamp(&spoken).unwrap().unwrap().ends_with("-h1"));
+        // One looked at before there was hearing is listened to when there is, even where
+        // files are only being listed: it is not put back to being a name and a place.
+        let meta = std::fs::metadata(&clip).unwrap();
+        store.set_file(&clip, &format!("{}-d2", stamp(&meta)), 1).unwrap();
+        let p = run(&mut store, &model, std::slice::from_ref(&dir), false, &mut |_| true);
+        let again = store.recent(5, Some(Kind::Video)).unwrap().into_iter().find(|m| m.title == "trip.mp4").unwrap();
+        assert!(!again.light && again.text.contains("What is said:") && p.read >= 1, "{}", again.text);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

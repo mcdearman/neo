@@ -28,10 +28,13 @@ pub enum Kind {
     /// A folder, and what it is: an Obsidian vault, a project, or only a
     /// folder with a name. Known by where it is, for "where is my …".
     Folder,
+    /// A sound recording: a voice memo, a podcast, a song. Known by what
+    /// is said in it.
+    Audio,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Photo, Kind::Video, Kind::Document, Kind::Conversation, Kind::Note, Kind::Folder];
+    pub const ALL: [Kind; 7] = [Kind::Photo, Kind::Video, Kind::Document, Kind::Conversation, Kind::Note, Kind::Folder, Kind::Audio];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -41,6 +44,7 @@ impl Kind {
             Kind::Conversation => "conversation",
             Kind::Note => "note",
             Kind::Folder => "folder",
+            Kind::Audio => "audio",
         }
     }
 
@@ -57,6 +61,7 @@ impl Kind {
             Kind::Conversation => "Conversations",
             Kind::Note => "Notes",
             Kind::Folder => "Folders",
+            Kind::Audio => "Audio",
         }
     }
 }
@@ -127,7 +132,7 @@ pub struct Related {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Memories of each kind, in [`Kind::ALL`]'s order.
-    pub memories: [u32; 6],
+    pub memories: [u32; 7],
     pub words: u32,
     pub files: u32,
     /// Photos and videos that are only listed, not yet looked at.

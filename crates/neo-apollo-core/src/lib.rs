@@ -20,6 +20,7 @@
 //! - [`settings`]: which folders are read, and which models are used.
 
 pub mod assistant;
+pub mod hear;
 pub mod index;
 pub mod key;
 pub mod model;

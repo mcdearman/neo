@@ -70,6 +70,7 @@ impl Wanted {
             Kind::Conversation => "conversations",
             Kind::Note => "notes",
             Kind::Folder => "folders",
+            Kind::Audio => "audio recordings",
         });
         match &self.span {
             Some(span) => format!("{things} from {span}"),
@@ -96,6 +97,8 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
         Some(Kind::Photo)
     } else if has(&["document", "documents", "docs", "pdf", "pdfs", "papers"]) {
         Some(Kind::Document)
+    } else if has(&["audio", "song", "songs", "music", "podcast", "podcasts", "memo", "memos", "voicemail", "voicemails"]) {
+        Some(Kind::Audio)
     } else if has(&["folder", "folders", "directory", "directories", "vault", "vaults", "repo", "repos", "repository", "repositories", "project", "projects"]) {
         Some(Kind::Folder)
     } else {
@@ -128,6 +131,14 @@ pub fn wanted(question: &str, now: DateTime<Local>) -> Wanted {
         "pdf",
         "pdfs",
         "papers",
+        "audio",
+        "song",
+        "songs",
+        "music",
+        "podcast",
+        "podcasts",
+        "memo",
+        "memos",
         "folder",
         "folders",
         "directory",
@@ -277,6 +288,7 @@ fn entry(n: usize, m: &Memory) -> String {
         Kind::Note => "A note the user asked you to keep".to_owned(),
         // A folder says what and where it is itself.
         Kind::Folder => return format!("{n}. {}\n", m.text),
+        Kind::Audio => "An audio recording".to_owned(),
     };
     // Where it is, for when that is what is asked: the folder, not the file.
     let place = m.source.as_deref().and_then(std::path::Path::parent).map(|dir| match dir.strip_prefix(neo_desktop::fs::home_dir()) {
@@ -541,6 +553,7 @@ mod tests {
         assert!(!wanted("What photos do I have?", now).about && wanted("What photos do I have?", now).any());
         assert!(wanted("photos of the dog from last month", now).any(), "a stretch of time is still a list");
         assert!(!wanted("show me my videos from March 2026 please", now).about);
+        assert_eq!((wanted("what voice memos do I have?", now).kind, wanted("the podcast about ferries", now).kind), (Some(Kind::Audio), Some(Kind::Audio)));
         // An ordinary question asks for no list.
         for q in ["Where is the spare key?", "What may I do about it?", "How do I record the screen?"] {
             assert!(!wanted(q, now).any() || q.contains("record"), "{q}");
