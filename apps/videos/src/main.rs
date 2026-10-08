@@ -126,6 +126,13 @@ impl App for Videos {
         self.desktop.theme(system)
     }
 
+    /// Closing the window stops the video, sound and all: the programs
+    /// that play it would otherwise carry on without a window.
+    fn on_exit(&mut self) {
+        self.player = None;
+        self.playing = false;
+    }
+
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
         let mut subs = vec![Desktop::subscription(Msg::Poll)];
         if self.player.is_some() {
@@ -375,6 +382,46 @@ mod tests {
         empty.update(Msg::Tick);
         assert!(!empty.playing && !empty.autoplay);
         drop((still, app));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_the_app_stops_the_picture_and_the_sound() {
+        // With sound, so there is something to be left playing.
+        let path = std::env::temp_dir().join(format!("neo-videos-{}-closing.mkv", std::process::id()));
+        let made = std::process::Command::new(neo_desktop::fs::tool("ffmpeg"))
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=30:size=160x120:rate=12", "-f", "lavfi", "-i", "sine=frequency=440:duration=30", "-pix_fmt", "yuv420p", "-shortest"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        // The programs playing this file, by its name on their command lines.
+        let playing = || {
+            let out = std::process::Command::new("pgrep").arg("-f").arg(path.file_name().unwrap()).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
+            out
+        };
+        let mut app = Videos::new(Some(path.clone()));
+        app.update(Msg::Volume(0.0));
+        app.autoplay = true;
+        let mut h = neo::testing::Harness::new(app, Size::new(640.0, 480.0)).unwrap();
+        h.app_mut().update(Msg::Tick);
+        assert!(h.app().playing);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while playing() < 2 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(playing() >= 2, "one program for the picture and one for the sound: {}", playing());
+        // The app ends, as when its window is closed or Quit is chosen.
+        h.exit();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while playing() > 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(playing(), 0, "nothing is left playing it");
+        assert!(h.app().player.is_none() && !h.app().playing);
         let _ = std::fs::remove_file(path);
     }
 

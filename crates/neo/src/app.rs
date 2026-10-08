@@ -79,6 +79,12 @@ pub trait App: 'static {
         None
     }
 
+    /// Called once as the app ends, however it ends: the window closed,
+    /// Quit chosen from the menu, or the system shutting it down. The
+    /// place to stop anything that would otherwise outlive it, such as a
+    /// program it started.
+    fn on_exit(&mut self) {}
+
     /// Return true to end the app. Checked after every update.
     fn should_exit(&self) -> bool {
         false
@@ -168,6 +174,10 @@ impl<A: App> armature::App for Themed<A> {
 
     fn on_window_focus(&self, focused: bool) -> Option<Self::Message> {
         self.0.on_window_focus(focused)
+    }
+
+    fn on_exit(&mut self) {
+        self.0.on_exit()
     }
 
     fn should_exit(&self) -> bool {
