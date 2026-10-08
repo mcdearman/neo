@@ -12,6 +12,15 @@ neo-apollo-core = { path = "../../crates/neo-apollo-core" }
 rfd = "0.17.2"
 # Hears from the system which files have changed, so that only they are read.
 notify = "8"
+png = "0.18"
+
+# The menu bar and system tray icon. Linux uses the StatusNotifierItem
+# protocol over D-Bus instead, which needs no GTK.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -33,6 +33,8 @@ use neo_desktop::{Desktop, DesktopMsg};
 
 mod cloud;
 use cloud::{Cloud, Graph, Hub};
+mod tray;
+use tray::{Tray, TrayAction, TrayState};
 
 /// How many words the cloud shows, and how many memories a list.
 const CLOUD_WORDS: usize = 90;
@@ -222,6 +224,11 @@ struct Apollo {
     /// Files a search turned up only listed that were sent to be looked at,
     /// so that none is sent twice.
     asked_after: Vec<PathBuf>,
+    /// Apollo's icon in the menu bar, and what its menu last said. Apollo
+    /// keeps out of the Dock, so this is where it is found.
+    tray: Option<Tray>,
+    tray_state: TrayState,
+    tray_tried: bool,
     /// The window is showing. Closed with Apollo set to stay ready, it is
     /// only out of sight, and a question brings it back.
     in_sight: bool,
@@ -329,6 +336,8 @@ enum Msg {
     /// What was found worth warning of.
     Warned(Vec<Warning>),
     WarnMe(bool),
+    /// Something was chosen from the menu bar icon's menu.
+    Tray(TrayAction),
     /// Put the window out of sight, with Apollo still running.
     Hide,
     Show,
@@ -527,6 +536,9 @@ impl Apollo {
             remote_draft: String::new(),
             choosing: None,
             typing: None,
+            tray: None,
+            tray_state: TrayState::default(),
+            tray_tried: false,
             in_sight: true,
             quit: false,
             last_used: std::time::Instant::now(),
@@ -1264,7 +1276,47 @@ impl App for Apollo {
         }
     }
 
+    fn view(&self) -> Element<Msg> {
+        self.whole_view()
+    }
+
     fn update(&mut self, m: Msg) {
+        self.apply(m);
+        // The icon goes into the menu bar once the event loop is running,
+        // which the first message shows, and its menu is kept in step.
+        if !self.tray_tried && self.proxy.is_some() {
+            self.tray_tried = true;
+            self.add_tray();
+        }
+        let state = self.tray_now();
+        if state != self.tray_state {
+            if let Some(tray) = &self.tray {
+                tray.update(&state);
+            }
+            self.tray_state = state;
+        }
+    }
+}
+
+impl Apollo {
+    fn tray_now(&self) -> TrayState {
+        TrayState { status: self.status(), unlocked: self.store.is_some(), can_read: self.ready == Engine::Ready && !self.reading }
+    }
+
+    /// Adds the menu bar icon. No icon is not fatal: the search bar and
+    /// opening Apollo again still bring the window.
+    fn add_tray(&mut self) {
+        let Some(proxy) = self.proxy.clone() else { return };
+        self.tray_state = self.tray_now();
+        match Tray::new(&self.tray_state, move |action| {
+            proxy.send(Msg::Tray(action));
+        }) {
+            Ok(tray) => self.tray = Some(tray),
+            Err(e) => eprintln!("neo-apollo: no menu bar icon: {e}"),
+        }
+    }
+
+    fn apply(&mut self, m: Msg) {
         match m {
             Msg::Page(page) => self.page = page,
             Msg::Desktop(m) => {
@@ -1445,6 +1497,12 @@ impl App for Apollo {
             }
 
             Msg::Read => self.read(),
+            Msg::Tray(action) => match action {
+                TrayAction::Open => self.in_sight = true,
+                TrayAction::Lock => self.lock(),
+                TrayAction::Read => self.read(),
+                TrayAction::Quit => self.quit = true,
+            },
             Msg::Hide => self.in_sight = false,
             Msg::Show => self.in_sight = true,
             Msg::Quit => self.quit = true,
@@ -1589,7 +1647,8 @@ impl App for Apollo {
         }
     }
 
-    fn view(&self) -> Element<Msg> {
+    /// The window's content, with whatever is over it.
+    fn whole_view(&self) -> Element<Msg> {
         let content = if self.asking_reset { self.reset_sheet() } else { self.content() };
         self.desktop.with_settings(content, "Apollo Settings", Msg::Desktop, vec![])
     }
@@ -2595,6 +2654,17 @@ mod tests {
         a.update(Msg::Ask("What about the cat?".into()));
         assert_eq!((a.talk.len(), a.store.is_none(), a.declined, a.waiting_question.clone()), (6, true, false, None));
         assert!(a.talk[5].text.ends_with("0 memories."));
+        // From the menu bar: open the window, lock the memory, read, quit.
+        a.check = Arc::new(|_| Ok(()));
+        a.update(Msg::Unlock);
+        a.update(Msg::Hide);
+        assert_eq!(a.tray_now(), TrayState { status: "Up to date".into(), unlocked: true, can_read: true });
+        a.update(Msg::Tray(TrayAction::Open));
+        assert!(a.window_state().visible);
+        a.update(Msg::Tray(TrayAction::Lock));
+        assert!(a.store.is_none() && !a.tray_now().unlocked);
+        a.update(Msg::Tray(TrayAction::Read));
+        assert!(!a.reading && a.tray.is_none(), "a reading done; and no icon is made in a test");
         // Set to stay unlocked until it quits, time does not lock it.
         a.check = Arc::new(|_| Ok(()));
         a.update(Msg::Unlock);
@@ -2606,7 +2676,7 @@ mod tests {
         a.update(Msg::Background(false));
         assert!(a.on_close().is_none() && !Settings::load_from(&scratch.0.join("settings")).background);
         a.update(Msg::Show);
-        a.update(Msg::Quit);
+        a.update(Msg::Tray(TrayAction::Quit));
         assert!(a.should_exit());
     }
 

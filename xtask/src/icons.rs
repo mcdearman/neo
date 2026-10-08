@@ -8,7 +8,7 @@ use std::path::Path;
 use armature_render::{FontFamily, Point, Rect, Renderer, Scene, TextStyle};
 use neo_theme::{Color, Shadow};
 
-use crate::apps::{AppInfo, APPS};
+use crate::apps::{APPS, AppInfo};
 
 /// Sizes for the freedesktop.org hicolor theme and Windows .ico files.
 pub const SIZES: [u32; 8] = [16, 24, 32, 48, 64, 128, 256, 512];
@@ -42,7 +42,8 @@ fn save(r: &mut Renderer, scene: &Scene, px: u32, path: &Path) -> std::io::Resul
 }
 
 /// Icons for the Recorder's place in the menu bar or system tray: a
-/// template glyph that the system tints, and a red dot shown while recording.
+/// template glyph that the system tints, and a red dot shown while
+/// recording. And Apollo's.
 fn tray(r: &mut Renderer, out: &Path) -> std::io::Result<()> {
     let mut idle = Scene::new(Color::TRANSPARENT);
     let glyph = r.text().layout(&neo_theme::icons::VIDEO.0.to_string(), &TextStyle { size: 800.0, family: FontFamily::Icons, line_height: 1.0, ..Default::default() }, None);
@@ -52,7 +53,14 @@ fn tray(r: &mut Renderer, out: &Path) -> std::io::Result<()> {
 
     let mut recording = Scene::new(Color::TRANSPARENT);
     recording.fill(Rect::new(192.0, 192.0, 640.0, 640.0), 320.0, Color::hex(0xFF3B30), None);
-    save(r, &recording, 44, &out.join("tray/recorder-recording.png"))
+    save(r, &recording, 44, &out.join("tray/recorder-recording.png"))?;
+
+    // Apollo's place there: its own glyph, tinted by the system likewise.
+    let mut apollo = Scene::new(Color::TRANSPARENT);
+    let glyph = r.text().layout(&neo_theme::icons::SPARKLES.0.to_string(), &TextStyle { size: 800.0, family: FontFamily::Icons, line_height: 1.0, ..Default::default() }, None);
+    let s = glyph.size();
+    apollo.text(&glyph, Point::new(512.0 - s.w * 0.5, 512.0 - s.h * 0.5), Color::BLACK);
+    save(r, &apollo, 44, &out.join("tray/apollo.png"))
 }
 
 /// Writes `hicolor/NxN/apps/<id>.png` and `macos/<id>.iconset/*.png` under `out`.

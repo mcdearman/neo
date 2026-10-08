@@ -1929,11 +1929,14 @@ name = "neo-apollo"
 version = "0.1.0"
 dependencies = [
  "image",
+ "ksni",
  "neo",
  "neo-apollo-core",
  "neo-desktop",
  "notify",
+ "png",
  "rfd",
+ "tray-icon",
 ]
 
 [[package]]

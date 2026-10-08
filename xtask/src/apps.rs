@@ -37,6 +37,6 @@ pub const APPS: &[AppInfo] = &[
     AppInfo { bin: "neo-launcher", id: "org.neo.Launcher", name: "Launcher", former: "Neo Launcher", glyph: icons::SEARCH, top: Color::hex(0x5B78E6), bottom: Color::hex(0x2B3A8C), ink: Color::WHITE, background: true },
     AppInfo { bin: "neo-shell", id: "org.neo.Shell", name: "NeoShell", former: "NeoShell", glyph: icons::PANEL_TOP, top: Color::hex(0x4A5568), bottom: Color::hex(0x1F2733), ink: Color::WHITE, background: true },
     AppInfo { bin: "neo-disk", id: "org.neo.Disk", name: "NeoDisk", former: "NeoDisk", glyph: icons::HARD_DRIVE, top: Color::hex(0x7BC96F), bottom: Color::hex(0x2E7D4F), ink: Color::WHITE, background: false },
-    AppInfo { bin: "neo-apollo", id: "org.neo.Apollo", name: "Apollo", former: "Apollo", glyph: icons::SPARKLES, top: Color::hex(0xFFC857), bottom: Color::hex(0xE0731D), ink: Color::WHITE, background: false },
+    AppInfo { bin: "neo-apollo", id: "org.neo.Apollo", name: "Apollo", former: "Apollo", glyph: icons::SPARKLES, top: Color::hex(0xFFC857), bottom: Color::hex(0xE0731D), ink: Color::WHITE, background: true },
     AppInfo { bin: "neo-code", id: "org.neo.Code", name: "NeoCode", former: "Neo Code", glyph: icons::CODE, top: Color::hex(0x2F3542), bottom: Color::hex(0x14171C), ink: Color::hex(0x889FEC), background: false },
 ];
