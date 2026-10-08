@@ -163,9 +163,14 @@ struct Apollo {
     /// The models as typed in Sources, before they are put to use: the one
     /// that answers, the one that sees, the one that embeds.
     drafts: [String; 3],
-    /// The models the server has, each with what it can do: `completion`,
-    /// `vision`, `embedding`. Nothing, for a server too old to say.
-    installed: Vec<(String, Vec<String>)>,
+    /// The models the servers have, each with what it can do (`completion`,
+    /// `vision`, `embedding`; nothing, for a server too old to say) and
+    /// whether it is on the other computer.
+    installed: Vec<(String, Vec<String>, bool)>,
+    /// Whether each of the models as typed is one on the other computer.
+    drafts_away: [bool; 3],
+    /// The other computer's address as typed, before it is put to use.
+    remote_draft: String,
     /// Which model's menu is open, and where it hangs from.
     choosing: Option<(usize, Point)>,
     /// Which model's name is being typed, for one that is not here yet.
@@ -229,14 +234,20 @@ enum Msg {
     ModelDraft(usize, String),
     /// Put the models typed to use.
     UseModels,
-    Installed(Vec<(String, Vec<String>)>),
+    Installed(Vec<(String, Vec<String>, bool)>),
+    RemoteDraft(String),
+    /// Put the other computer's address, as typed, to use.
+    UseRemote,
     /// Open the menu of models for one of the three jobs, under its control.
     ChooseModel(usize, Rect),
     CloseChoice,
     /// A model was picked from the menu: put it to use.
-    PickModel(usize, String),
-    /// Type the name of one that is not in the menu.
-    OtherModel(usize),
+    /// A model was picked from the menu: put it to use. The last says
+    /// whether it is one on the other computer.
+    PickModel(usize, String, bool),
+    /// Type the name of one that is not in the menu, for here or for the
+    /// other computer.
+    OtherModel(usize, bool),
     /// The system says these files or folders have changed.
     Changed(Vec<PathBuf>),
     AskReset,
@@ -339,6 +350,8 @@ impl Apollo {
         let mut app = Self::with(server.clone(), neo_apollo_core::dir().join("memory.db"), None, Arc::new(key::authenticate));
         app.settings = settings;
         app.drafts = app.chosen();
+        app.drafts_away = app.away();
+        app.remote_draft = app.settings.remote.clone();
         app.settings_file = Some(Settings::file());
         app.server = Some(server);
         app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
@@ -387,6 +400,8 @@ impl Apollo {
             held: false,
             drafts: Default::default(),
             installed: vec![],
+            drafts_away: [false; 3],
+            remote_draft: String::new(),
             choosing: None,
             typing: None,
             pending: vec![],
@@ -430,15 +445,53 @@ impl Apollo {
         [self.settings.chat_model.clone(), self.settings.vision_model.clone(), self.settings.embed_model.clone()]
     }
 
-    /// Puts the models typed in Sources to use.
+    /// Whether each job is done on the other computer.
+    fn away(&self) -> [bool; 3] {
+        let there = !self.settings.remote.is_empty();
+        [self.settings.chat_remote && there, self.settings.vision_remote && there, self.settings.embed_remote && there]
+    }
+
+    /// The other computer by its name alone, as it is said in menus: the
+    /// address without its scheme and port.
+    fn remote_name(&self) -> String {
+        let address = self.settings.remote.split_once("://").map_or(self.settings.remote.as_str(), |(_, rest)| rest);
+        address.split([':', '/']).next().unwrap_or(address).to_owned()
+    }
+
+    /// Puts the models typed in Sources to use, each where it was said to be.
     fn use_models(&mut self) {
         let typed = self.drafts.clone().map(|m| m.trim().to_owned());
-        if typed.iter().any(String::is_empty) || typed == self.chosen() {
+        let there = !self.settings.remote.is_empty();
+        let away = self.drafts_away.map(|a| a && there);
+        if typed.iter().any(String::is_empty) || (typed == self.chosen() && away == self.away()) {
             return;
         }
         [self.settings.chat_model, self.settings.vision_model, self.settings.embed_model] = typed.clone();
-        self.drafts = typed;
+        [self.settings.chat_remote, self.settings.vision_remote, self.settings.embed_remote] = away;
+        (self.drafts, self.drafts_away) = (typed, away);
         self.save_settings();
+        self.serve_anew();
+    }
+
+    /// Puts the other computer's address to use. Taken away, every job
+    /// comes back to this computer.
+    fn use_remote(&mut self) {
+        let address = self.remote_draft.trim().trim_end_matches('/').to_owned();
+        if address == self.settings.remote {
+            return;
+        }
+        self.settings.remote = address;
+        if self.settings.remote.is_empty() {
+            (self.settings.chat_remote, self.settings.vision_remote, self.settings.embed_remote) = (false, false, false);
+            self.drafts_away = [false; 3];
+        }
+        self.remote_draft = self.settings.remote.clone();
+        self.save_settings();
+        self.serve_anew();
+    }
+
+    /// Takes up the models and servers as they are now set.
+    fn serve_anew(&mut self) {
         // Tests have a model of their own, and no server to ask for another.
         if self.server.is_some() {
             let server = Arc::new(Ollama::from_settings(&self.settings));
@@ -489,9 +542,25 @@ impl Apollo {
                     None => server.dims().map(|d| (Engine::Ready, d)),
                 }
             });
-            if let Ok(have) = server.models() {
-                send(Msg::Installed(have.into_iter().map(|m| (server.capabilities(&m).unwrap_or_default(), m)).map(|(can, m)| (m, can)).collect()));
+            // What each server has, for the menus: this computer's, then the other's.
+            let mut have = vec![];
+            for away in [false, true] {
+                if away && server.remote().is_none() {
+                    continue;
+                }
+                // Each once, and without the server's own entries for its runners.
+                let mut names: Vec<String> = vec![];
+                for model in server.models_at(away).unwrap_or_default() {
+                    if !model.starts_with("llamacpp:") && !names.contains(&model) {
+                        names.push(model);
+                    }
+                }
+                for model in names {
+                    let can = server.capabilities_at(&model, away).unwrap_or_default();
+                    have.push((model, can, away));
+                }
             }
+            send(Msg::Installed(have));
             let (ready, dims) = found.unwrap_or_else(|e| (Engine::Trouble(e), 0));
             send(Msg::Ready(ready, dims));
         });
@@ -1062,14 +1131,21 @@ impl App for Apollo {
                 self.choosing = Some((i, Point::new(under.x, under.bottom() + 4.0)));
             }
             Msg::CloseChoice => self.choosing = None,
-            Msg::PickModel(i, name) => {
+            Msg::PickModel(i, name, away) => {
                 self.choosing = None;
-                if let Some(draft) = self.drafts.get_mut(i) {
-                    *draft = name;
+                if i < 3 {
+                    (self.drafts[i], self.drafts_away[i]) = (name, away);
                     self.use_models();
                 }
             }
-            Msg::OtherModel(i) => (self.choosing, self.typing) = (None, Some(i)),
+            Msg::OtherModel(i, away) => {
+                (self.choosing, self.typing) = (None, Some(i));
+                if i < 3 {
+                    self.drafts_away[i] = away;
+                }
+            }
+            Msg::RemoteDraft(address) => self.remote_draft = address,
+            Msg::UseRemote => self.use_remote(),
             Msg::Changed(paths) => {
                 for path in paths {
                     if !self.pending.contains(&path) {
@@ -1147,21 +1223,38 @@ impl Apollo {
     /// The models that can do one of the three jobs (answer, see, embed),
     /// of those the server has. One whose abilities are not known is offered
     /// for every job.
-    fn models_for(&self, job: usize) -> Vec<&str> {
+    fn models_for(&self, job: usize, away: bool) -> Vec<&str> {
         let need = ["completion", "vision", "embedding"][job.min(2)];
-        self.installed.iter().filter(|(_, can)| can.is_empty() || (can.iter().any(|c| c == need) && (job == 2 || !can.iter().all(|c| c == "embedding")))).map(|(name, _)| name.as_str()).collect()
+        self.installed.iter().filter(|(_, can, there)| *there == away && (can.is_empty() || (can.iter().any(|c| c == need) && (job == 2 || !can.iter().all(|c| c == "embedding"))))).map(|(name, _, _)| name.as_str()).collect()
     }
 
     fn model_menu(&self, job: usize) -> Vec<MenuItem<Msg>> {
-        let now = self.chosen()[job.min(2)].clone();
+        let job = job.min(2);
+        let (now, now_away) = (self.chosen()[job].clone(), self.away()[job]);
         // Had as "name:latest", chosen as "name": the same model.
         let same = |a: &str, b: &str| a == b || a.strip_suffix(":latest") == Some(b) || b.strip_suffix(":latest") == Some(a);
-        let mut items: Vec<MenuItem<Msg>> = self.models_for(job).into_iter().map(|name| if same(name, &now) { MenuItem::new(name, Msg::CloseChoice).icon(icons::CHECK) } else { MenuItem::new(name, Msg::PickModel(job, name.to_owned())) }).collect();
-        if items.is_empty() {
-            items.push(MenuItem::disabled("None here yet that can do this"));
+        let listed = |away: bool| -> Vec<MenuItem<Msg>> {
+            let mut items: Vec<MenuItem<Msg>> = self.models_for(job, away).into_iter().map(|name| if same(name, &now) && away == now_away { MenuItem::new(name, Msg::CloseChoice).icon(icons::CHECK) } else { MenuItem::new(name, Msg::PickModel(job, name.to_owned(), away)) }).collect();
+            if items.is_empty() {
+                items.push(MenuItem::disabled("None yet that can do this"));
+            }
+            items
+        };
+        let mut items = listed(false);
+        if self.settings.remote.is_empty() {
+            items.push(MenuItem::separator());
+            items.push(MenuItem::new("Another, by name…", Msg::OtherModel(job, false)).icon(icons::DOWNLOAD));
+            return items;
         }
+        // With another computer to hand, its models follow under its name.
+        let there = self.remote_name();
+        items.insert(0, MenuItem::disabled("On this computer"));
         items.push(MenuItem::separator());
-        items.push(MenuItem::new("Another, by name…", Msg::OtherModel(job)).icon(icons::DOWNLOAD));
+        items.push(MenuItem::disabled(format!("On {there}")));
+        items.extend(listed(true));
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new("Another here, by name…", Msg::OtherModel(job, false)).icon(icons::DOWNLOAD));
+        items.push(MenuItem::new(format!("Another on {there}, by name…"), Msg::OtherModel(job, true)).icon(icons::DOWNLOAD));
         items
     }
 
@@ -1411,24 +1504,38 @@ impl Apollo {
         page = page.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PLUS).size(14.0)).push(text("Add Folder…"))).on_press(Msg::AddFolder)));
 
         page = page.push(section("Conversations")).push(setting("Remember what I ask", "What you ask Apollo and what it answers go into its memory, so it can be brought up later.", toggle(self.settings.remember_conversations, Msg::RememberTalk)));
-        // The models, which can be any the server has or can get.
+        // The models, which can be any the servers have or can get.
+        let anything_away = self.away().contains(&true);
         let running = text(if self.ready == Engine::Ready { "Running" } else { "Not running" }).role(TextRole::Caption).tone(if self.ready == Engine::Ready { Tone::Good } else { Tone::Warn });
-        page = page.push(section("Models")).push(setting("On this computer", "Apollo's models are served by Ollama here, and nothing is sent anywhere. Each job below can be given to any model that is here, or to another by name, which is downloaded.", running));
+        let where_it_runs =
+            if anything_away { format!("Some of Apollo's work is given to {}: what is asked of a model there is sent to it. The rest is done by Ollama on this computer.", self.remote_name()) } else { "Apollo's models are served by Ollama here, and nothing is sent anywhere. Each job below can be given to any model that is here, or to another by name, which is downloaded.".to_owned() };
+        page = page.push(section("Models")).push(setting("On this computer", &where_it_runs, running));
         let jobs = [("Answers with", "The model that holds the conversation."), ("Describes pictures with", "A model that can see: it is shown each picture and each frame of a video."), ("Places text by meaning with", "An embedding model. Memories made with one cannot be searched with another, so changing it means starting the memory afresh.")];
+        let away = self.away();
         for (i, (title, help)) in jobs.into_iter().enumerate() {
-            // A menu of the models that are here; or, for one that is not, its name typed.
+            // A menu of the models that are there to choose; or, for one that is not, its name typed.
             let control: Element<Msg> = if self.typing == Some(i) {
                 text_input("name, as Ollama lists it", self.drafts[i].clone()).on_input(move |name| Msg::ModelDraft(i, name)).on_submit(Msg::UseModels).autofocus(true).width(MODEL_W).into()
             } else {
-                let face = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text(self.chosen()[i].clone()).no_wrap().width(Length::Fill)).push(icon(icons::CHEVRONS_UP_DOWN).size(14.0).tone(Tone::Muted));
+                let name = if away[i] { format!("{}  ·  {}", self.chosen()[i], self.remote_name()) } else { self.chosen()[i].clone() };
+                let face = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text(name).no_wrap().width(Length::Fill)).push(icon(icons::CHEVRONS_UP_DOWN).size(14.0).tone(Tone::Muted));
                 mouse_area(container(face).surface(Surface::Raised).radius(8.0).padding([12.0, 7.0]).width(MODEL_W)).on_press_in(move |at| Msg::ChooseModel(i, at)).into()
             };
             page = page.push(setting(title, help, control));
         }
-        if self.typing.is_some() {
-            let changed = self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() && self.drafts.iter().all(|m| !m.trim().is_empty());
-            page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("Type a model's name and press Return. It is downloaded if it is not here yet.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Use This Model")).on_press_maybe(changed.then_some(Msg::UseModels))));
+        if let Some(i) = self.typing {
+            let changed = (self.drafts.clone().map(|m| m.trim().to_owned()) != self.chosen() || self.drafts_away != away) && self.drafts.iter().all(|m| !m.trim().is_empty());
+            let onto = if self.drafts_away[i.min(2)] { format!("Type a model's name and press Return. It is downloaded onto {} if it is not there yet.", self.remote_name()) } else { "Type a model's name and press Return. It is downloaded if it is not here yet.".to_owned() };
+            page = page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(onto).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(Button::new(text("Use This Model")).on_press_maybe(changed.then_some(Msg::UseModels))));
         }
+        // Another computer, for models this one has no room for.
+        let address = text_input("studio.local, or 192.168.1.20:11434", self.remote_draft.clone()).on_input(Msg::RemoteDraft).on_submit(Msg::UseRemote).width(MODEL_W);
+        let set = self.remote_draft.trim().trim_end_matches('/') != self.settings.remote;
+        page = page.push(setting(
+            "Another computer",
+            "A machine of yours that runs Ollama, for models too large for this one. Its models then appear in the menus above. What a model there is asked (your questions, or the pictures it describes) is sent to that machine over the network, unprotected unless the address begins with https; the memory itself stays here. On that machine, start Ollama with OLLAMA_HOST=0.0.0.0 ollama serve.",
+            row().spacing(8.0).align(Align::Center).push(address).push(Button::new(text(if self.remote_draft.trim().is_empty() && !self.settings.remote.is_empty() { "Remove" } else { "Use" })).on_press_maybe(set.then_some(Msg::UseRemote))),
+        ));
         if let Some(why) = &self.stale {
             page = page.push(notice(Tone::Warn, format!("{why} Go back to the model it was made with, or start the memory afresh."))).push(row().push(Button::new(text("Start Memory Afresh…")).on_press(Msg::AskReset)));
         }
@@ -1555,8 +1662,9 @@ fn snapshots(dir: PathBuf) {
         ("apollo-sources", neo_desktop::SchemePref::Light, &|a| a.update(Msg::Page(Page::Sources))),
         ("apollo-models", neo_desktop::SchemePref::Dark, &|a| {
             a.update(Msg::Page(Page::Sources));
-            let can = |name: &str, what: &[&str]| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>());
-            a.update(Msg::Installed(vec![can("gemma3:1b", &["completion"]), can("gemma3:4b", &["completion", "vision"]), can("qwen3:8b", &["completion", "tools"]), can("nomic-embed-text:latest", &["embedding"])]));
+            let can = |name: &str, what: &[&str], away: bool| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>(), away);
+            a.settings.remote = "http://studio.local:11434".into();
+            a.update(Msg::Installed(vec![can("gemma3:1b", &["completion"], false), can("gemma3:4b", &["completion", "vision"], false), can("nomic-embed-text:latest", &["embedding"], false), can("muse-glimmer:30b", &["completion", "vision", "tools"], true), can("qwen3:32b", &["completion", "tools"], true)]));
             a.update(Msg::ChooseModel(0, Rect::new(826.0, 250.0, MODEL_W, 34.0)));
         }),
     ];
@@ -2064,9 +2172,9 @@ mod tests {
         let saved = Settings::load_from(&file);
         assert_eq!((saved.chat_model, saved.vision_model), ("qwen3:8b".to_owned(), "qwen3-vl:8b".to_owned()));
         // The menu for each job offers the models that can do it.
-        let can = |name: &str, what: &[&str]| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>());
+        let can = |name: &str, what: &[&str]| (name.to_owned(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>(), false);
         a.update(Msg::Installed(vec![can("qwen3:8b", &["completion", "tools"]), can("gemma3:4b", &["completion", "vision"]), can("nomic-embed-text:latest", &["embedding"]), can("mystery", &[])]));
-        assert_eq!((a.models_for(0), a.models_for(1), a.models_for(2)), (vec!["qwen3:8b", "gemma3:4b", "mystery"], vec!["gemma3:4b", "mystery"], vec!["nomic-embed-text:latest", "mystery"]));
+        assert_eq!((a.models_for(0, false), a.models_for(1, false), a.models_for(2, false)), (vec!["qwen3:8b", "gemma3:4b", "mystery"], vec!["gemma3:4b", "mystery"], vec!["nomic-embed-text:latest", "mystery"]));
         a.update(Msg::ChooseModel(1, Rect::new(700.0, 400.0, 230.0, 32.0)));
         assert_eq!(a.choosing, Some((1, Point::new(700.0, 436.0))), "the menu hangs under its control");
         assert_eq!(a.model_menu(1).len(), 4, "the two that can see, a line, and another by name");
@@ -2078,14 +2186,37 @@ mod tests {
         assert_eq!(a.choosing, None, "Escape closes it");
         // Picked from the menu, a model is put to use at once.
         a.update(Msg::ChooseModel(1, Rect::new(700.0, 400.0, 230.0, 32.0)));
-        a.update(Msg::PickModel(1, "gemma3:4b".into()));
+        a.update(Msg::PickModel(1, "gemma3:4b".into(), false));
         assert_eq!((a.choosing, a.settings.vision_model.as_str(), Settings::load_from(&file).vision_model.as_str()), (None, "gemma3:4b", "gemma3:4b"));
         // One that is not in the menu is typed.
-        a.update(Msg::OtherModel(1));
+        a.update(Msg::OtherModel(1, false));
         assert_eq!(a.typing, Some(1));
         a.update(Msg::ModelDraft(1, "qwen3-vl:8b".into()));
         a.update(Msg::UseModels);
         assert_eq!((a.typing, a.settings.vision_model.as_str()), (None, "qwen3-vl:8b"));
+        // With another computer named, its models are offered under its name, and a job can be given to it.
+        assert_eq!(a.model_menu(0).len(), 5, "without one, only what is here");
+        a.update(Msg::RemoteDraft(" http://studio.local:11434/ ".into()));
+        a.update(Msg::UseRemote);
+        assert_eq!((a.settings.remote.as_str(), a.remote_name().as_str(), Settings::load_from(&file).remote.as_str()), ("http://studio.local:11434", "studio.local", "http://studio.local:11434"));
+        let mut have = a.installed.clone();
+        have.push(("muse-glimmer:30b".into(), vec!["completion".into(), "vision".into()], true));
+        a.update(Msg::Installed(have));
+        assert_eq!((a.models_for(0, true), a.models_for(2, true)), (vec!["muse-glimmer:30b"], Vec::<&str>::new()));
+        assert_eq!(a.model_menu(0).len(), 10, "this computer's under one heading, the other's under another, and a name for either");
+        a.update(Msg::PickModel(0, "muse-glimmer:30b".into(), true));
+        assert_eq!((a.settings.chat_model.as_str(), a.away(), Settings::load_from(&file).chat_remote), ("muse-glimmer:30b", [true, false, false], true));
+        // The same model picked here instead comes back; so does everything when the address is taken away.
+        a.update(Msg::OtherModel(1, true));
+        a.update(Msg::ModelDraft(1, "llava:34b".into()));
+        a.update(Msg::UseModels);
+        assert_eq!((a.settings.vision_model.as_str(), a.away()), ("llava:34b", [true, true, false]));
+        a.update(Msg::PickModel(1, "llava:34b".into(), false));
+        assert_eq!(a.away(), [true, false, false]);
+        a.update(Msg::RemoteDraft(String::new()));
+        a.update(Msg::UseRemote);
+        let saved = Settings::load_from(&file);
+        assert_eq!((a.away(), saved.remote.as_str(), saved.chat_remote), ([false; 3], "", false), "nothing is left pointing at a computer that is not named");
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-models-menu-{}", std::process::id())));
 
         // The memory is marked as the first model's when it is first used.

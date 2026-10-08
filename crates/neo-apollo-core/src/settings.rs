@@ -21,8 +21,15 @@ pub struct Settings {
     pub vision_model: String,
     /// The model that turns text into embeddings.
     pub embed_model: String,
-    /// Where the model server listens.
+    /// Where the model server on this computer listens.
     pub server: String,
+    /// The address of a model server on another computer, for models too
+    /// large for this one. Empty if there is none.
+    pub remote: String,
+    /// Whether each job is done on the other computer.
+    pub chat_remote: bool,
+    pub vision_remote: bool,
+    pub embed_remote: bool,
     /// Whether what is asked and answered is remembered.
     pub remember_conversations: bool,
     /// Whether the folders are read without being asked: when Apollo
@@ -34,7 +41,7 @@ impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
         let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
-        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remember_conversations: true, read_automatically: true }
+        Self { folders, chat_model: "gemma3:1b".into(), vision_model: "gemma3:4b".into(), embed_model: "nomic-embed-text".into(), server: "http://127.0.0.1:11434".into(), remote: String::new(), chat_remote: false, vision_remote: false, embed_remote: false, remember_conversations: true, read_automatically: true }
     }
 }
 
@@ -66,6 +73,7 @@ impl Settings {
         let mut out = format!("chat-model={}\nvision-model={}\nembed-model={}\nserver={}\nremember-conversations={}\nread-automatically={}\n", self.chat_model, self.vision_model, self.embed_model, self.server, self.remember_conversations, self.read_automatically);
         // Said even when there are none, so that none is not read as the defaults.
         out.push_str("folders=\n");
+        out.push_str(&format!("remote-server={}\nchat-remote={}\nvision-remote={}\nembed-remote={}\n", self.remote, self.chat_remote, self.vision_remote, self.embed_remote));
         for f in &self.folders {
             out.push_str(&format!("{}={}\n", if f.on { "folder" } else { "folder-off" }, f.path.display()));
         }
@@ -86,6 +94,10 @@ impl Settings {
                 "vision-model" if !value.is_empty() => s.vision_model = value.into(),
                 "embed-model" if !value.is_empty() => s.embed_model = value.into(),
                 "server" if !value.is_empty() => s.server = value.trim_end_matches('/').into(),
+                "remote-server" => s.remote = value.trim_end_matches('/').into(),
+                "chat-remote" => s.chat_remote = value == "true",
+                "vision-remote" => s.vision_remote = value == "true",
+                "embed-remote" => s.embed_remote = value == "true",
                 "remember-conversations" => s.remember_conversations = value != "false",
                 "read-automatically" => s.read_automatically = value != "false",
                 "folder" | "folder-off" => {
@@ -118,7 +130,19 @@ mod tests {
     fn settings_are_written_and_read_back() {
         let d = Settings::default();
         assert_eq!((d.folders.len(), d.folders.iter().all(|f| f.on), d.remember_conversations), (3, true, true));
-        let s = Settings { folders: vec![Folder { path: "/a b/c".into(), on: true }, Folder { path: "/d".into(), on: false }], chat_model: "qwen3".into(), vision_model: "llava".into(), embed_model: "embed".into(), server: "http://box:1".into(), remember_conversations: false, read_automatically: false };
+        let s = Settings {
+            folders: vec![Folder { path: "/a b/c".into(), on: true }, Folder { path: "/d".into(), on: false }],
+            chat_model: "qwen3".into(),
+            vision_model: "llava".into(),
+            embed_model: "embed".into(),
+            server: "http://box:1".into(),
+            remote: "http://studio.local:11434".into(),
+            chat_remote: true,
+            vision_remote: true,
+            embed_remote: false,
+            remember_conversations: false,
+            read_automatically: false,
+        };
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(s.roots(), [PathBuf::from("/a b/c")]);
         // Nothing said: the defaults. Folders all removed: none, not the defaults back.
