@@ -189,6 +189,46 @@ enum ViewMode {
 }
 
 /// A picture's thumbnail for the grid.
+/// A video's thumbnail: the frame, with a border round it and a play sign
+/// in the middle.
+struct VideoMark {
+    picture: [Element<Msg>; 1],
+    glyph: Option<neo::TextLayout>,
+}
+
+impl neo::Widget<Msg> for VideoMark {
+    fn children_mut(&mut self) -> &mut [Element<Msg>] {
+        &mut self.picture
+    }
+
+    fn layout(&mut self, cx: &mut neo::Cx, limits: neo::Limits) -> Size {
+        let size = self.picture[0].layout(cx, limits);
+        self.picture[0].set_position(Point::ZERO);
+        self.glyph = Some(cx.text().layout(&icons::PLAY.0.to_string(), &neo::TextStyle { size: 15.0, family: neo::FontFamily::Icons, line_height: 1.0, ..Default::default() }, None));
+        size
+    }
+
+    fn draw(&self, cx: &mut neo::DrawCx) {
+        let b = cx.bounds();
+        self.picture[0].draw(cx);
+        // Over the frame, which is drawn after the shapes of its own layer.
+        cx.scene.push_layer();
+        cx.scene.fill(b, 5.0, neo::Color::TRANSPARENT, Some((1.5, neo::Color::BLACK.with_alpha(0.55))));
+        let centre = b.center();
+        let disc = neo::Rect::new(centre.x - 15.0, centre.y - 15.0, 30.0, 30.0);
+        cx.scene.fill(disc, 15.0, neo::Color::BLACK.with_alpha(0.6), Some((1.0, neo::Color::WHITE.with_alpha(0.85))));
+        if let Some(glyph) = &self.glyph {
+            let g = glyph.size();
+            // A play sign looks centred a little to the right of where it is.
+            cx.scene.text(glyph, Point::new((centre.x - g.w * 0.5 + 1.0).round(), (centre.y - g.h * 0.5).round()), neo::Color::WHITE);
+        }
+    }
+
+    fn event(&mut self, _cx: &mut neo::EventCx<Msg>, _event: &neo::Event) -> neo::Status {
+        neo::Status::Ignored
+    }
+}
+
 impl ViewMode {
     /// The word the view is written down as.
     fn name(self) -> &'static str {
@@ -1183,6 +1223,9 @@ impl Files {
     fn tile(&self, e: &Entry) -> Element<Msg> {
         let selected = self.selected.contains(&e.path);
         let preview: Element<Msg> = match self.thumbs.get(&e.path) {
+            // A video's frame is marked as one: a border round it and a
+            // play sign over it, so it is not taken for a picture.
+            Some(Thumb::Ready(image)) if neo_desktop::fs::has_extension(&e.path, neo_desktop::fs::VIDEO_EXTENSIONS) => Element::new(VideoMark { picture: [picture(image).fit(Fit::Cover).width(108.0).height(84.0).into()], glyph: None }),
             Some(Thumb::Ready(image)) => picture(image).width(108.0).height(84.0).into(),
             _ => icon(Self::entry_icon(e)).size(44.0).tone(if e.dir { Tone::Accent } else { Tone::Muted }).into(),
         };
@@ -1741,6 +1784,33 @@ mod tests {
             assert_eq!(ViewMode::from_name(view.name()), Some(view));
         }
         assert_eq!(ViewMode::from_name("tiles"), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_videos_thumbnail_is_marked_as_a_video() {
+        let root = temp_dir("video-mark");
+        std::fs::write(root.join("clip.mov"), "x").unwrap();
+        std::fs::write(root.join("shot.png"), "x").unwrap();
+        let frame = || Image::frame(4, 3, vec![200u8; 4 * 3 * 4]);
+        let render = |video: bool| {
+            let mut f = Files::new(root.clone());
+            f.view = ViewMode::Grid;
+            // The same frame for one of the two; the other left as an icon.
+            f.thumbs.insert(root.join(if video { "clip.mov" } else { "shot.png" }), Thumb::Ready(frame()));
+            let mut h = neo::testing::Harness::new(f, Size::new(1040.0, 680.0)).unwrap();
+            if let Some(dir) = std::env::var_os("NEO_SHOTS") {
+                h.save_png(PathBuf::from(dir).join(if video { "video-tile.png" } else { "still-tile.png" }), 1.0).unwrap();
+            }
+            h.render(1.0)
+        };
+        let (video, still) = (render(true), render(false));
+        // The frame is an even grey. Over the video's there is the play
+        // sign, white; a picture's is left exactly as it is.
+        let white_in = |px: &[u8], x0: usize| (130..212).flat_map(|y| (x0..x0 + 108).map(move |x| (x, y))).filter(|(x, y)| px[(y * 1040 + x) * 4..(y * 1040 + x) * 4 + 3].iter().all(|c| *c > 240)).count();
+        // The second tile is the video; the fourth, the picture.
+        assert!(white_in(&video, 372) >= 8, "a play sign on the video: {}", white_in(&video, 372));
+        assert_eq!(white_in(&still, 648), 0, "nothing over a picture");
         std::fs::remove_dir_all(root).unwrap();
     }
 
