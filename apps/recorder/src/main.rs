@@ -221,19 +221,19 @@ enum Msg {
     Poll,
 }
 
-/// The Recorder's own settings, in `recorder.conf` beside the appearance file.
+/// The Recorder's own settings: `launch-at-startup` in `apps/neo-recorder.toml`.
 mod settings {
-    use std::path::PathBuf;
+    use neo_desktop::config::File;
 
-    fn path() -> PathBuf {
-        neo_desktop::config_dir().join("recorder.conf")
-    }
+    const KEY: &[&str] = &["launch-at-startup"];
 
     /// Whether to start at login, if the user has ever chosen.
     pub fn load() -> Option<bool> {
-        parse(&std::fs::read_to_string(path()).ok()?)
+        // Kept in `recorder.conf` before, which is still read if nothing newer says.
+        File::app("neo-recorder").flag(KEY).or_else(|| parse(&std::fs::read_to_string(neo_desktop::config_dir().join("recorder.conf")).ok()?))
     }
 
+    /// Reads the old `recorder.conf`.
     pub fn parse(src: &str) -> Option<bool> {
         src.lines().find_map(|l| l.trim().strip_prefix("launch-at-startup")).and_then(|v| match v.trim_start_matches([' ', '=']).trim() {
             "true" => Some(true),
@@ -243,11 +243,9 @@ mod settings {
     }
 
     pub fn save(launch_at_startup: bool) {
-        let path = path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, format!("# NeoCap settings.\nlaunch-at-startup = {launch_at_startup}\n"));
+        let mut file = File::app("neo-recorder");
+        file.set(KEY, launch_at_startup);
+        let _ = file.save();
     }
 
     /// Whether this is an installed copy and not one run from Cargo's build

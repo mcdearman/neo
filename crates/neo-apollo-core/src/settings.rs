@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use neo_desktop::config::File;
+
 /// A folder Apollo reads, or has been told to leave for now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {
@@ -79,16 +81,35 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The file these are kept in: `apps/neo-apollo.toml`.
     pub fn file() -> PathBuf {
-        crate::dir().join("settings")
+        neo_desktop::config::app_path("neo-apollo")
     }
 
     pub fn load() -> Self {
-        Self::load_from(&Self::file())
+        let path = Self::file();
+        // Kept in Apollo's own folder before: brought over, the once.
+        if !path.exists()
+            && let Ok(old) = std::fs::read_to_string(crate::dir().join("settings"))
+        {
+            let s = Self::legacy(&old);
+            let _ = s.save_to(&path);
+            return s;
+        }
+        Self::load_from(&path)
     }
 
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path).map(|text| Self::decode(&text)).unwrap_or_default()
+        Self::read(&File::open(path.to_owned()))
+    }
+
+    /// As [`load`](Self::load), or what is wrong with the file: a mistake
+    /// made editing it by hand is not to put everything back to defaults.
+    pub fn try_load() -> Result<Self, String> {
+        match File::open(Self::file()).problem() {
+            Some(problem) => Err(problem),
+            None => Ok(Self::load()),
+        }
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -96,27 +117,87 @@ impl Settings {
     }
 
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, self.encode())
+        let mut file = File::open(path.to_owned());
+        self.write(&mut file);
+        file.save()
     }
 
-    pub fn encode(&self) -> String {
-        let mut out = format!("chat-model={}\nvision-model={}\nembed-model={}\nserver={}\nremember-conversations={}\nread-automatically={}\nlook-ahead={}\nwarnings={}\nbackground={}\nstay-unlocked-minutes={}\n", self.chat_model, self.vision_model, self.embed_model, self.server, self.remember_conversations, self.read_automatically, self.look_ahead, self.warn, self.background, self.stay_unlocked);
+    /// Puts the settings into a file, leaving whatever else is in it.
+    pub fn write(&self, file: &mut File) {
+        let paths = |on: bool| self.folders.iter().filter(|f| f.on == on).map(|f| f.path.display().to_string()).collect::<Vec<_>>();
         // Said even when there are none, so that none is not read as the defaults.
-        out.push_str("folders=\n");
-        out.push_str(&format!("remote-server={}\nchat-remote={}\nvision-remote={}\nembed-remote={}\n", self.remote, self.chat_remote, self.vision_remote, self.embed_remote));
-        out.push_str(&format!("hear-model={}\n", self.hear_model));
-        for f in &self.folders {
-            out.push_str(&format!("{}={}\n", if f.on { "folder" } else { "folder-off" }, f.path.display()));
-        }
-        out
+        file.set_list(&["folders"], &paths(true));
+        file.set_list(&["folders-off"], &paths(false));
+        file.set(&["remember-conversations"], self.remember_conversations);
+        file.set(&["read-automatically"], self.read_automatically);
+        file.set(&["look-ahead"], self.look_ahead);
+        file.set(&["warnings"], self.warn);
+        file.set(&["background"], self.background);
+        file.set(&["stay-unlocked-minutes"], i64::from(self.stay_unlocked));
+        file.set(&["models", "chat"], self.chat_model.as_str());
+        file.set(&["models", "vision"], self.vision_model.as_str());
+        file.set(&["models", "embed"], self.embed_model.as_str());
+        file.set(&["models", "hear"], self.hear_model.as_str());
+        file.set(&["servers", "local"], self.server.as_str());
+        file.set(&["servers", "remote"], self.remote.as_str());
+        file.set(&["servers", "chat-remote"], self.chat_remote);
+        file.set(&["servers", "vision-remote"], self.vision_remote);
+        file.set(&["servers", "embed-remote"], self.embed_remote);
     }
 
-    /// Reads what [`encode`](Self::encode) wrote. What is not said keeps
-    /// its default, but for the folders: a file that names any names all.
+    /// The settings in a file. What is not said keeps its default, but
+    /// for the folders: a file that names any names all.
+    pub fn read(file: &File) -> Self {
+        let mut s = Self::default();
+        let said = |at: &[&str], into: &mut String| {
+            if let Some(v) = file.text(at).map(str::trim).filter(|v| !v.is_empty()) {
+                *into = v.to_owned();
+            }
+        };
+        said(&["models", "chat"], &mut s.chat_model);
+        said(&["models", "vision"], &mut s.vision_model);
+        said(&["models", "embed"], &mut s.embed_model);
+        said(&["models", "hear"], &mut s.hear_model);
+        said(&["servers", "local"], &mut s.server);
+        s.server = s.server.trim_end_matches('/').to_owned();
+        s.remote = file.text(&["servers", "remote"]).map_or(s.remote, |v| v.trim().trim_end_matches('/').to_owned());
+        s.chat_remote = file.flag(&["servers", "chat-remote"]).unwrap_or(s.chat_remote);
+        s.vision_remote = file.flag(&["servers", "vision-remote"]).unwrap_or(s.vision_remote);
+        s.embed_remote = file.flag(&["servers", "embed-remote"]).unwrap_or(s.embed_remote);
+        s.remember_conversations = file.flag(&["remember-conversations"]).unwrap_or(s.remember_conversations);
+        s.read_automatically = file.flag(&["read-automatically"]).unwrap_or(s.read_automatically);
+        s.look_ahead = file.flag(&["look-ahead"]).unwrap_or(s.look_ahead);
+        s.warn = file.flag(&["warnings"]).unwrap_or(s.warn);
+        s.background = file.flag(&["background"]).unwrap_or(s.background);
+        s.stay_unlocked = file.number(&["stay-unlocked-minutes"]).map_or(s.stay_unlocked, |n| n.clamp(0.0, 100_000.0) as u32);
+        if file.has(&["folders"]) || file.has(&["folders-off"]) {
+            s.folders.clear();
+            for (key, on) in [("folders", true), ("folders-off", false)] {
+                for path in file.list(&[key]).unwrap_or_default() {
+                    if !path.is_empty() && !s.folders.iter().any(|f| f.path == Path::new(&path)) {
+                        s.folders.push(Folder { path: path.into(), on });
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    /// The settings as a file of their own would have them.
+    pub fn encode(&self) -> String {
+        let mut file = File::parse("");
+        self.write(&mut file);
+        file.encode()
+    }
+
+    /// The settings in a file's text.
     pub fn decode(text: &str) -> Self {
+        Self::read(&File::parse(text))
+    }
+
+    /// Reads the `key=value` lines these were kept in before, in a file
+    /// called `settings` in Apollo's folder.
+    fn legacy(text: &str) -> Self {
         let mut s = Self::default();
         let mut folders = vec![];
         let mut named = false;
@@ -193,5 +274,15 @@ mod tests {
         assert_eq!(Settings::decode(""), d);
         let none = Settings { folders: vec![], ..d.clone() };
         assert_eq!(Settings::decode(&none.encode()).folders, vec![]);
+        // By hand: a few lines are enough, and the rest keep their defaults.
+        let few = Settings::decode("folders = [\"/music\"]\nstay-unlocked-minutes = 5\n[models]\nchat = \"qwen3:4b\"\n[servers]\nlocal = \"http://box:1/\"\n");
+        assert_eq!((few.roots(), few.stay_unlocked, few.chat_model.as_str(), few.server.as_str(), few.vision_model == d.vision_model), (vec![PathBuf::from("/music")], 5, "qwen3:4b", "http://box:1", true));
+        // What was kept before is read as it was.
+        assert_eq!(
+            Settings::legacy(
+                "chat-model=qwen3\nvision-model=llava\nembed-model=embed\nserver=http://box:1\nremember-conversations=false\nread-automatically=false\nlook-ahead=true\nwarnings=false\nbackground=false\nstay-unlocked-minutes=60\nfolders=\nremote-server=http://studio.local:11434\nchat-remote=true\nvision-remote=true\nembed-remote=false\nhear-model=turbo\nfolder=/a b/c\nfolder-off=/d\n"
+            ),
+            s
+        );
     }
 }

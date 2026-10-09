@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::config_dir;
+use crate::config::{self, File};
 
 /// Settings that belong to one app rather than the whole desktop.
 ///
-/// Stored as `key = value` lines in `apps/<app>.conf` under [`config_dir`].
+/// Kept in `apps/<app>.toml` in the settings folder: see [`crate::config`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppPrefs {
     /// Whether this app's window is glass when the desktop's windows are.
@@ -27,10 +27,19 @@ impl AppPrefs {
 
     /// Where the settings of the app called `app` are kept.
     pub fn path_for(app: &str) -> PathBuf {
-        config_dir().join("apps").join(format!("{app}.conf"))
+        config::app_path(app)
     }
 
     pub fn parse(src: &str) -> Self {
+        Self::read(&File::parse(src))
+    }
+
+    pub fn read(file: &File) -> Self {
+        Self { glass: file.flag(&["glass"]).unwrap_or(Self::default().glass) }
+    }
+
+    /// Reads the `key = value` lines these were kept in before.
+    fn legacy(src: &str) -> Self {
         let mut p = Self::default();
         for line in src.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -46,26 +55,35 @@ impl AppPrefs {
     }
 
     pub fn serialize(&self) -> String {
-        format!("# Settings for this Neo app alone.\nglass = {}\n", self.glass)
+        let mut file = File::parse("");
+        file.set(&["glass"], self.glass);
+        file.encode()
     }
 
     /// Reads the settings file. A missing or unreadable file gives the defaults.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path).map(|s| Self::parse(&s)).unwrap_or_default()
+        let mut file = File::open(path.to_owned());
+        // Kept in a `.conf` beside it before: brought over, the once.
+        if !path.exists()
+            && let Ok(old) = std::fs::read_to_string(path.with_extension("conf"))
+        {
+            let p = Self::legacy(&old);
+            file.set(&["glass"], p.glass);
+            let _ = file.save();
+            return p;
+        }
+        Self::read(&file)
     }
 
     pub(crate) fn modified(path: &Path) -> Option<SystemTime> {
-        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+        config::modified(path)
     }
 
     /// Writes the settings atomically, so readers never see half a file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("conf.tmp");
-        std::fs::write(&tmp, self.serialize())?;
-        std::fs::rename(tmp, path)
+        let mut file = File::open(path.to_owned());
+        file.set(&["glass"], self.glass);
+        file.save()
     }
 }
 
@@ -77,14 +95,14 @@ mod tests {
     fn round_trips_and_defaults_to_glass() {
         assert!(AppPrefs::default().glass);
         assert_eq!(AppPrefs::parse(""), AppPrefs::default());
-        assert_eq!(AppPrefs::parse("glass = maybe\nother = 1"), AppPrefs::default(), "junk keeps the default");
+        assert_eq!(AppPrefs::parse("glass = \"maybe\"\nother = 1"), AppPrefs::default(), "junk keeps the default");
         let solid = AppPrefs { glass: false };
         assert_eq!(AppPrefs::parse(&solid.serialize()), solid);
     }
 
     #[test]
     fn saves_to_and_loads_from_its_file() {
-        let path = std::env::temp_dir().join(format!("neo-prefs-{}", std::process::id())).join("apps").join("demo.conf");
+        let path = std::env::temp_dir().join(format!("neo-prefs-{}", std::process::id())).join("apps").join("demo.toml");
         assert_eq!(AppPrefs::load(&path), AppPrefs::default(), "no file yet");
         AppPrefs { glass: false }.save(&path).unwrap();
         assert!(!AppPrefs::load(&path).glass);

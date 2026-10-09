@@ -238,6 +238,8 @@ enum Msg {
     OpenAccessibility,
     /// Have NeoShell ask the system for leave to move windows.
     AllowControl,
+    /// Open `neo.toml`, to change settings by hand.
+    OpenSettingsFile,
 }
 
 /// How large a picture is shown to choose it by, how many go across, and
@@ -605,6 +607,13 @@ impl App for Settings {
                     if self.windows_changed.is_none_or(|t| t.elapsed() >= SOUND_SETTLES) {
                         self.windowing = kept;
                     }
+                }
+            }
+            Msg::OpenSettingsFile => {
+                // Written first if it never has been, so that there is something to open.
+                self.change(|_| {});
+                if self.error.is_none() && !cfg!(test) {
+                    let _ = neo_desktop::fs::open_file(&Appearance::path());
                 }
             }
             Msg::AllowControl => {
@@ -1089,7 +1098,9 @@ impl Settings {
             .width(Length::Fill)
             .push(badge)
             .push(group(vec![fact("Device name", a.host.clone()), fact("Operating system", a.os.clone()), fact("Kernel", a.kernel.clone()), fact("Processor", format!("{} × {}", a.cores, a.cpu)), fact("Memory", human_bytes_binary(a.memory)), fact("Uptime", uptime)]))
-            .push(text(format!("Settings file: {}", Appearance::path().display())).role(TextRole::Caption).tone(Tone::Muted))
+            .push(section("Settings file"))
+            .push(group(vec![setting("neo.toml", "Everything set here is kept in this file, and whatever is changed in it by hand is taken up here and in every Neo app. Each app's own settings are beside it, in apps.", button("Open File").on_press(Msg::OpenSettingsFile))]))
+            .push(text(Appearance::path().display().to_string()).role(TextRole::Caption).tone(Tone::Muted))
             .into()
     }
 }
@@ -1221,7 +1232,7 @@ mod tests {
 
         // Windows: floating until tiling is asked for, and what is set is kept for NeoShell to follow.
         settings.update(Msg::Page(Page::Windows));
-        assert_eq!((settings.windowing.clone(), Windowing::path().exists()), (Windowing::default(), false), "nothing is tiled, or written, until asked");
+        assert_eq!((settings.windowing.clone(), neo_desktop::config::File::desktop().has(&["windows"])), (Windowing::default(), false), "nothing is tiled, or written, until asked");
         settings.update(Msg::WindowMode(Mode::Tiling));
         settings.update(Msg::WindowLayout(Layout::Grid));
         settings.update(Msg::WindowLayout(Layout::MasterStack));

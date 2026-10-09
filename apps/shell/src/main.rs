@@ -452,9 +452,11 @@ fn keep_at_startup() {
     let installed = std::env::current_exe().is_ok_and(|p| !p.components().any(|c| c.as_os_str() == "target"));
     let Ok(program) = std::env::current_exe() else { return };
     let entry = neo_desktop::autostart::Entry { id: "org.neo.Shell", name: "NeoShell", program: &program, args: &[] };
-    // Unless the user has said in Settings that it is not to.
-    if installed && !neo_desktop::autostart::declined(entry.id) && !neo_desktop::autostart::is_enabled(&entry) {
-        let _ = neo_desktop::autostart::enable(&entry);
+    // Unless the user has said that it is not to, in Settings or in `neo.toml`.
+    match (installed, neo_desktop::autostart::declined(entry.id), neo_desktop::autostart::is_enabled(&entry)) {
+        (true, false, false) => drop(neo_desktop::autostart::enable(&entry)),
+        (true, true, true) => drop(neo_desktop::autostart::disable(&entry)),
+        _ => {}
     }
 }
 

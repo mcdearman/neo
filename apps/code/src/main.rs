@@ -230,6 +230,8 @@ struct NeoCode {
     /// Whether choosing a lens really starts its command.
     runs_commands: bool,
     settings: settings::Settings,
+    /// When the settings files were last seen written.
+    settings_seen: [Option<std::time::SystemTime>; 2],
     /// NeoCode's own folder, where settings and what was open are kept.
     /// Tests keep nothing unless they say where.
     config: Option<PathBuf>,
@@ -351,7 +353,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -392,7 +394,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -728,6 +730,7 @@ impl NeoCode {
             }
             Msg::OpenRecent(dir) => self.open_folder(&dir),
             Msg::Save => {
+                let settings_files: Vec<PathBuf> = self.config.as_deref().map(settings::user_file).into_iter().chain(self.root.as_deref().map(settings::folder_file)).collect();
                 let Some(t) = self.active.and_then(|i| self.tabs.get_mut(i)) else { return };
                 let result = match &t.disk {
                     Some(p) => std::fs::write(p, t.doc.text() + "\n").map(|_| format!("Saved {}", t.name)),
@@ -736,7 +739,7 @@ impl NeoCode {
                 match result {
                     Ok(msg) => {
                         t.saved = t.doc.revision();
-                        let settings = t.name == "settings.json";
+                        let settings = t.disk.as_deref().is_some_and(|p| settings_files.iter().any(|f| f == p));
                         self.toast = Some(msg);
                         // Saving the settings is how they are changed.
                         if settings {
@@ -764,6 +767,12 @@ impl NeoCode {
             }
             Msg::Poll => {
                 self.desktop.poll();
+                // The settings changed in the file by hand, in another editor say.
+                let stamp = self.settings_stamp();
+                if stamp != self.settings_seen {
+                    self.settings_seen = stamp;
+                    self.load_settings();
+                }
             }
         }
     }
@@ -829,7 +838,7 @@ impl App for NeoCode {
                     file = file.push(MenuEntry::new(format!("Reopen {name}"), Msg::OpenRecent(dir.clone())));
                 }
                 file.separator()
-                    .push(MenuEntry::new("Open Settings (JSON)", Msg::OpenSettings))
+                    .push(MenuEntry::new("Open Settings", Msg::OpenSettings))
                     .separator()
                     .push(MenuEntry::new("Save", Msg::Save).shortcut(Shortcut::command("s")).enabled(file_open))
                     .push(MenuEntry::new("Close Tab", Msg::Close(self.active.unwrap_or(0))).shortcut(Shortcut::command("w")).enabled(file_open))
@@ -1158,6 +1167,13 @@ impl NeoCode {
         if let Some(first) = problems.into_iter().next() {
             self.toast = Some(first);
         }
+        self.settings_seen = self.settings_stamp();
+    }
+
+    /// When the settings files, the user's and the project's, were last written.
+    fn settings_stamp(&self) -> [Option<std::time::SystemTime>; 2] {
+        let written = |file: Option<PathBuf>| file.as_deref().and_then(neo_desktop::config::modified);
+        [written(self.config.as_deref().map(settings::user_file)), written(self.root.as_deref().map(settings::folder_file))]
     }
 
     /// Writes one setting to the user's file, as when it is changed from
@@ -1169,8 +1185,8 @@ impl NeoCode {
         }
     }
 
-    /// Opens the user's `settings.json` in a tab, making it first if
-    /// there is none. Saving it puts the changes into effect.
+    /// Opens the user's settings file in a tab, with every setting in it.
+    /// It is `neo-code.toml`, in `apps` in Neo's settings folder. Saving it puts the changes into effect.
     fn open_settings(&mut self) {
         let Some(dir) = self.config.clone() else {
             self.toast = Some("There is no settings file to open here.".into());
@@ -1943,7 +1959,8 @@ mod tests {
         fourth.restore_workspace();
         assert_eq!(fourth.tabs.len(), 1);
         // Told not to, it starts with nothing open.
-        std::fs::write(settings::user_file(&config), "{ \"window.restoreWorkspace\": false }").unwrap();
+        std::fs::create_dir_all(settings::user_file(&config).parent().unwrap()).unwrap();
+        std::fs::write(settings::user_file(&config), "[window]\nrestoreWorkspace = false\n").unwrap();
         let mut fifth = NeoCode::folder(&dir);
         fifth.config = Some(config.clone());
         fifth.load_settings();
@@ -1969,12 +1986,12 @@ mod tests {
         app.toast = None;
         app.update(Msg::OpenSettings);
         let tab = app.active_tab().expect("the settings in a tab");
-        assert_eq!((tab.name.as_str(), tab.language), ("settings.json", Language::Json));
-        assert!(tab.doc.text().contains("\"editor.tabSize\": 4"));
+        assert_eq!((tab.disk.clone(), tab.language), (Some(settings::user_file(&config)), Language::Toml));
+        assert!(tab.doc.text().contains("[editor]\n") && tab.doc.text().contains("tabSize = 4\n") && tab.doc.text().contains("[editor.hover]\ndelay = 350\nenabled = true"), "{}", tab.doc.text());
         app.update(Msg::OpenSettings);
         assert_eq!(app.tabs.len(), 1, "not twice");
         // Edit and save: the changes are in force at once.
-        std::fs::write(settings::user_file(&config), "{\n  // two spaces here\n  \"editor.tabSize\": 2,\n  \"editor.keymap\": \"helix\",\n  \"workbench.colorTheme\": \"dark\",\n  \"editor.codeLens\": false\n}\n").unwrap();
+        std::fs::write(settings::user_file(&config), "glass = false\n\n[editor]\n# two spaces here\ntabSize = 2\nkeymap = \"helix\"\ncodeLens = false\n\n[workbench]\ncolorTheme = \"dark\"\n").unwrap();
         app.update(Msg::Close(0));
         app.update(Msg::OpenSettings);
         app.update(Msg::Save);
@@ -1985,18 +2002,37 @@ mod tests {
         app.update(Msg::ToggleScheme);
         let kept = settings::read(&settings::user_file(&config)).unwrap();
         assert_eq!(kept[settings::KEYMAP], json!(settings::keymap_name(KEYMAPS[0].0)));
-        assert_eq!((kept[settings::THEME].clone(), kept["editor.tabSize"].clone()), (json!("light"), json!(2)));
+        assert_eq!((kept[settings::THEME].clone(), kept["editor.tabSize"].clone(), kept["glass"].clone()), (json!("light"), json!(2), json!(false)));
+        assert!(std::fs::read_to_string(settings::user_file(&config)).unwrap().contains("# two spaces here\ntabSize = 2\n"), "what was written by hand is as it was");
+        // Changed in the file from elsewhere, it is taken up without being asked.
+        std::fs::write(settings::user_file(&config), "[editor]\ntabSize = 6\n").unwrap();
+        app.settings_seen = [None, None];
+        app.update(Msg::Poll);
+        assert_eq!(app.settings.tab_size, 6);
         // A mistake in the file is reported, and what was in force stays.
-        std::fs::write(settings::user_file(&config), "{ nonsense").unwrap();
+        std::fs::write(settings::user_file(&config), "[editor\nnonsense").unwrap();
         app.toast = None;
         app.load_settings();
         assert!(app.toast.as_deref().is_some_and(|t| t.contains("mistake")), "{:?}", app.toast);
         // The project's own settings win for the project.
-        std::fs::write(settings::user_file(&config), "{ \"editor.tabSize\": 8 }").unwrap();
+        std::fs::write(settings::user_file(&config), "[editor]\ntabSize = 8\n").unwrap();
         std::fs::create_dir_all(dir.join(".neocode")).unwrap();
-        std::fs::write(settings::folder_file(app.root.as_ref().unwrap()), "{ \"editor.tabSize\": 3 }").unwrap();
+        std::fs::write(settings::folder_file(app.root.as_ref().unwrap()), "[editor]\ntabSize = 3\n").unwrap();
         app.load_settings();
         assert_eq!(app.settings.tab_size, 3);
+        // What was kept as JSON before: a project's is read as it is, and the user's is brought over.
+        std::fs::remove_file(settings::folder_file(app.root.as_ref().unwrap())).unwrap();
+        std::fs::write(dir.join(".neocode").join("settings.json"), "{ \"editor.tabSize\": 5 }").unwrap();
+        app.load_settings();
+        assert_eq!(app.settings.tab_size, 5);
+        std::fs::remove_dir_all(dir.join(".neocode")).unwrap();
+        std::fs::write(settings::user_file(&config), "glass = false\n").unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), "{\n  // from before\n  \"editor.tabSize\": 7,\n  \"editor.keymap\": \"helix\",\n  \"editor.hover.enabled\": false\n}\n").unwrap();
+        app.load_settings();
+        assert_eq!((app.settings.tab_size, app.settings.keymap, app.settings.hover), (7, Keymap::Helix, false));
+        assert_eq!(std::fs::read_to_string(settings::user_file(&config)).unwrap(), "glass = false\n\n[editor]\nkeymap = \"helix\"\ntabSize = 7\n\n[editor.hover]\nenabled = false\n");
+        std::fs::remove_file(settings::user_file(&config)).unwrap();
         std::fs::remove_dir_all(config).unwrap();
     }
 
@@ -2158,7 +2194,7 @@ mod tests {
         }
         // The file says so in a word a person can read and change.
         let text = std::fs::read_to_string(settings::user_file(&config)).unwrap();
-        assert!(text.contains("\"editor.keymap\": \"helix\""), "{text}");
+        assert!(text.contains("[editor]\nkeymap = \"helix\"\n"), "{text}");
         // Chosen while a different folder is open, it holds for every folder.
         let other = project("keys-kept-other");
         let mut elsewhere = NeoCode::folder(&other);

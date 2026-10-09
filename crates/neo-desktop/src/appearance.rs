@@ -3,6 +3,8 @@ use std::time::SystemTime;
 
 use neo::{Accent, Glass, Scheme, Theme};
 
+use crate::config::{self, File};
+
 /// Light, dark, or whatever the system prefers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SchemePref {
@@ -26,7 +28,7 @@ impl SchemePref {
 
 /// The user's appearance settings, shared by every Neo app.
 ///
-/// Stored as `key = value` lines in `appearance.conf` under [`config_dir`].
+/// Kept in `neo.toml` under [`config_dir`]: see [`crate::config`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Appearance {
     pub scheme: SchemePref,
@@ -85,28 +87,93 @@ fn parse_accent(v: &str) -> Option<Accent> {
         "coral" => Accent::Coral,
         "amber" => Accent::Amber,
         _ => {
-            let (l, d) = v.split_once('/')?;
-            let hex = |s: &str| u32::from_str_radix(s.strip_prefix('#')?, 16).ok().map(neo::Color::hex);
-            Accent::Custom { light: hex(l)?, dark: hex(d)? }
+            let hex = |s: &str| u32::from_str_radix(s.trim().strip_prefix('#').filter(|h| h.len() == 6)?, 16).ok().map(neo::Color::hex);
+            match v.split_once('/') {
+                // One for light windows and one for dark.
+                Some((l, d)) => Accent::Custom { light: hex(l)?, dark: hex(d)? },
+                // One colour, shifted as far as it needs to be to be read on each.
+                None => Accent::from_color(hex(v)?),
+            }
         }
     })
 }
 
 impl Appearance {
+    /// The file these are kept in: `neo.toml`, under `[appearance]`,
+    /// `[appearance.glass]` and `[notifications]`.
     pub fn path() -> PathBuf {
-        config_dir().join("appearance.conf")
+        config::desktop_path()
     }
 
     pub(crate) fn modified() -> Option<SystemTime> {
-        std::fs::metadata(Self::path()).and_then(|m| m.modified()).ok()
+        config::modified(&Self::path())
     }
 
     /// Reads the settings file. Missing or unreadable values keep their defaults.
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path()).map(|s| Self::parse(&s)).unwrap_or_default()
+        Self::try_load().unwrap_or_default()
     }
 
+    /// Reads the settings file, or says what is wrong with it: a mistake
+    /// made editing it by hand is not to put everything back to defaults.
+    pub fn try_load() -> Result<Self, String> {
+        let mut file = File::desktop();
+        if let Some(problem) = file.problem() {
+            return Err(problem);
+        }
+        // Kept in a file of its own before: brought over, the once.
+        if !file.has(&["appearance"])
+            && let Ok(old) = std::fs::read_to_string(config_dir().join("appearance.conf"))
+        {
+            let a = Self::legacy(&old);
+            a.write(&mut file);
+            let _ = file.save();
+            return Ok(a);
+        }
+        Ok(Self::read(&file))
+    }
+
+    /// The settings in a file. What is missing, or makes no sense, keeps
+    /// its default, and numbers are kept within bounds.
+    pub fn read(file: &File) -> Self {
+        let mut a = Self::default();
+        let num = |at: &[&str], lo: f32, hi: f32, or: f32| file.number(at).map_or(or, |n| (n as f32).clamp(lo, hi));
+        a.scheme = file.text(&["appearance", "scheme"]).and_then(|v| SchemePref::ALL.into_iter().find(|s| s.key() == v)).unwrap_or(a.scheme);
+        a.accent = file.text(&["appearance", "accent"]).and_then(parse_accent).unwrap_or(a.accent);
+        a.radius = num(&["appearance", "radius"], 0.0, 40.0, a.radius);
+        a.text_scale = num(&["appearance", "text-scale"], 0.75, 2.0, a.text_scale);
+        a.reduce_motion = file.flag(&["appearance", "reduce-motion"]).unwrap_or(a.reduce_motion);
+        a.glass.enabled = file.flag(&["appearance", "glass", "enabled"]).unwrap_or(a.glass.enabled);
+        a.glass.opacity = num(&["appearance", "glass", "opacity"], 0.2, 1.0, a.glass.opacity);
+        a.glass.blur = num(&["appearance", "glass", "blur"], 0.0, 60.0, a.glass.blur);
+        a.notification_seconds = num(&["notifications", "seconds"], 1.0, 60.0, a.notification_seconds);
+        a
+    }
+
+    /// Puts the settings into a file, leaving whatever else is in it.
+    pub fn write(&self, file: &mut File) {
+        file.set(&["appearance", "scheme"], self.scheme.key());
+        // A colour written by hand as one code stays as it was written, while it is still that colour.
+        if file.text(&["appearance", "accent"]).and_then(parse_accent) != Some(self.accent) {
+            file.set(&["appearance", "accent"], accent_key(self.accent));
+        }
+        file.set_number(&["appearance", "radius"], self.radius);
+        file.set_number(&["appearance", "text-scale"], self.text_scale);
+        file.set(&["appearance", "reduce-motion"], self.reduce_motion);
+        file.set(&["appearance", "glass", "enabled"], self.glass.enabled);
+        file.set_number(&["appearance", "glass", "opacity"], self.glass.opacity);
+        file.set_number(&["appearance", "glass", "blur"], self.glass.blur);
+        file.set_number(&["notifications", "seconds"], self.notification_seconds);
+    }
+
+    /// The settings in a file's text.
     pub fn parse(src: &str) -> Self {
+        Self::read(&File::parse(src))
+    }
+
+    /// Reads the `key = value` lines of `appearance.conf`, which is where
+    /// these were kept before `neo.toml`.
+    fn legacy(src: &str) -> Self {
         let mut a = Self::default();
         for line in src.lines() {
             let line = line.trim();
@@ -137,31 +204,18 @@ impl Appearance {
         a
     }
 
+    /// The settings as a file of their own would have them.
     pub fn serialize(&self) -> String {
-        format!(
-            "# Neo appearance. Written by Settings; every Neo app reloads it on change.\n\
-             scheme = {}\naccent = {}\nradius = {}\ntext-scale = {}\nreduce-motion = {}\nglass = {}\nglass-opacity = {}\nglass-blur = {}\nnotification-seconds = {}\n",
-            self.scheme.key(),
-            accent_key(self.accent),
-            self.radius,
-            self.text_scale,
-            self.reduce_motion,
-            self.glass.enabled,
-            self.glass.opacity,
-            self.glass.blur,
-            self.notification_seconds,
-        )
+        let mut file = File::parse("");
+        self.write(&mut file);
+        file.encode()
     }
 
-    /// Writes the settings atomically, so readers never see half a file.
+    /// Writes the settings into `neo.toml`, atomically, so readers never see half a file.
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("conf.tmp");
-        std::fs::write(&tmp, self.serialize())?;
-        std::fs::rename(tmp, path)
+        let mut file = File::desktop();
+        self.write(&mut file);
+        file.save()
     }
 
     pub fn theme(&self, system: Scheme) -> Theme {
@@ -187,23 +241,27 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let a = Appearance {
-            scheme: SchemePref::Dark,
-            accent: Accent::Custom { light: neo::Color::hex(0x123456), dark: neo::Color::hex(0xABCDEF) },
-            radius: 12.0,
-            text_scale: 1.25,
-            reduce_motion: true,
-            glass: Glass { enabled: true, opacity: 0.5, blur: 20.0 },
-            notification_seconds: 8.0,
-        };
+        let a = Appearance { scheme: SchemePref::Dark, accent: Accent::Custom { light: neo::Color::hex(0x123456), dark: neo::Color::hex(0xABCDEF) }, radius: 12.0, text_scale: 1.25, reduce_motion: true, glass: Glass { enabled: true, opacity: 0.5, blur: 20.0 }, notification_seconds: 8.0 };
         assert_eq!(Appearance::parse(&a.serialize()), a);
     }
 
     #[test]
     fn ignores_junk_and_clamps() {
-        let a = Appearance::parse("scheme = purple\nradius = 900\nnonsense\naccent = teal\n");
-        assert_eq!(a.scheme, SchemePref::Auto);
-        assert_eq!(a.radius, 40.0);
-        assert_eq!(a.accent, Accent::Teal);
+        let a = Appearance::parse("[appearance]\nscheme = \"purple\"\nradius = 900\nnonsense = 1\naccent = \"teal\"\ntext-scale = \"big\"\n[notifications]\nseconds = 9\n");
+        assert_eq!((a.scheme, a.radius, a.accent, a.text_scale, a.notification_seconds), (SchemePref::Auto, 40.0, Accent::Teal, 1.0, 9.0));
+        // An accent written as one colour is that colour, and stays as it was written.
+        let mine = "[appearance]\naccent = \"#E0569B\" # pink\n";
+        let a = Appearance::parse(mine);
+        assert_eq!(a.accent, Accent::from_color(neo::Color::hex(0xE0569B)));
+        let mut file = File::parse(mine);
+        a.write(&mut file);
+        assert!(file.encode().starts_with(mine), "{}", file.encode());
+    }
+
+    #[test]
+    fn what_was_kept_in_appearance_conf_is_read() {
+        let old = Appearance { scheme: SchemePref::Dark, accent: Accent::Coral, radius: 12.0, text_scale: 1.15, reduce_motion: true, glass: Glass { enabled: false, opacity: 0.5, blur: 20.0 }, notification_seconds: 8.0 };
+        assert_eq!(Appearance::legacy("# Neo appearance.\nscheme = dark\naccent = coral\nradius = 12\ntext-scale = 1.15\nreduce-motion = true\nglass = false\nglass-opacity = 0.5\nglass-blur = 20\nnotification-seconds = 8\n"), old);
+        assert_eq!(old.serialize(), "[appearance]\nscheme = \"dark\"\naccent = \"coral\"\nradius = 12\ntext-scale = 1.15\nreduce-motion = true\n\n[appearance.glass]\nenabled = false\nopacity = 0.5\nblur = 20\n\n[notifications]\nseconds = 8\n");
     }
 }

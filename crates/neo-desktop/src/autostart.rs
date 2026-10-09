@@ -65,12 +65,29 @@ fn command_line(e: &Entry) -> String {
     std::iter::once(e.program.to_string_lossy().into_owned()).chain(e.args.iter().map(|a| a.to_string())).map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(" ")
 }
 
-/// Where it is noted which apps the user has said are not to start at login.
-fn declined_file() -> std::path::PathBuf {
-    crate::config_dir().join("startup.conf")
+/// The name an app goes by under `[startup]` in `neo.toml`: the last
+/// part of its ID, `shell` for `org.neo.Shell`.
+fn key(id: &str) -> String {
+    id.rsplit('.').next().unwrap_or(id).to_ascii_lowercase()
 }
 
-/// The apps noted in `text` as not to start at login, by their IDs.
+/// The `[startup]` table, with what was kept in `startup.conf` before
+/// brought over, the once.
+fn startup() -> crate::config::File {
+    let mut file = crate::config::File::desktop();
+    if file.problem().is_none()
+        && !file.has(&["startup"])
+        && let Ok(old) = std::fs::read_to_string(crate::config_dir().join("startup.conf"))
+    {
+        for id in declined_in(&old) {
+            file.set(&["startup", &key(&id)], false);
+        }
+        let _ = file.save();
+    }
+    file
+}
+
+/// The apps noted in the old `startup.conf` as not to start at login, by their IDs.
 fn declined_in(text: &str) -> Vec<String> {
     text.lines().filter_map(|l| l.split_once('=')).filter(|(_, v)| v.trim() == "false").map(|(id, _)| id.trim().to_owned()).filter(|id| !id.is_empty()).collect()
 }
@@ -80,23 +97,15 @@ fn declined_in(text: &str) -> Vec<String> {
 /// that their shortcuts work after a restart; one turned off in Settings
 /// is to stay off, and this is how it knows.
 pub fn declined(id: &str) -> bool {
-    declined_in(&std::fs::read_to_string(declined_file()).unwrap_or_default()).iter().any(|d| d == id)
+    startup().flag(&["startup", &key(id)]) == Some(false)
 }
 
 /// Notes that the user does not want this app started at login, or that
 /// they do again.
 pub fn set_declined(id: &str, declined: bool) -> std::io::Result<()> {
-    let path = declined_file();
-    let mut ids = declined_in(&std::fs::read_to_string(&path).unwrap_or_default());
-    ids.retain(|d| d != id);
-    if declined {
-        ids.push(id.to_owned());
-    }
-    ids.sort();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, ids.iter().map(|id| format!("{id} = false\n")).collect::<String>())
+    let mut file = startup();
+    file.set(&["startup", &key(id)], !declined);
+    file.save()
 }
 
 /// Whether the app is set to start at login exactly as `e` describes. A

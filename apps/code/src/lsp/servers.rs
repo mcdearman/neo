@@ -56,25 +56,41 @@ pub const SERVERS: &[ServerSpec] = &[
     ServerSpec { name: "PHP", language: "PHP", extensions: &[("php", "php")], commands: &[("intelephense", &["--stdio"]), ("phpactor", &["language-server"])] },
 ];
 
-/// Where a user lists servers of their own: `apps/neo-code-servers.conf`
-/// in Neo's settings folder. Each line gives the file extensions a server
-/// handles and the command that starts it, speaking over its standard
-/// input and output:
+/// Where a user lists servers of their own: `apps/neo-code.toml` in
+/// Neo's settings folder, with NeoCode's other settings. Each gives the
+/// file extensions a server handles and the command that starts it,
+/// speaking over its standard input and output:
 ///
-/// ```text
-/// # extensions = command
-/// hs lhs = haskell-language-server-wrapper --lsp
-/// vue:vue = vue-language-server --stdio
+/// ```toml
+/// [[servers]]
+/// extensions = ["hs", "lhs"]
+/// command = "haskell-language-server-wrapper --lsp"
+///
+/// [[servers]]
+/// extensions = ["vue:vue"]
+/// command = "vue-language-server --stdio"
 /// ```
 ///
 /// An extension is also used as the language ID unless one follows it
-/// after a colon. These come before the built-in servers, so a line here
+/// after a colon. These come before the built-in servers, so one here
 /// can replace one of them.
 pub fn user_servers_file() -> PathBuf {
+    neo_desktop::config::app_path("neo-code")
+}
+
+/// The servers listed in a settings file.
+pub fn servers_in(file: &neo_desktop::config::File) -> Vec<ServerSpec> {
+    // Each as a line of the kind they were listed in before, and read as one.
+    file.each(&["servers"]).iter().flat_map(|s| parse_user_servers(&format!("{} = {}", s.list(&["extensions"]).unwrap_or_default().join(" "), s.text(&["command"]).unwrap_or_default()))).collect()
+}
+
+/// The servers in `apps/neo-code-servers.conf`, where they were listed
+/// before: a line to each, `hs lhs = haskell-language-server-wrapper --lsp`.
+fn old_servers_file() -> PathBuf {
     neo_desktop::config_dir().join("apps").join("neo-code-servers.conf")
 }
 
-/// Reads a user's server list. Lines that make no sense are skipped.
+/// Reads a list of servers, a line to each. Lines that make no sense are skipped.
 pub fn parse_user_servers(src: &str) -> Vec<ServerSpec> {
     // These live as long as the app, like the built-in list.
     fn keep(s: &str) -> &'static str {
@@ -109,7 +125,13 @@ pub fn all() -> &'static [ServerSpec] {
     static ALL: std::sync::OnceLock<Vec<ServerSpec>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         // Tests see the built-in list only, whatever this computer has set up.
-        let mut list = if cfg!(test) { vec![] } else { std::fs::read_to_string(user_servers_file()).map(|s| parse_user_servers(&s)).unwrap_or_default() };
+        let mut list = if cfg!(test) {
+            vec![]
+        } else {
+            let mut own = servers_in(&neo_desktop::config::File::open(user_servers_file()));
+            own.extend(std::fs::read_to_string(old_servers_file()).map(|s| parse_user_servers(&s)).unwrap_or_default());
+            own
+        };
         list.extend(SERVERS.iter().map(|s| ServerSpec { name: s.name, language: s.language, extensions: s.extensions, commands: s.commands }));
         list
     })
@@ -243,6 +265,10 @@ mod tests {
         assert_eq!(list[0].commands, &[("/opt/hls/bin/hls-wrapper", &["--lsp", "--debug"][..])][..]);
         assert_eq!(list[1].extensions, &[("vue", "vue-html")][..], "a language ID can follow the extension");
         assert!(parse_user_servers("").is_empty());
+        // As they are listed now, among NeoCode's settings.
+        let file = neo_desktop::config::File::parse("glass = true\n[editor]\ntabSize = 2\n\n[[servers]]\nextensions = [\"hs\", \".LHS\"]\ncommand = \"/opt/hls/bin/hls-wrapper --lsp --debug\"\n\n[[servers]]\nextensions = [\"vue:vue-html\"]\ncommand = \"vue-language-server --stdio\"\n\n[[servers]]\ncommand = \"no-extensions\"\n\n[[servers]]\nextensions = [\"kk\"]\n");
+        let listed = servers_in(&file);
+        assert_eq!(listed.iter().map(|s| (s.name, s.extensions, s.commands)).collect::<Vec<_>>(), list.iter().map(|s| (s.name, s.extensions, s.commands)).collect::<Vec<_>>());
     }
 
     #[test]

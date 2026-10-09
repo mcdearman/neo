@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use neo::Rect;
 
+use crate::config::{self, File};
+
 /// Whether windows are tiled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -77,7 +79,7 @@ pub enum NewWindow {
     Stack,
 }
 
-/// The windowing settings, kept as `key = value` lines in `windowing.conf`.
+/// The windowing settings, kept under `[windows]` in `neo.toml`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Windowing {
     pub mode: Mode,
@@ -110,33 +112,86 @@ impl Default for Windowing {
 }
 
 impl Windowing {
+    /// The file these are kept in: `neo.toml`, under `[windows]`.
     pub fn path() -> PathBuf {
-        crate::config_dir().join("windowing.conf")
+        config::desktop_path()
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path()).map(|text| Self::parse(&text)).unwrap_or_default()
+        Self::try_load().unwrap_or_default()
+    }
+
+    /// Reads the settings file, or says what is wrong with it.
+    pub fn try_load() -> Result<Self, String> {
+        let mut file = File::desktop();
+        if let Some(problem) = file.problem() {
+            return Err(problem);
+        }
+        // Kept in a file of its own before: brought over, the once.
+        if !file.has(&["windows"])
+            && let Ok(old) = std::fs::read_to_string(crate::config_dir().join("windowing.conf"))
+        {
+            let w = Self::legacy(&old);
+            w.write(&mut file);
+            let _ = file.save();
+            return Ok(w);
+        }
+        Ok(Self::read(&file))
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, self.encode())
+        let mut file = File::desktop();
+        self.write(&mut file);
+        file.save()
     }
 
+    /// The settings in a file. What is missing or makes no sense keeps
+    /// its default, and numbers are kept within bounds.
+    pub fn read(file: &File) -> Self {
+        let mut w = Self::default();
+        let num = |key: &str, lo: f32, hi: f32, or: f32| file.number(&["windows", key]).map_or(or, |n| (n as f32).clamp(lo, hi));
+        w.mode = if file.text(&["windows", "mode"]) == Some("tiling") { Mode::Tiling } else { Mode::Floating };
+        w.layout = file.text(&["windows", "layout"]).and_then(|v| Layout::ALL.into_iter().find(|l| l.id() == v)).unwrap_or(w.layout);
+        w.ratio = num("main-share", RATIOS.0, RATIOS.1, w.ratio);
+        w.masters = num("main-windows", 1.0, MOST_MASTERS as f32, w.masters as f32).round() as u32;
+        w.gap = num("gap", 0.0, WIDEST_GAP, w.gap);
+        w.margin = num("margin", 0.0, WIDEST_GAP, w.margin);
+        w.new_window = if file.text(&["windows", "new-window"]) == Some("main") { NewWindow::Master } else { NewWindow::Stack };
+        for app in file.list(&["windows", "float"]).unwrap_or_default() {
+            if !app.trim().is_empty() && !w.floats(&app) {
+                w.floating.push(app);
+            }
+        }
+        w
+    }
+
+    /// Puts the settings into a file, leaving whatever else is in it.
+    pub fn write(&self, file: &mut File) {
+        file.set(&["windows", "mode"], if self.mode == Mode::Tiling { "tiling" } else { "floating" });
+        file.set(&["windows", "layout"], self.layout.id());
+        file.set_number(&["windows", "main-share"], self.ratio);
+        file.set(&["windows", "main-windows"], i64::from(self.masters));
+        file.set_number(&["windows", "gap"], self.gap);
+        file.set_number(&["windows", "margin"], self.margin);
+        file.set(&["windows", "new-window"], if self.new_window == NewWindow::Master { "main" } else { "stack" });
+        file.set_list(&["windows", "float"], &self.floating);
+    }
+
+    /// The settings as a file of their own would have them.
     pub fn encode(&self) -> String {
-        let mut out = format!("mode = {}\nlayout = {}\nratio = {:.2}\nmasters = {}\ngap = {:.0}\nmargin = {:.0}\nnew-window = {}\n", if self.mode == Mode::Tiling { "tiling" } else { "floating" }, self.layout.id(), self.ratio, self.masters, self.gap, self.margin, if self.new_window == NewWindow::Master { "master" } else { "stack" });
-        for app in &self.floating {
-            out.push_str(&format!("float = {app}\n"));
-        }
-        out
+        let mut file = File::parse("");
+        self.write(&mut file);
+        file.encode()
     }
 
-    /// Reads what [`encode`](Self::encode) wrote. What is missing or makes
-    /// no sense keeps its default, and numbers are kept within bounds.
+    /// The settings in a file's text.
     pub fn parse(text: &str) -> Self {
+        Self::read(&File::parse(text))
+    }
+
+    /// Reads the `key = value` lines of `windowing.conf`, where these
+    /// were kept before `neo.toml`.
+    fn legacy(text: &str) -> Self {
         let mut w = Self::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
@@ -321,7 +376,10 @@ mod tests {
         assert_eq!(Windowing::parse(""), Windowing::default());
         assert_eq!(Windowing::default().mode, Mode::Floating, "nothing is moved until it is asked for");
         // What makes no sense is kept within bounds or left as it was.
-        let odd = Windowing::parse("mode = sideways\nlayout = spiral\nratio = 9\nmasters = 0\ngap = -4\nmargin = 900\nfloat = \nfloat = Notes\nfloat = Notes\n");
+        assert_eq!(w.encode(), "[windows]\nmode = \"tiling\"\nlayout = \"grid\"\nmain-share = 0.65\nmain-windows = 2\ngap = 12\nmargin = 4\nnew-window = \"main\"\nfloat = [\"System Settings\", \"NeoCal\"]\n");
+        // What was kept in windowing.conf before is read as it was.
+        assert_eq!(Windowing::legacy("mode = tiling\nlayout = grid\nratio = 0.65\nmasters = 2\ngap = 12\nmargin = 4\nnew-window = master\nfloat = System Settings\nfloat = NeoCal\n"), w);
+        let odd = Windowing::parse("[windows]\nmode = \"sideways\"\nlayout = \"spiral\"\nmain-share = 9\nmain-windows = 0\ngap = -4\nmargin = 900\nfloat = [\"\", \"Notes\", \"notes\"]\n");
         assert_eq!((odd.mode, odd.layout, odd.ratio, odd.masters, odd.gap, odd.margin, odd.floating.clone()), (Mode::Floating, Layout::MasterStack, 0.8, 1, 0.0, 40.0, vec!["Notes".to_owned()]));
         assert!(odd.floats("notes") && !odd.floats("Safari"));
         assert_eq!(Layout::ALL.map(Layout::next), [Layout::Columns, Layout::Grid, Layout::Monocle, Layout::MasterStack]);

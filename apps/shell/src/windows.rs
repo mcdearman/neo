@@ -507,7 +507,10 @@ pub fn run(actions: Receiver<Action>, turned: impl Fn(bool)) {
         let now = written(&Windowing::path());
         if now != read {
             read = now;
-            manager.configure(Windowing::load());
+            // With a mistake in the file, things stay as they are until it is put right.
+            if let Ok(config) = Windowing::try_load() {
+                manager.configure(config);
+            }
         }
         manager.tick(false);
         if said.as_ref() != Some(manager.status()) {

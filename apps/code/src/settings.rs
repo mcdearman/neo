@@ -1,16 +1,18 @@
 //! What NeoCode keeps between runs: settings, and for each folder the
 //! files that were open in it.
 //!
-//! Settings are a `settings.json`, as in VS Code and with its names where
-//! there is one for the same thing. The user's is in NeoCode's own
-//! folder; a project can carry another at `.neocode/settings.json`,
-//! which wins for that project. Keys NeoCode does not know are left
-//! alone, so a file can be shared or carried forward.
+//! Settings are TOML, as all of Neo's are, with VS Code's names where
+//! there is one for the same thing: `tabSize` under `[editor]` is its
+//! `editor.tabSize`. The user's are in `apps/neo-code.toml` in Neo's
+//! settings folder; a project can carry its own at
+//! `.neocode/settings.toml`, which wins for that project. What NeoCode
+//! does not know is left alone, comments and all.
 
 use std::path::{Path, PathBuf};
 
 use neo::Syntax;
 use neo::prelude::Keymap;
+use neo_desktop::config::File;
 use serde_json::{Map, Value, json};
 
 /// The settings NeoCode acts on.
@@ -115,8 +117,8 @@ impl Settings {
     }
 }
 
-/// JSON with the comments taken out, since people write them in settings
-/// files and VS Code allows it. Text inside strings is left alone.
+/// JSON with the comments taken out, since people wrote them in the
+/// `settings.json` these were kept in before. Text inside strings is left alone.
 fn without_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -154,53 +156,114 @@ fn without_comments(text: &str) -> String {
     out
 }
 
-/// The values in a settings file. A file that is not there has none; one
-/// that cannot be read as settings says what is wrong with it.
+/// The values in a settings file, each under its whole name:
+/// `editor.tabSize` for `tabSize` under `[editor]`. A file that is not
+/// there has none; one that cannot be read as settings says what is
+/// wrong with it.
 pub fn read(file: &Path) -> Result<Map<String, Value>, String> {
     let text = match std::fs::read_to_string(file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
         Err(e) => return Err(format!("Couldn't read {}: {e}", file.display())),
     };
-    if text.trim().is_empty() {
-        return Ok(Map::new());
+    if let Some(problem) = File::open(file.to_owned()).problem() {
+        return Err(problem);
     }
-    match serde_json::from_str(&without_comments(&text)) {
-        Ok(Value::Object(map)) => Ok(map),
-        Ok(_) => Err("settings.json should be one object, in curly brackets.".into()),
-        Err(e) => Err(format!("settings.json has a mistake on line {}: {e}", e.line())),
+    let mut values = Map::new();
+    if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+        flatten("", doc.as_table(), &mut values);
+    }
+    Ok(values)
+}
+
+/// Puts a table's settings into `out` under their whole names. Lists of
+/// tables, the user's language servers say, are not settings of this kind.
+fn flatten(under: &str, table: &toml_edit::Table, out: &mut Map<String, Value>) {
+    fn plain(v: &toml_edit::Value) -> Option<Value> {
+        Some(match v {
+            toml_edit::Value::String(s) => json!(s.value()),
+            toml_edit::Value::Integer(n) => json!(n.value()),
+            toml_edit::Value::Float(n) => json!(n.value()),
+            toml_edit::Value::Boolean(b) => json!(b.value()),
+            toml_edit::Value::Array(a) => Value::Array(a.iter().filter_map(plain).collect()),
+            _ => return None,
+        })
+    }
+    for (key, item) in table.iter() {
+        let name = if under.is_empty() { key.to_owned() } else { format!("{under}.{key}") };
+        match item {
+            toml_edit::Item::Table(t) => flatten(&name, t, out),
+            toml_edit::Item::Value(v) => {
+                if let Some(v) = plain(v) {
+                    out.insert(name, v);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-fn write(file: &Path, values: &Map<String, Value>) -> std::io::Result<()> {
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
+/// Puts one value into a file under its whole name.
+fn put(file: &mut File, key: &str, value: &Value) {
+    let at: Vec<&str> = key.split('.').collect();
+    match value {
+        Value::String(s) => file.set(&at, s.as_str()),
+        Value::Bool(b) => file.set(&at, *b),
+        Value::Number(n) => match n.as_i64() {
+            Some(whole) => file.set(&at, whole),
+            None => file.set_number(&at, n.as_f64().unwrap_or(0.0) as f32),
+        },
+        _ => {}
     }
-    let text = serde_json::to_string_pretty(values).map_err(std::io::Error::other)?;
-    std::fs::write(file, text + "\n")
 }
 
-/// Changes one setting in a file, keeping the rest. A file with a mistake
-/// in it is left as it is rather than written over.
+/// Changes one setting in a file, keeping the rest as it is written. A
+/// file with a mistake in it is left as it is rather than written over.
 pub fn set(file: &Path, key: &str, value: Value) -> Result<(), String> {
-    let mut values = read(file)?;
-    values.insert(key.to_owned(), value);
-    write(file, &values).map_err(|e| format!("Couldn't write {}: {e}", file.display()))
+    let mut toml = File::open(file.to_owned());
+    if let Some(problem) = toml.problem() {
+        return Err(problem);
+    }
+    put(&mut toml, key, &value);
+    toml.save().map_err(|e| format!("Couldn't write {}: {e}", file.display()))
 }
 
-/// Makes the settings file if there is none, with every setting in it.
+/// Puts every setting the file does not have into it, with its usual
+/// value, so that opening it shows what there is to change.
 pub fn ensure(file: &Path) -> std::io::Result<()> {
-    if file.exists() { Ok(()) } else { write(file, &Settings::defaults()) }
+    let mut toml = File::open(file.to_owned());
+    for (key, value) in Settings::defaults() {
+        if !toml.has(&key.split('.').collect::<Vec<_>>()) {
+            put(&mut toml, &key, &value);
+        }
+    }
+    toml.save()
 }
 
-/// The user's settings file, under NeoCode's own folder `dir`.
+/// The user's settings file, for NeoCode's own folder `dir`: beside it,
+/// in `apps`, with the other apps' settings, as `apps/neo-code.toml`.
 pub fn user_file(dir: &Path) -> PathBuf {
-    dir.join("settings.json")
+    let name = dir.file_name().map_or_else(|| "neo-code".into(), |n| n.to_string_lossy().into_owned());
+    dir.with_file_name("apps").join(format!("{name}.toml"))
 }
 
 /// A project's own settings file.
 pub fn folder_file(root: &Path) -> PathBuf {
-    root.join(".neocode").join("settings.json")
+    root.join(".neocode").join("settings.toml")
+}
+
+/// The settings that were kept as JSON before, in `settings.json`.
+fn read_json(file: &Path) -> Option<Map<String, Value>> {
+    match serde_json::from_str(&without_comments(&std::fs::read_to_string(file).ok()?)) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Whether a name is one of NeoCode's settings, and not something else
+/// kept in the same file.
+fn ours(key: &str) -> bool {
+    ["editor.", "workbench.", "window."].iter().any(|p| key.starts_with(p))
 }
 
 /// The settings in force: the user's, with the project's over them. Says
@@ -208,14 +271,38 @@ pub fn folder_file(root: &Path) -> PathBuf {
 pub fn load(dir: Option<&Path>, root: Option<&Path>) -> (Settings, Vec<String>) {
     let mut problems = vec![];
     let mut values = Map::new();
-    for file in dir.map(user_file).into_iter().chain(root.map(folder_file)) {
+    if let Some(dir) = dir {
+        let file = user_file(dir);
         match read(&file) {
+            Ok(mut found) => {
+                // Kept as JSON in NeoCode's own folder before: brought over, the once.
+                if !found.keys().any(|k| ours(k))
+                    && let Some(old) = read_json(&dir.join("settings.json"))
+                {
+                    let mut toml = File::open(file.clone());
+                    for (key, value) in &old {
+                        put(&mut toml, key, value);
+                    }
+                    let _ = toml.save();
+                    found = read(&file).unwrap_or(old);
+                }
+                values.extend(found);
+            }
+            Err(why) => problems.push(why),
+        }
+    }
+    if let Some(root) = root {
+        let file = folder_file(root);
+        // A project that still carries the JSON one is read as it is, and not written to.
+        let found = if file.exists() { read(&file) } else { Ok(read_json(&file.with_extension("json")).unwrap_or_default()) };
+        match found {
             Ok(more) => values.extend(more),
             Err(why) => problems.push(why),
         }
     }
+    values.retain(|key, _| ours(key));
     let (settings, wrong) = Settings::from(&values);
-    problems.extend(wrong.into_iter().map(|key| format!("\"{key}\" in settings.json has a value NeoCode can't use.")));
+    problems.extend(wrong.into_iter().map(|key| format!("\"{key}\" in the settings has a value NeoCode can't use.")));
     (settings, problems)
 }
 
@@ -312,17 +399,23 @@ mod tests {
         let dir = scratch("read");
         let file = user_file(&dir);
         assert_eq!(read(&file), Ok(Map::new()), "no file is no settings, not a mistake");
-        std::fs::write(&file, "// mine\n{\n  \"editor.tabSize\": 2, /* two\n spaces */\n  \"note\": \"not // a comment\"\n}\n").unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "# mine\nglass = false\nnote = \"not # a comment\"\n\n[editor]\ntabSize = 2 # two spaces\nfontSize = 13.5\n\n[editor.hover]\nenabled = false\n\n[[servers]]\ncommand = \"not a setting\"\n").unwrap();
         let values = read(&file).unwrap();
-        assert_eq!((values["editor.tabSize"].clone(), values["note"].clone()), (json!(2), json!("not // a comment")));
-        std::fs::write(&file, "{\n  \"editor.tabSize\": 2,\n  oops\n}\n").unwrap();
+        assert_eq!((values["editor.tabSize"].clone(), values["note"].clone(), values["editor.hover.enabled"].clone(), values["editor.fontSize"].clone(), values.len()), (json!(2), json!("not # a comment"), json!(false), json!(13.5), 5));
+        std::fs::write(&file, "[editor]\ntabSize = 2\noops\n").unwrap();
         let why = read(&file).unwrap_err();
-        assert!(why.contains("line 3"), "{why}");
+        assert!(why.contains("mistake at line 3"), "{why}");
         // A file with a mistake is not written over when a setting changes.
         assert!(set(&file, KEYMAP, json!("vim")).is_err());
         assert!(std::fs::read_to_string(&file).unwrap().contains("oops"));
-        std::fs::write(&file, "[1]").unwrap();
-        assert!(read(&file).unwrap_err().contains("curly brackets"));
+        // The JSON these were kept in before could have comments, and is still read.
+        std::fs::write(dir.join("settings.json"), "// mine\n{\n  \"editor.tabSize\": 2, /* two\n spaces */\n  \"note\": \"not // a comment\"\n}\n").unwrap();
+        let old = read_json(&dir.join("settings.json")).unwrap();
+        assert_eq!((old["editor.tabSize"].clone(), old["note"].clone()), (json!(2), json!("not // a comment")));
+        std::fs::write(dir.join("settings.json"), "[1]").unwrap();
+        assert!(read_json(&dir.join("settings.json")).is_none());
+        std::fs::remove_file(&file).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -332,9 +425,11 @@ mod tests {
         let root = scratch("set-project");
         let file = user_file(&dir);
         ensure(&file).unwrap();
-        assert_eq!(read(&file).unwrap(), Settings::defaults());
-        std::fs::write(&file, "{ \"someone.elses\": true, \"editor.tabSize\": 8 }").unwrap();
+        assert_eq!(Settings::from(&read(&file).unwrap()), (Settings::default(), vec![]));
+        assert_eq!(read(&file).unwrap().len(), Settings::defaults().len());
+        std::fs::write(&file, "[someone]\nelses = true # theirs\n\n[editor]\ntabSize = 8\n").unwrap();
         ensure(&file).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("[someone]\nelses = true # theirs\n\n[editor]\ntabSize = 8\n"), "what was there is as it was, with the rest after it");
         set(&file, KEYMAP, json!("helix")).unwrap();
         let values = read(&file).unwrap();
         assert_eq!((values["someone.elses"].clone(), values["editor.tabSize"].clone(), values[KEYMAP].clone()), (json!(true), json!(8), json!("helix")));
@@ -342,11 +437,12 @@ mod tests {
         assert_eq!((s.keymap, s.tab_size, problems.len()), (Keymap::Helix, 8, 0));
         // The project's own file is laid over the user's.
         std::fs::create_dir_all(root.join(".neocode")).unwrap();
-        std::fs::write(folder_file(&root), "{ \"editor.tabSize\": 2, \"editor.fontSize\": \"big\" }").unwrap();
+        std::fs::write(folder_file(&root), "[editor]\ntabSize = 2\nfontSize = \"big\"\n").unwrap();
         let (s, problems) = load(Some(&dir), Some(&root));
         assert_eq!((s.keymap, s.tab_size), (Keymap::Helix, 2));
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert_eq!(load(None, None), (Settings::default(), vec![]));
+        std::fs::remove_file(&file).unwrap();
         for d in [dir, root] {
             std::fs::remove_dir_all(d).unwrap();
         }

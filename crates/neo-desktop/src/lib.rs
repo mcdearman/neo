@@ -29,13 +29,14 @@
 pub mod apollo;
 mod appearance;
 pub mod autostart;
+pub mod config;
 pub mod fs;
 pub mod notify;
-pub mod tiling;
 mod prefs;
+pub mod tiling;
 pub mod ui;
 
-pub use appearance::{config_dir, Appearance, SchemePref};
+pub use appearance::{Appearance, SchemePref, config_dir};
 pub use prefs::AppPrefs;
 
 use std::path::PathBuf;
@@ -101,9 +102,15 @@ impl Desktop {
         let stamp = Appearance::modified();
         if stamp != self.stamp {
             self.stamp = stamp;
-            let next = Appearance::load();
-            changed |= next != self.appearance;
-            self.appearance = next;
+            // A mistake made editing the file by hand: things stay as they
+            // are, and the settings panel says what is wrong, until it is put right.
+            match Appearance::try_load() {
+                Ok(next) => {
+                    changed |= next != self.appearance;
+                    (self.appearance, self.error) = (next, None);
+                }
+                Err(problem) => self.error = Some(problem),
+            }
         }
         let stamp = AppPrefs::modified(&self.prefs_path);
         if stamp != self.prefs_stamp {

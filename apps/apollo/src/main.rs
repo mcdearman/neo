@@ -157,6 +157,8 @@ struct Apollo {
     settings: Settings,
     /// Where settings are kept. Tests and snapshots keep none.
     settings_file: Option<PathBuf>,
+    /// When that file was last seen written, for taking up a change made to it by hand.
+    settings_stamp: Option<std::time::SystemTime>,
     page: Page,
     proxy: Option<Proxy<Msg>>,
     model: Arc<dyn Model>,
@@ -498,6 +500,7 @@ impl Apollo {
         app.drafts_away = app.away();
         app.remote_draft = app.settings.remote.clone();
         app.settings_file = Some(Settings::file());
+        app.settings_stamp = neo_desktop::config::modified(&Settings::file());
         app.server = Some(server);
         app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
         app.tell = tell_neoshell;
@@ -512,6 +515,7 @@ impl Apollo {
             desktop: Desktop::load(),
             settings: Settings { folders: vec![], ..Settings::default() },
             settings_file: None,
+            settings_stamp: None,
             page: Page::Ask,
             proxy: None,
             model,
@@ -702,6 +706,34 @@ impl Apollo {
             && let Err(e) = self.settings.save_to(path)
         {
             self.trouble = Some(format!("Couldn't save Apollo's settings: {e}"));
+        }
+        self.settings_stamp = self.settings_file.as_deref().and_then(neo_desktop::config::modified);
+    }
+
+    /// Takes up settings changed in the file by hand, as if they had been
+    /// changed here.
+    fn follow_settings(&mut self) {
+        let Some(path) = self.settings_file.clone() else { return };
+        let stamp = neo_desktop::config::modified(&path);
+        if stamp == self.settings_stamp {
+            return;
+        }
+        self.settings_stamp = stamp;
+        let file = neo_desktop::config::File::open(path);
+        // With a mistake in it, things stay as they are until it is put right.
+        if let Some(problem) = file.problem() {
+            self.trouble = Some(problem);
+            return;
+        }
+        let next = Settings::read(&file);
+        if next != self.settings {
+            let s = &self.settings;
+            let models = (&next.chat_model, &next.vision_model, &next.embed_model, &next.server, &next.remote, next.chat_remote, next.vision_remote, next.embed_remote) != (&s.chat_model, &s.vision_model, &s.embed_model, &s.server, &s.remote, s.chat_remote, s.vision_remote, s.embed_remote);
+            self.settings = next;
+            self.remote_draft = self.settings.remote.clone();
+            if models {
+                self.serve_anew();
+            }
         }
     }
 
@@ -1367,6 +1399,7 @@ impl Apollo {
             }
             Msg::Poll => {
                 self.desktop.poll();
+                self.follow_settings();
             }
 
             Msg::Ready(ready, dims) => {
