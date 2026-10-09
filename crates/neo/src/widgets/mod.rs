@@ -24,7 +24,7 @@ mod tree;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
-pub use color::{hex, hues, parse_hex, shades, Hsv, Plane};
+pub use color::{color_field, hex, hues, parse_hex, shades, ColorField, Hsv, Plane};
 pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, ExtraSelection, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
