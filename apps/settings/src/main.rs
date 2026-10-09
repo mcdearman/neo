@@ -236,6 +236,8 @@ enum Msg {
     Tiler(bool, Option<tiling::Status>, Windowing),
     /// Open the system's settings where leave to move windows is given.
     OpenAccessibility,
+    /// Have NeoShell ask the system for leave to move windows.
+    AllowControl,
 }
 
 /// How large a picture is shown to choose it by, how many go across, and
@@ -315,6 +317,8 @@ impl Settings {
             Page::Network | Page::Bluetooth => self.ask(self.page, 0),
             Page::Startup => self.starting = if cfg!(test) { self.starting } else { startup::ITEMS.map(|item| item.on()) },
             Page::Notifications => self.tried = None,
+            // Whether NeoShell may move windows, which is asked for here.
+            Page::Accessibility => self.update(Msg::WindowTick),
             Page::Windows => {
                 if self.follows {
                     self.windowing = Windowing::load();
@@ -437,7 +441,7 @@ impl App for Settings {
             subs.push(Subscription::every(SOUND_EVERY, Msg::SoundTick));
         }
         // And the Windows page what NeoShell is doing, and what the tiling's keys change.
-        if self.page == Page::Windows {
+        if matches!(self.page, Page::Windows | Page::Accessibility) {
             subs.push(Subscription::every(WINDOWS_EVERY, Msg::WindowTick));
         }
         subs
@@ -595,12 +599,23 @@ impl App for Settings {
                 }
             }
             Msg::Tiler(running, status, kept) => {
-                if self.page == Page::Windows {
+                if matches!(self.page, Page::Windows | Page::Accessibility) {
                     // The keys change the layout too, and what they change shows here.
                     self.tiler = Some((running, status));
                     if self.windows_changed.is_none_or(|t| t.elapsed() >= SOUND_SETTLES) {
                         self.windowing = kept;
                     }
+                }
+            }
+            Msg::AllowControl => {
+                // NeoShell is the one to be allowed, so it is the one that asks: the
+                // system then shows its request, and lists NeoShell with its switch.
+                if let Some(dir) = tiling::ask_path().parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                self.error = std::fs::write(tiling::ask_path(), "").err().map(|e| format!("Could not ask NeoShell: {e}"));
+                if matches!(self.tiler, Some((false, _))) {
+                    self.update(Msg::StartShell);
                 }
             }
             Msg::OpenAccessibility => {
@@ -764,6 +779,28 @@ impl Settings {
             .width(Length::Fill)
             .push(group(vec![setting("Text size", "Scales text in every Neo app.", segmented(TEXT_SCALES.map(|(_, n)| n), scale_idx, |i| Msg::TextScale(TEXT_SCALES[i].0))), setting("Reduce motion", "Turns off transitions and animation, including notifications sliding in and the flash after a screenshot.", toggle(a.reduce_motion, Msg::ReduceMotion))]))
             .push(text("Text and controls meet WCAG AA contrast in both colour schemes with the royal blue accent.").role(TextRole::Caption).tone(Tone::Muted))
+            .push(self.control())
+            .into()
+    }
+
+    /// Leave for NeoShell to move other apps' windows, which tiling needs:
+    /// how it stands, and the way to giving it.
+    fn control(&self) -> Element<Msg> {
+        if !cfg!(target_os = "macos") {
+            return column().into();
+        }
+        let (said, control): (&str, Element<Msg>) = match &self.tiler {
+            None | Some((true, None)) => ("Asking NeoShell…", row().into()),
+            Some((false, _)) => ("NeoShell does the moving, and it is not running.", button("Start NeoShell").on_press(Msg::StartShell).into()),
+            Some((true, Some(status))) if status.allowed => ("Allowed. Tiling can lay your windows out.", row().spacing(6.0).align(Align::Center).push(icon(icons::CIRCLE_CHECK).tone(Tone::Good)).push(text("On").role(TextRole::Strong).tone(Tone::Good)).into()),
+            Some((true, Some(_))) => ("Not allowed yet. Allow asks macOS, which shows NeoShell with a switch to turn on.", row().spacing(8.0).align(Align::Center).push(button("Show the Switch").on_press(Msg::OpenAccessibility)).push(Button::new(text("Allow…").role(TextRole::Strong)).kind(ButtonKind::Accent).on_press(Msg::AllowControl)).into()),
+        };
+        column()
+            .spacing(18.0)
+            .width(Length::Fill)
+            .push(section("Control of windows"))
+            .push(group(vec![setting("Let NeoShell move windows", said, control)]))
+            .push(text("Tiling needs this. The switch itself is macOS's: it keeps it in its own list under Privacy & Security, Accessibility, and no app can turn it on for you. This page shows it as on the moment you have.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
             .into()
     }
 
@@ -920,7 +957,11 @@ impl Settings {
         let w = &self.windowing;
         let tiling = w.mode == Mode::Tiling;
         let wide = |control: Slider<Msg>| container(control).width(220.0);
-        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Windows are", if tiling { "Tiled: laid out to share the screen, and laid out again as they open and close." } else { "Floating: each stays where you put it. Coming back from tiling, they return to where they were." }, segmented(["Floating", "Tiling"], Some(usize::from(tiling)), |i| Msg::WindowMode(if i == 1 { Mode::Tiling } else { Mode::Floating })))]));
+        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting(
+            "Windows are",
+            if tiling { "Tiled: laid out to share the screen, and laid out again as they open and close." } else { "Floating: each stays where you put it. Coming back from tiling, they return to where they were." },
+            segmented(["Floating", "Tiling"], Some(usize::from(tiling)), |i| Msg::WindowMode(if i == 1 { Mode::Tiling } else { Mode::Floating })),
+        )]));
         if !tiling {
             return page.push(text("Tiling arranges the windows of every app so that none covers another, the way a tiling window manager does. Turn it on to choose a layout.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into();
         }
@@ -937,7 +978,7 @@ impl Settings {
         } else {
             match &self.tiler {
                 Some((false, _)) => page = page.push(line(Tone::Warn, "NeoShell lays the windows out, and it is not running.", Some(("Start NeoShell", Msg::StartShell)))),
-                Some((true, Some(status))) if !status.allowed => page = page.push(line(Tone::Warn, "NeoShell needs your leave to move other apps' windows. Turn it on under Privacy & Security, Accessibility.", Some(("Open Accessibility", Msg::OpenAccessibility)))),
+                Some((true, Some(status))) if !status.allowed => page = page.push(line(Tone::Warn, "NeoShell needs your leave to move other apps' windows, which is given under Accessibility.", Some(("Allow in Accessibility", Msg::Page(Page::Accessibility))))),
                 Some((true, Some(status))) => {
                     page = page.push(line(
                         Tone::Good,
@@ -1208,6 +1249,16 @@ mod tests {
         settings.update(Msg::Tiler(true, Some(tiling::Status { allowed: false, windows: 0, possible: true }), Windowing { layout: Layout::Columns, ..set.clone() }));
         assert_eq!((settings.windowing.layout, settings.sample_windows, settings.tiler.as_ref().map(|t| t.0)), (Layout::Columns, 5, Some(true)));
         settings.update(Msg::OpenAccessibility);
+        // Leave to move windows is asked for from Accessibility: NeoShell is left word to ask.
+        settings.update(Msg::Page(Page::Accessibility));
+        assert_eq!(settings.subscriptions().len(), 2, "how it stands is followed there too");
+        settings.update(Msg::Tiler(true, Some(tiling::Status { allowed: false, windows: 0, possible: true }), set.clone()));
+        settings.update(Msg::AllowControl);
+        assert_eq!((tiling::ask_path().exists(), settings.error.clone()), (true, None));
+        std::fs::remove_file(tiling::ask_path()).unwrap();
+        settings.update(Msg::Page(Page::Windows));
+        settings.windows_changed = None;
+        settings.update(Msg::Tiler(true, Some(tiling::Status { allowed: false, windows: 0, possible: true }), Windowing { layout: Layout::Columns, ..set.clone() }));
         let mut h = Harness::new(settings, Size::new(920.0, 640.0)).unwrap();
         for (running, status) in [(false, None), (true, None), (true, Some(tiling::Status { allowed: false, windows: 0, possible: true })), (true, Some(tiling::Status { allowed: true, windows: 4, possible: true }))] {
             h.app_mut().tiler = Some((running, status));

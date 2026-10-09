@@ -150,6 +150,13 @@ impl<B: Backend> Manager<B> {
         self.config.mode == Mode::Tiling
     }
 
+    /// Has the system ask the user to let windows be moved, if they have
+    /// not. Asked for from Settings. Returns whether they have.
+    pub fn ask(&mut self) -> bool {
+        self.asked_leave = true;
+        self.backend.possible() && self.backend.allowed(true)
+    }
+
     /// How it is going, for Settings to show.
     pub fn status(&self) -> &Status {
         &self.status
@@ -493,6 +500,10 @@ pub fn run(actions: Receiver<Action>, turned: impl Fn(bool)) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+        // Settings has asked for leave to be asked for.
+        if std::fs::remove_file(neo_desktop::tiling::ask_path()).is_ok() {
+            manager.ask();
+        }
         let now = written(&Windowing::path());
         if now != read {
             read = now;
@@ -752,6 +763,15 @@ pub mod tests {
         desk.0.borrow_mut().allowed = true;
         assert!(m.tick(false));
         assert_eq!(m.status(), &Status { allowed: true, windows: 2, possible: true });
+        // Asked for from Settings, it is asked again, tiling or not; and not once it is given.
+        let (mut m, desk) = super::tests::desk(&[(1, "Notes")]);
+        m.configure(Windowing::default());
+        desk.0.borrow_mut().allowed = false;
+        assert!(!m.ask() && !m.ask());
+        assert_eq!(desk.0.borrow().asked, 2);
+        desk.0.borrow_mut().allowed = true;
+        assert!(m.ask());
+        assert_eq!(desk.0.borrow().asked, 2);
     }
 
     #[test]

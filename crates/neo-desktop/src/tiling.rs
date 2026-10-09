@@ -225,6 +225,12 @@ pub struct Status {
     pub possible: bool,
 }
 
+/// A file Settings leaves for NeoShell to find: the user has asked for it
+/// to be allowed to move windows, and NeoShell is to have the system ask.
+pub fn ask_path() -> PathBuf {
+    crate::config_dir().join("windowing.ask")
+}
+
 impl Status {
     pub fn path() -> PathBuf {
         crate::config_dir().join("windowing.status")
