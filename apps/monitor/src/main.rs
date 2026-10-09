@@ -6,6 +6,7 @@
 // Release builds on Windows open no console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod ask;
 mod detail;
 mod heat;
 mod inspect;
@@ -90,6 +91,9 @@ struct Monitor {
     sort: SortBy,
     descending: bool,
     selected: Option<Pid>,
+    /// Where a selection of several began: they are those from here to
+    /// `selected`, as the list is sorted. `None` when one is selected.
+    anchor: Option<Pid>,
     confirm_end: bool,
     status: Option<(Tone, String)>,
     /// The process whose threads are shown in place of the process list.
@@ -127,6 +131,10 @@ enum Msg {
     /// A reading from the sensor thread.
     Heat(sensors::Reading),
     Move(isize),
+    /// Move the selection's end, keeping where it began: Shift with an arrow.
+    Extend(isize),
+    /// Ask Apollo what the selected processes are.
+    AskApollo,
     End,
     ConfirmEnd,
     CancelEnd,
@@ -168,6 +176,7 @@ impl Monitor {
             sort: SortBy::Cpu,
             descending: true,
             selected: None,
+            anchor: None,
             confirm_end: false,
             status: None,
             inspect: None,
@@ -258,6 +267,24 @@ impl Monitor {
     fn selected_proc(&self) -> Option<&Proc> {
         self.selected.and_then(|pid| self.procs.iter().find(|p| p.pid == pid))
     }
+
+    /// Every process selected: the one, or those from where the selection
+    /// began to where it ends, in the order the list shows them.
+    fn chosen(&self) -> Vec<&Proc> {
+        let v = self.sorted();
+        let at = |pid: Option<Pid>| pid.and_then(|pid| v.iter().position(|p| p.pid == pid));
+        match (at(self.selected), at(self.anchor)) {
+            (Some(a), Some(b)) => v[a.min(b)..=a.max(b)].to_vec(),
+            (Some(a), None) => vec![v[a]],
+            // Filtered out of the list, it is still the one selected.
+            (None, _) => self.selected_proc().into_iter().collect(),
+        }
+    }
+
+    /// What is known of the selected processes, for asking Apollo about them.
+    fn asked_about(&self) -> Vec<ask::About> {
+        self.chosen().into_iter().map(|p| ask::About { name: p.name.clone(), pid: p.pid.as_u32(), user: p.user.clone(), program: self.sys.process(p.pid).and_then(|s| s.exe()).map(|e| e.display().to_string()), cpu: p.cpu, memory: p.memory }).collect()
+    }
 }
 
 impl App for Monitor {
@@ -344,6 +371,8 @@ impl App for Monitor {
         }
         match k.key {
             Key::Enter => self.selected.map(|_| Msg::Inspect),
+            Key::Up if k.modifiers.shift => Some(Msg::Extend(-1)),
+            Key::Down if k.modifiers.shift => Some(Msg::Extend(1)),
             Key::Up => Some(Msg::Move(-1)),
             Key::Down => Some(Msg::Move(1)),
             Key::Delete => self.selected.map(|_| Msg::End),
@@ -385,6 +414,19 @@ impl App for Monitor {
                     self.confirm_end = false;
                 }
                 self.selected = Some(pid);
+                self.anchor = None;
+            }
+            Msg::Extend(d) => {
+                // From the one selected, which stays one end of them.
+                let began = self.anchor.or(self.selected);
+                self.update(Msg::Move(d));
+                self.anchor = began.filter(|b| Some(*b) != self.selected);
+            }
+            Msg::AskApollo => {
+                let Some(question) = ask::question(&self.asked_about()) else { return };
+                // Tests must not start Apollo, or put questions to the one that is running.
+                let asked = if cfg!(test) { Ok(()) } else { neo_desktop::apollo::ask(&question) };
+                self.status = asked.err().map(|e| (Tone::Bad, format!("Apollo could not be asked: {e}")));
             }
             Msg::Move(d) => {
                 let v = self.sorted();
@@ -395,6 +437,7 @@ impl App for Monitor {
                 };
                 if let Some(p) = v.get(next) {
                     self.selected = Some(p.pid);
+                    self.anchor = None;
                     self.confirm_end = false;
                 }
             }
@@ -529,6 +572,7 @@ impl Monitor {
             header = header.push(header_cell("Energy", SortBy::Energy, Length::Fixed(80.0), Align::End));
         }
         let header = header.push(header_cell("Threads", SortBy::Threads, Length::Fixed(76.0), Align::End)).push(header_cell("PID", SortBy::Pid, Length::Fixed(70.0), Align::End));
+        let chosen: Vec<Pid> = self.chosen().iter().map(|p| p.pid).collect();
         let mut rows = column().spacing(1.0).width(Length::Fill).padding([10.0, 4.0, 10.0, 10.0]);
         for p in v.iter().take(MAX_PROCESSES) {
             let cpu = row().spacing(8.0).align(Align::Center).width(120.0).push(Space::fill_x()).push(progress_bar((p.cpu / 100.0).min(1.0)).width(44.0).height(6.0)).push(text(format!("{:.1}%", p.cpu)).mono().role(TextRole::Caption).align(Align::End).width(50.0));
@@ -546,7 +590,7 @@ impl Monitor {
                 content = content.push(text(p.energy.map_or("—".into(), power::watts)).mono().role(TextRole::Caption).tone(tone).align(Align::End).width(80.0));
             }
             let content = content.push(text(p.threads.map_or("—".into(), |n| n.to_string())).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(76.0)).push(text(p.pid.to_string()).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(70.0));
-            rows = rows.push(Button::new(content).kind(ButtonKind::Ghost).selected(self.selected == Some(p.pid)).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Select(p.pid)));
+            rows = rows.push(Button::new(content).kind(ButtonKind::Ghost).selected(chosen.contains(&p.pid)).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Select(p.pid)));
         }
         let toolbar = row()
             .spacing(10.0)
@@ -572,9 +616,10 @@ impl Monitor {
                 let mut r = row().spacing(10.0).align(Align::Center).width(Length::Fill).padding([16.0, 10.0]);
                 r = match &self.status {
                     Some((tone, msg)) => r.push(notice(*tone, msg.clone())),
-                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads or end it.".into())).role(TextRole::Caption).tone(Tone::Muted)),
+                    None if chosen.len() > 1 => r.push(text(format!("{} processes selected", chosen.len())).role(TextRole::Caption).tone(Tone::Muted)),
+                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads, end it, or ask Apollo what it is. Shift with the arrows selects several.".into())).role(TextRole::Caption).tone(Tone::Muted)),
                 };
-                r.push(Space::fill_x()).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
+                r.push(Space::fill_x()).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::SPARKLES).size(15.0)).push(text("Ask Apollo"))).on_press_maybe(selected.map(|_| Msg::AskApollo))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
             }
         };
         column().width(Length::Fill).height(Length::Fill).push(toolbar).push(Divider::horizontal()).push(header).push(scrollable(rows).height(Length::Fill)).push(Divider::horizontal()).push(footer).into()
@@ -736,4 +781,46 @@ fn snapshots(dir: std::path::PathBuf) {
     let path = dir.join("monitor-sensors.png");
     h.save_png(&path, 1.0).expect("write png");
     println!("wrote {}", path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn several_processes_are_selected_with_shift_and_asked_about_together() {
+        let mut m = Monitor::new();
+        m.update(Msg::Sort(SortBy::Pid));
+        let pids: Vec<Pid> = m.sorted().iter().map(|p| p.pid).collect();
+        assert!(pids.len() >= 4, "this computer is running something");
+        assert!(m.chosen().is_empty() && ask::question(&m.asked_about()).is_none(), "nothing is selected to begin with");
+        m.update(Msg::AskApollo);
+        m.update(Msg::Select(pids[1]));
+        assert_eq!(m.chosen().iter().map(|p| p.pid).collect::<Vec<_>>(), [pids[1]]);
+        // Shift with an arrow takes in the next, and the next; back again lets one go.
+        let shift = |key| KeyEvent { key, pressed: true, repeat: false, modifiers: neo::Modifiers { shift: true, ..Default::default() }, text: None };
+        assert!(matches!(m.on_key(&shift(Key::Down)), Some(Msg::Extend(1))) && matches!(m.on_key(&shift(Key::Up)), Some(Msg::Extend(-1))));
+        m.update(Msg::Extend(1));
+        m.update(Msg::Extend(1));
+        assert_eq!(m.chosen().iter().map(|p| p.pid).collect::<Vec<_>>(), pids[1..=3]);
+        let about = m.asked_about();
+        assert_eq!((about.len(), about[0].pid, ask::question(&about).is_some()), (3, pids[1].as_u32(), true));
+        m.update(Msg::Extend(-1));
+        assert_eq!(m.chosen().len(), 2);
+        // Above where it began, the same; back to where it began, the one.
+        m.update(Msg::Extend(-1));
+        m.update(Msg::Extend(-1));
+        assert_eq!(m.chosen().iter().map(|p| p.pid).collect::<Vec<_>>(), pids[0..=1]);
+        m.update(Msg::Extend(1));
+        assert_eq!((m.chosen().len(), m.anchor), (1, None));
+        // An arrow alone, or a click, selects one again; asking leaves no complaint.
+        m.update(Msg::Extend(1));
+        m.update(Msg::Move(1));
+        assert_eq!(m.chosen().len(), 1);
+        m.update(Msg::Extend(1));
+        m.update(Msg::Select(pids[0]));
+        assert_eq!((m.chosen().len(), m.anchor), (1, None));
+        m.update(Msg::AskApollo);
+        assert!(m.status.is_none());
+    }
 }
