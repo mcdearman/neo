@@ -107,6 +107,9 @@ struct Settings {
     levels: Option<sound::Levels>,
     /// What sound can come out of and go into.
     devices: Vec<sound::Device>,
+    /// When a level was last changed here: what the system says just after
+    /// is of a moment before, and is not to pull the slider back.
+    sound_changed: Option<std::time::Instant>,
     /// Which list of devices is open, for sound in or out, and where it hangs from.
     choosing: Option<(bool, Point)>,
     /// How this computer is connected, and Bluetooth, once each has been asked.
@@ -144,6 +147,11 @@ enum Msg {
     Volume(f32),
     Mute(bool),
     Input(f32),
+    /// Time to see whether the loudness was changed elsewhere: by the
+    /// keyboard's volume keys, or the system's own settings.
+    SoundTick,
+    /// How loud things are, just asked, and the devices there are.
+    Levels(Option<sound::Levels>, Vec<sound::Device>),
     /// Open the list of devices for sound in (true) or out, under its control.
     ChooseDevice(bool, Rect),
     CloseChoice,
@@ -169,11 +177,16 @@ const TILE: (f32, f32) = (146.0, 91.0);
 const TILES_ACROSS: usize = 4;
 const TILE_GAP: f32 = 6.0;
 
+/// How often the Sound page asks the system how loud things are, and how
+/// long after a change made here it leaves the system to catch up.
+const SOUND_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+const SOUND_SETTLES: std::time::Duration = std::time::Duration::from_millis(900);
+
 const TEXT_SCALES: [(f32, &str); 3] = [(1.0, "Default"), (1.15, "Large"), (1.3, "Larger")];
 
 impl Settings {
     fn new() -> Self {
-        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
+        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], sound_changed: None, choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
     }
 
     /// Looks up what a page shows, on coming to it: these are things that
@@ -247,6 +260,7 @@ impl Settings {
     /// Makes a change to how loud things are, and shows it at once: the
     /// system is told on a thread, as it takes a moment to answer.
     fn change_sound(&mut self, change: sound::Change) {
+        self.sound_changed = Some(std::time::Instant::now());
         if let Some(levels) = &mut self.levels {
             match change {
                 sound::Change::Output(level) => (levels.output, levels.muted) = (level, levels.muted && level <= 0.0),
@@ -300,7 +314,12 @@ impl App for Settings {
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
-        vec![Desktop::subscription(Msg::Poll)]
+        let mut subs = vec![Desktop::subscription(Msg::Poll)];
+        // While the Sound page shows, it follows the volume keys and devices coming and going.
+        if self.page == Page::Sound {
+            subs.push(Subscription::every(SOUND_EVERY, Msg::SoundTick));
+        }
+        subs
     }
 
     fn update(&mut self, m: Msg) {
@@ -333,10 +352,25 @@ impl App for Settings {
             Msg::Volume(level) => self.change_sound(sound::Change::Output(level)),
             Msg::Mute(muted) => self.change_sound(sound::Change::Muted(muted)),
             Msg::Input(level) => self.change_sound(sound::Change::Input(level)),
+            Msg::SoundTick => {
+                // Asked off the main thread, as it takes a moment to answer.
+                if let Some(proxy) = self.proxy.clone() {
+                    std::thread::spawn(move || {
+                        proxy.send(Msg::Levels(sound::read(), sound::devices()));
+                    });
+                }
+            }
+            Msg::Levels(levels, devices) => {
+                // Not over a change just made here, which it may not have caught up with.
+                if self.page == Page::Sound && self.sound_changed.is_none_or(|t| t.elapsed() >= SOUND_SETTLES) {
+                    (self.levels, self.devices) = (levels, devices);
+                }
+            }
             Msg::ChooseDevice(input, under) => self.choosing = Some((input, Point::new(under.x, under.bottom() + 4.0))),
             Msg::CloseChoice => self.choosing = None,
             Msg::PickDevice(id, input) => {
                 self.choosing = None;
+                self.sound_changed = Some(std::time::Instant::now());
                 // Tests must not change what this computer plays through.
                 if cfg!(test) || sound::set_default(id, input) {
                     for d in &mut self.devices {
@@ -805,6 +839,26 @@ mod tests {
         settings.levels = None;
         settings.update(Msg::Volume(0.7));
         assert_eq!(settings.levels, None);
+
+        // Changed elsewhere, by the volume keys say, the page follows; but what the system says
+        // just after a change made here does not pull the slider back.
+        settings.levels = Some(sound::Levels { output: 0.4, muted: false, input: Some(0.5) });
+        settings.update(Msg::Page(Page::Sound));
+        settings.sound_changed = None;
+        assert_eq!(settings.subscriptions().len(), 2, "the page asks again and again while it shows");
+        settings.update(Msg::Levels(Some(sound::Levels { output: 0.7, muted: false, input: Some(0.5) }), vec![]));
+        assert_eq!(settings.levels.map(|l| l.output), Some(0.7));
+        settings.update(Msg::Volume(0.2));
+        settings.update(Msg::Levels(Some(sound::Levels { output: 0.7, muted: false, input: Some(0.5) }), vec![]));
+        assert_eq!(settings.levels.map(|l| l.output), Some(0.2), "a stale answer just after the slider moved");
+        settings.sound_changed = std::time::Instant::now().checked_sub(SOUND_SETTLES);
+        settings.update(Msg::Levels(Some(sound::Levels { output: 0.25, muted: true, input: None }), vec![]));
+        assert_eq!(settings.levels, Some(sound::Levels { output: 0.25, muted: true, input: None }));
+        // Away from the page nothing is asked, and an answer that comes late is not taken.
+        settings.update(Msg::Page(Page::About));
+        assert_eq!(settings.subscriptions().len(), 1);
+        settings.update(Msg::Levels(None, vec![]));
+        assert!(settings.levels.is_some());
 
         // The devices sound goes through: the list opens under its control, and one picked is the one in use.
         let device = |id, name: &str, input: bool, default: bool| sound::Device { id, name: name.into(), input, output: !input, default_input: input && default, default_output: !input && default };
