@@ -16,6 +16,7 @@
 //! window manager places windows, and this does nothing.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -102,11 +103,47 @@ pub struct Manager<B> {
     /// Leave has been asked for since tiling was turned on, so as not to ask over and over.
     asked_leave: bool,
     status: Status,
+    /// Where each window was before it was tiled, with its process, to
+    /// put it back when tiling is turned off; and the file that is kept
+    /// in, so that it is still known after NeoShell is started again.
+    before: HashMap<u32, (i32, Rect)>,
+    kept: Option<PathBuf>,
 }
 
 impl<B: Backend> Manager<B> {
     pub fn new(backend: B, config: Windowing) -> Self {
-        Self { backend, config, order: vec![], floating: vec![], asked: HashMap::new(), rested: HashMap::new(), seen: vec![], asked_leave: false, status: Status::default() }
+        Self { backend, config, order: vec![], floating: vec![], asked: HashMap::new(), rested: HashMap::new(), seen: vec![], asked_leave: false, status: Status::default(), before: HashMap::new(), kept: None }
+    }
+
+    /// Keeps where windows were before tiling in a file, and takes up
+    /// what an earlier run left there.
+    pub fn keeping(mut self, path: PathBuf) -> Self {
+        self.before = std::fs::read_to_string(&path).map(|text| parse_windows(&text).into_iter().map(|w| (w.id, (w.pid, w.frame))).collect()).unwrap_or_default();
+        self.kept = Some(path);
+        self
+    }
+
+    fn keep(&self) {
+        let Some(path) = &self.kept else { return };
+        if self.before.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        // As the system's own lines of windows are written, less the name.
+        let lines: String = self.before.iter().map(|(id, (pid, r))| format!("{id}\t{pid}\t{}\t{}\t{}\t{}\t\n", r.x, r.y, r.w, r.h)).collect();
+        let _ = std::fs::write(path, lines);
+    }
+
+    /// Puts the windows back where they were before they were tiled:
+    /// those that are still there, on the screen now. Then it is forgotten.
+    fn put_back(&mut self) {
+        for w in self.backend.windows() {
+            if let Some((_, was)) = self.before.get(&w.id).filter(|(pid, was)| *pid == w.pid && !near(*was, w.frame)) {
+                self.backend.place(&w, *was);
+            }
+        }
+        self.before.clear();
+        self.keep();
     }
 
     pub fn tiling(&self) -> bool {
@@ -131,7 +168,6 @@ impl<B: Backend> Manager<B> {
             self.floating.clear();
         }
         if !self.tiling() {
-            // Left as they are: floating is not putting anything back.
             self.forget();
         }
         self.tick(true);
@@ -167,7 +203,14 @@ impl<B: Backend> Manager<B> {
     pub fn tick(&mut self, all: bool) -> bool {
         let possible = self.backend.possible();
         if !self.tiling() || !possible {
-            self.status = Status { allowed: possible && self.backend.allowed(false), windows: 0, possible };
+            let allowed = possible && self.backend.allowed(false);
+            self.status = Status { allowed, windows: 0, possible };
+            // Tiling has been turned off, now or while this was not running:
+            // the windows go back where they were.
+            if allowed && !self.tiling() && !self.before.is_empty() {
+                self.put_back();
+                return true;
+            }
             return false;
         }
         // Asked for once when tiling is turned on; after that it is the user's to give.
@@ -189,6 +232,17 @@ impl<B: Backend> Manager<B> {
         self.order.retain(|id| tiled.contains(id));
         self.floating.retain(|id| windows.iter().any(|w| w.id == *id));
         let fresh: Vec<u32> = windows.iter().filter(|w| self.tiled(w) && !self.order.contains(&w.id)).map(|w| w.id).collect();
+        // Where each was before it is moved, to be put back there. One seen
+        // before is one coming back from another desktop, and keeps what it had.
+        let known = self.before.len();
+        for w in windows.iter().filter(|w| fresh.contains(&w.id)) {
+            if self.before.get(&w.id).is_none_or(|(pid, _)| *pid != w.pid) {
+                self.before.insert(w.id, (w.pid, w.frame));
+            }
+        }
+        if self.before.len() != known {
+            self.keep();
+        }
         match self.config.new_window {
             // The frontmost of several ends up first.
             NewWindow::Master => fresh.iter().rev().for_each(|id| self.order.insert(0, *id)),
@@ -282,7 +336,14 @@ impl<B: Backend> Manager<B> {
                 if let Some(id) = focused {
                     match self.floating.iter().position(|f| *f == id) {
                         Some(i) => drop(self.floating.remove(i)),
-                        None => self.floating.push(id),
+                        None => {
+                            self.floating.push(id);
+                            // Let out, it goes back where it was, and is the user's to place from there.
+                            if let (Some((_, was)), Some(w)) = (self.before.remove(&id), self.seen.iter().find(|w| w.id == id)) {
+                                self.backend.place(w, was);
+                                self.keep();
+                            }
+                        }
                     }
                     self.tick(true);
                 }
@@ -417,7 +478,7 @@ fn written(path: &std::path::Path) -> Option<std::time::SystemTime> {
 /// settings are read again whenever Settings writes them, `actions` are
 /// what the keys ask for, and `turned` is told when tiling goes on or off.
 pub fn run(actions: Receiver<Action>, turned: impl Fn(bool)) {
-    let mut manager = Manager::new(System, Windowing::load());
+    let mut manager = Manager::new(System, Windowing::load()).keeping(neo_desktop::config_dir().join("windowing.before"));
     let mut read = written(&Windowing::path());
     let (mut said, mut on): (Option<Status>, Option<bool>) = (None, None);
     loop {
@@ -610,14 +671,13 @@ pub mod tests {
         m.configure(Windowing::default());
         assert!(!m.tick(false) && !m.tick(true));
         assert_eq!((desk.0.borrow().moves, desk.frame(1)), (0, Rect::new(300.0, 200.0, 600.0, 400.0)), "nothing is moved until tiling is asked for");
-        // Turned on, they are laid out; turned off again, they stay as they are.
+        // Turned on, they are laid out; and with it off, one that opens is left alone.
         m.configure(tiling());
-        let tiled = desk.frame(1);
-        assert_ne!(tiled, Rect::new(300.0, 200.0, 600.0, 400.0));
+        assert_ne!(desk.frame(1), Rect::new(300.0, 200.0, 600.0, 400.0));
         m.configure(Windowing::default());
         desk.open(3, "Files");
         m.tick(false);
-        assert_eq!((desk.frame(1), desk.frame(3)), (tiled, Rect::new(300.0, 200.0, 600.0, 400.0)));
+        assert_eq!(desk.frame(3), Rect::new(300.0, 200.0, 600.0, 400.0));
         // An app set to float is left out, and so is a window let out by hand.
         m.configure(Windowing { floating: vec!["files".into()], ..tiling() });
         assert_eq!((m.order(), desk.frame(3)), (&[2, 1][..], Rect::new(300.0, 200.0, 600.0, 400.0)));
@@ -626,6 +686,60 @@ pub mod tests {
         assert_eq!((m.order(), desk.frame(1)), (&[1][..], tiling().arrange(1, SCREEN)[0]), "the one left has the screen");
         m.act(Action::ToggleFloat);
         assert_eq!(m.order(), [1, 2], "put back, it joins as a new window does");
+    }
+
+    #[test]
+    fn turning_tiling_off_puts_windows_back_where_they_were() {
+        let (mut m, desk) = desk(&[(1, "Notes"), (2, "Safari"), (3, "NeoTerm")]);
+        let were = [Rect::new(40.0, 60.0, 500.0, 300.0), Rect::new(700.0, 90.0, 640.0, 480.0), Rect::new(200.0, 400.0, 800.0, 450.0)];
+        for (id, at) in [1, 2, 3].into_iter().zip(were) {
+            desk.drag(id, at);
+        }
+        let file = std::env::temp_dir().join(format!("neo-shell-before-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        m = m.keeping(file.clone());
+        m.tick(false);
+        assert!(file.exists() && [1, 2, 3].into_iter().zip(were).all(|(id, at)| desk.frame(id) != at), "tiled, and where they were is kept");
+        // One opened while tiling goes back to where it opened; one closed is done without.
+        desk.open(4, "Files");
+        m.tick(false);
+        desk.close(2);
+        m.act(Action::NextLayout);
+        m.configure(Windowing::default());
+        assert_eq!((desk.frame(1), desk.frame(3), desk.frame(4)), (were[0], were[2], Rect::new(300.0, 200.0, 600.0, 400.0)));
+        assert!(!file.exists(), "and then it is forgotten");
+        // Moved about while floating, they stay where they are put; tiling again starts from there.
+        desk.drag(1, Rect::new(10.0, 40.0, 300.0, 300.0));
+        assert!(!m.tick(false));
+        m.configure(tiling());
+        m.configure(Windowing::default());
+        assert_eq!(desk.frame(1), Rect::new(10.0, 40.0, 300.0, 300.0));
+
+        // NeoShell started again while tiling still knows where they were,
+        // and one started after tiling was turned off puts them back.
+        m.configure(tiling());
+        let again = Manager::new(desk.clone(), tiling()).keeping(file.clone());
+        drop(again);
+        let mut later = Manager::new(desk.clone(), Windowing::default()).keeping(file.clone());
+        assert!(later.tick(false));
+        assert_eq!((desk.frame(1), desk.frame(3), file.exists()), (Rect::new(10.0, 40.0, 300.0, 300.0), were[2], false));
+        // A window let out by hand goes back at once, and is not moved again later.
+        let mut m = Manager::new(desk.clone(), tiling()).keeping(file.clone());
+        m.tick(false);
+        desk.0.borrow_mut().focused = Some(3);
+        m.act(Action::ToggleFloat);
+        assert_eq!(desk.frame(3), were[2]);
+        desk.drag(3, Rect::new(900.0, 500.0, 400.0, 300.0));
+        m.configure(Windowing::default());
+        assert_eq!((desk.frame(3), desk.frame(1)), (Rect::new(900.0, 500.0, 400.0, 300.0), Rect::new(10.0, 40.0, 300.0, 300.0)));
+        // Without leave nothing can be put back, and it is kept until there is.
+        m.configure(tiling());
+        desk.0.borrow_mut().allowed = false;
+        let moves = desk.0.borrow().moves;
+        m.configure(Windowing::default());
+        assert_eq!((desk.0.borrow().moves, file.exists()), (moves, true));
+        desk.0.borrow_mut().allowed = true;
+        assert!(m.tick(false) && !file.exists());
     }
 
     #[test]

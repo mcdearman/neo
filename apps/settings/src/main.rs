@@ -920,7 +920,7 @@ impl Settings {
         let w = &self.windowing;
         let tiling = w.mode == Mode::Tiling;
         let wide = |control: Slider<Msg>| container(control).width(220.0);
-        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Windows are", if tiling { "Tiled: laid out to share the screen, and laid out again as they open and close." } else { "Floating: each stays where you put it." }, segmented(["Floating", "Tiling"], Some(usize::from(tiling)), |i| Msg::WindowMode(if i == 1 { Mode::Tiling } else { Mode::Floating })))]));
+        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Windows are", if tiling { "Tiled: laid out to share the screen, and laid out again as they open and close." } else { "Floating: each stays where you put it. Coming back from tiling, they return to where they were." }, segmented(["Floating", "Tiling"], Some(usize::from(tiling)), |i| Msg::WindowMode(if i == 1 { Mode::Tiling } else { Mode::Floating })))]));
         if !tiling {
             return page.push(text("Tiling arranges the windows of every app so that none covers another, the way a tiling window manager does. Turn it on to choose a layout.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into();
         }
