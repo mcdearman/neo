@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use neo::prelude::*;
 use neo::{Image, Point, Proxy, Rect, Size};
 use neo_desktop::fs::human_bytes_binary;
+use neo_desktop::pointing::{self, Scrolling};
 use neo_desktop::tiling::{self, Layout, Mode, NewWindow, Windowing};
 use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Appearance, Desktop, SchemePref};
@@ -37,6 +38,8 @@ enum Page {
     Sound,
     Network,
     Bluetooth,
+    Trackpad,
+    Mouse,
     Notifications,
     Startup,
     Shortcuts,
@@ -45,7 +48,7 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 10] = [Page::Appearance, Page::Windows, Page::Sound, Page::Network, Page::Bluetooth, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
+    const ALL: [Page; 12] = [Page::Appearance, Page::Windows, Page::Sound, Page::Network, Page::Bluetooth, Page::Trackpad, Page::Mouse, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
 
     fn name(self) -> &'static str {
         match self {
@@ -54,6 +57,8 @@ impl Page {
             Page::Sound => "Sound",
             Page::Network => "Network",
             Page::Bluetooth => "Bluetooth",
+            Page::Trackpad => "Trackpad",
+            Page::Mouse => "Mouse",
             Page::Notifications => "Notifications",
             Page::Startup => "Startup",
             Page::Shortcuts => "Shortcuts",
@@ -69,6 +74,8 @@ impl Page {
             Page::Sound => icons::VOLUME_2,
             Page::Network => icons::WIFI,
             Page::Bluetooth => icons::BLUETOOTH,
+            Page::Trackpad => icons::TOUCHPAD,
+            Page::Mouse => icons::MOUSE,
             Page::Notifications => icons::BELL,
             Page::Startup => icons::ROCKET,
             Page::Shortcuts => icons::KEYBOARD,
@@ -155,6 +162,12 @@ struct Settings {
     /// When the layout was last changed here: what was read from the file
     /// a moment before is not to undo it.
     windows_changed: Option<std::time::Instant>,
+    /// Which way the trackpad and the mouse scroll; whether there is a
+    /// trackpad to have a page for; and what NeoShell says of seeing to it:
+    /// whether it is running, and how it is going.
+    scrolling: Scrolling,
+    has_trackpad: bool,
+    scroller: Option<(bool, Option<pointing::Status>)>,
     /// Whether the Windows page follows what NeoShell is doing. Not in a
     /// picture of the page, which is of what it was given to show.
     follows: bool,
@@ -240,6 +253,12 @@ enum Msg {
     AllowControl,
     /// Open `neo.toml`, to change settings by hand.
     OpenSettingsFile,
+    /// Whether the trackpad, or the mouse, moves what is on screen the way the fingers go.
+    TrackpadReversed(bool),
+    MouseReversed(bool),
+    /// Time to see how NeoShell is getting on with the scrolling, and what it found.
+    ScrollTick,
+    Scroller(bool, Option<pointing::Status>, Scrolling),
 }
 
 /// How large a picture is shown to choose it by, how many go across, and
@@ -285,6 +304,10 @@ impl Settings {
             sample_windows: 3,
             float_name: String::new(),
             windows_changed: None,
+            scrolling: Scrolling::load(),
+            // In tests there is one, whatever this computer has.
+            has_trackpad: cfg!(test) || pointing::has_trackpad(),
+            scroller: None,
             follows: !cfg!(test),
         }
     }
@@ -321,6 +344,12 @@ impl Settings {
             Page::Notifications => self.tried = None,
             // Whether NeoShell may move windows, which is asked for here.
             Page::Accessibility => self.update(Msg::WindowTick),
+            Page::Trackpad | Page::Mouse => {
+                if self.follows {
+                    self.scrolling = Scrolling::load();
+                }
+                self.update(Msg::ScrollTick);
+            }
             Page::Windows => {
                 if self.follows {
                     self.windowing = Windowing::load();
@@ -397,6 +426,19 @@ impl Settings {
         self.change(|a| a.accent = Accent::from_color(c));
     }
 
+    /// Changes which way the trackpad or the mouse scrolls, and keeps it:
+    /// NeoShell follows, or the desktop's own settings are set.
+    fn scroll(&mut self, f: impl FnOnce(&mut Scrolling)) {
+        f(&mut self.scrolling);
+        self.windows_changed = Some(std::time::Instant::now());
+        self.error = self.scrolling.save().err().map(|e| format!("Could not save {}: {e}", Appearance::path().display()));
+        // What NeoShell said before is of how things were.
+        self.scroller = None;
+        if !cfg!(test) {
+            pointing::apply(self.scrolling);
+        }
+    }
+
     /// Changes how windows are laid out, and keeps it: NeoShell follows.
     fn arrange(&mut self, f: impl FnOnce(&mut Windowing)) {
         f(&mut self.windowing);
@@ -443,6 +485,9 @@ impl App for Settings {
             subs.push(Subscription::every(SOUND_EVERY, Msg::SoundTick));
         }
         // And the Windows page what NeoShell is doing, and what the tiling's keys change.
+        if matches!(self.page, Page::Trackpad | Page::Mouse) {
+            subs.push(Subscription::every(WINDOWS_EVERY, Msg::ScrollTick));
+        }
         if matches!(self.page, Page::Windows | Page::Accessibility) {
             subs.push(Subscription::every(WINDOWS_EVERY, Msg::WindowTick));
         }
@@ -609,6 +654,24 @@ impl App for Settings {
                     }
                 }
             }
+            Msg::TrackpadReversed(on) => self.scroll(|s| s.trackpad_reversed = on),
+            Msg::MouseReversed(on) => self.scroll(|s| s.mouse_reversed = on),
+            Msg::ScrollTick => {
+                if let Some(proxy) = self.proxy.clone().filter(|_| self.follows) {
+                    std::thread::spawn(move || {
+                        proxy.send(Msg::Scroller(neo_desktop::notify::shell_running(), pointing::Status::load(), Scrolling::load()));
+                    });
+                }
+            }
+            Msg::Scroller(running, status, kept) => {
+                if matches!(self.page, Page::Trackpad | Page::Mouse) {
+                    self.scroller = Some((running, status));
+                    // Changed in the file by hand, it shows here; but not over a change just made here.
+                    if self.windows_changed.is_none_or(|t| t.elapsed() >= SOUND_SETTLES) {
+                        self.scrolling = kept;
+                    }
+                }
+            }
             Msg::OpenSettingsFile => {
                 // Written first if it never has been, so that there is something to open.
                 self.change(|_| {});
@@ -710,7 +773,8 @@ impl Settings {
     /// The window's content, which the settings panel goes over.
     fn content(&self) -> Element<Msg> {
         let mut side = column().spacing(2.0).width(Length::Fill).push(section("Settings"));
-        for p in Page::ALL {
+        // A page for the trackpad only where there is one.
+        for p in Page::ALL.into_iter().filter(|p| *p != Page::Trackpad || self.has_trackpad) {
             side = side.push(nav_item(p.icon(), p.name(), p == self.page, Msg::Page(p)));
         }
         let body = match self.page {
@@ -719,6 +783,8 @@ impl Settings {
             Page::Sound => self.sound_page(),
             Page::Network => self.network_page(),
             Page::Bluetooth => self.bluetooth_page(),
+            Page::Trackpad => self.pointing_page(true),
+            Page::Mouse => self.pointing_page(false),
             Page::Notifications => self.notifications(),
             Page::Startup => self.startup_page(),
             Page::Shortcuts => self.shortcuts(),
@@ -1038,6 +1104,36 @@ impl Settings {
             .into()
     }
 
+    /// The trackpad's page, or the mouse's: which way it scrolls.
+    fn pointing_page(&self, trackpad: bool) -> Element<Msg> {
+        let reversed = if trackpad { self.scrolling.trackpad_reversed } else { self.scrolling.mouse_reversed };
+        let help = match (trackpad, reversed) {
+            (true, true) => "What is on screen moves the way your fingers do, as paper under them would.",
+            (true, false) => "Moving your fingers down brings up what is further down, as a scroll bar does.",
+            (false, true) => "What is on screen moves the way the wheel turns, as on a trackpad.",
+            (false, false) => "Turning the wheel towards you brings up what is further down.",
+        };
+        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Reverse scrolling", help, toggle(reversed, if trackpad { Msg::TrackpadReversed } else { Msg::MouseReversed }))]));
+        // On a Mac the system has one setting for both, and NeoShell makes the difference.
+        if cfg!(target_os = "macos") {
+            let line = |tone: Tone, said: &str, button_for: Option<(&str, Msg)>| -> Element<Msg> {
+                let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(container(notice(tone, said)).width(Length::Fill));
+                if let Some((label, m)) = button_for {
+                    line = line.push(button(label).on_press(m));
+                }
+                line.into()
+            };
+            match &self.scroller {
+                Some((false, _)) => page = page.push(line(Tone::Warn, "NeoShell sees to this, and it is not running.", Some(("Start NeoShell", Msg::StartShell)))),
+                Some((true, Some(status))) if status.needed && !status.working => page = page.push(line(Tone::Warn, "NeoShell needs your leave to control the computer before it can turn scrolling round.", Some(("Allow in Accessibility", Msg::Page(Page::Accessibility))))),
+                _ => {}
+            }
+        }
+        let other = if trackpad { "The mouse has a setting of its own, under Mouse." } else if self.has_trackpad { "The trackpad has a setting of its own, under Trackpad." } else { "" };
+        let how = if cfg!(target_os = "macos") { "macOS scrolls the trackpad and the mouse the same way, whichever its own settings say; where the two are to differ here, NeoShell turns one of them round, in every app." } else { "On a GNOME desktop this sets the desktop's own setting. Other desktops have theirs in their own settings." };
+        page.push(text(format!("{other} {how}").trim().to_owned()).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into()
+    }
+
     fn notifications(&self) -> Element<Msg> {
         let a = &self.desktop.appearance;
         let mut col = column()
@@ -1228,7 +1324,35 @@ mod tests {
             h.render(1.0);
         }
         let mut settings = std::mem::replace(h.app_mut(), Settings::new());
-        assert_eq!(Page::ALL.len(), 10);
+        assert_eq!(Page::ALL.len(), 12);
+
+        // The trackpad and the mouse: the one follows the fingers and the other does not, until set otherwise.
+        settings.update(Msg::Page(Page::Trackpad));
+        assert_eq!((settings.scrolling, settings.subscriptions().len()), (Scrolling { trackpad_reversed: true, mouse_reversed: false }, 2));
+        settings.update(Msg::TrackpadReversed(false));
+        settings.update(Msg::Page(Page::Mouse));
+        settings.update(Msg::MouseReversed(true));
+        let set = Scrolling { trackpad_reversed: false, mouse_reversed: true };
+        assert_eq!((settings.scrolling, Scrolling::load(), settings.error.clone()), (set, set, None), "kept as it is changed");
+        // What NeoShell says of it is shown, and a change made in the file by hand.
+        settings.update(Msg::Scroller(true, Some(pointing::Status { needed: true, working: false }), Scrolling::default()));
+        assert_eq!(settings.scrolling, set, "but not over a change just made here");
+        settings.windows_changed = None;
+        settings.update(Msg::Scroller(true, Some(pointing::Status { needed: true, working: false }), Scrolling::default()));
+        assert_eq!((settings.scrolling, settings.scroller.map(|s| s.0)), (Scrolling::default(), Some(true)));
+        settings.update(Msg::MouseReversed(false));
+        settings.windows_changed = None;
+        // With no trackpad there is no page for one.
+        let mut h = Harness::new(settings, Size::new(920.0, 640.0)).unwrap();
+        for (trackpad, scroller) in [(true, None), (false, Some((false, None))), (true, Some((true, Some(pointing::Status { needed: true, working: false })))), (true, Some((true, Some(pointing::Status { needed: true, working: true }))))] {
+            (h.app_mut().has_trackpad, h.app_mut().scroller) = (trackpad, scroller);
+            for page in [Page::Trackpad, Page::Mouse] {
+                h.app_mut().page = page;
+                h.render(1.0);
+            }
+        }
+        let mut settings = std::mem::replace(h.app_mut(), Settings::new());
+        settings.has_trackpad = true;
 
         // Windows: floating until tiling is asked for, and what is set is kept for NeoShell to follow.
         settings.update(Msg::Page(Page::Windows));

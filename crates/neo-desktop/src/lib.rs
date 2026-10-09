@@ -32,6 +32,7 @@ pub mod autostart;
 pub mod config;
 pub mod fs;
 pub mod notify;
+pub mod pointing;
 mod prefs;
 pub mod tiling;
 pub mod ui;

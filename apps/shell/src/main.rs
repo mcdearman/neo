@@ -22,6 +22,7 @@ use neo_desktop::Desktop;
 use neo_desktop::notify::{Inbox, Notification};
 
 mod reminders;
+mod scroll;
 mod windows;
 use reminders::{Later, Reminder};
 
@@ -370,9 +371,10 @@ impl App for Shell {
                 }
             }
         });
-        // Tests must not move this computer's windows about.
+        // Tests must not move this computer's windows about, or turn its scrolling round.
         if !cfg!(test) {
             self.start_tiling();
+            std::thread::spawn(scroll::run);
         }
     }
 
