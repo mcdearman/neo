@@ -96,11 +96,16 @@ pub enum Entry<Id, M> {
     Ask(Asking<M>),
 }
 
-fn said<M: 'static>(s: &Said) -> Element<M> {
+/// One thing said. What whoever answers says is read as Markdown, since
+/// that is what such things write; `on_link` hears of a link in it clicked.
+fn said<M: 'static>(s: &Said, on_link: Option<std::rc::Rc<dyn Fn(String) -> M>>) -> Element<M> {
     match s.who {
         // What one wrote oneself, set apart to the right as on a page of letters.
         Speaker::You => column().width(Length::Fill).align(Align::End).push(container(text(s.text.clone()).width(Length::Fill)).surface(Surface::Well).padding([12.0, 9.0]).max_width(560.0)).into(),
-        Speaker::Them => text(s.text.clone()).width(Length::Fill).into(),
+        Speaker::Them => match on_link {
+            Some(f) => super::markdown(&s.text).on_link(move |to| f(to)).into(),
+            None => super::markdown(&s.text).into(),
+        },
         Speaker::Note => text(s.text.clone()).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill).into(),
     }
 }
@@ -111,7 +116,7 @@ fn said<M: 'static>(s: &Said) -> Element<M> {
 pub fn transcript<M: 'static>(all: &[Said]) -> Element<M> {
     let mut entries = column().spacing(14.0).width(Length::Fill).padding([14.0, 14.0]);
     for s in all {
-        entries = entries.push(said(s));
+        entries = entries.push(said(s, None));
     }
     scrollable(entries).follow_end(true).into()
 }
@@ -122,12 +127,22 @@ pub fn transcript<M: 'static>(all: &[Said]) -> Element<M> {
 /// tool's row is to be opened (true) or shut; which are open is the
 /// app's to keep, in each [`ToolRow`].
 pub fn conversation<Id: Clone + 'static, M: Clone + 'static>(entries: &[Entry<Id, M>], on_toggle: impl Fn(Id, bool) -> M + Clone + 'static) -> Element<M> {
+    converse(entries, on_toggle, None)
+}
+
+/// As [`conversation`], and told the address of a link clicked in what
+/// whoever answers has said. What following it means is the app's to say.
+pub fn conversation_linked<Id: Clone + 'static, M: Clone + 'static>(entries: &[Entry<Id, M>], on_toggle: impl Fn(Id, bool) -> M + Clone + 'static, on_link: impl Fn(String) -> M + 'static) -> Element<M> {
+    converse(entries, on_toggle, Some(std::rc::Rc::new(on_link)))
+}
+
+fn converse<Id: Clone + 'static, M: Clone + 'static>(entries: &[Entry<Id, M>], on_toggle: impl Fn(Id, bool) -> M + Clone + 'static, on_link: Option<std::rc::Rc<dyn Fn(String) -> M>>) -> Element<M> {
     use super::{button, icon, mouse_area, picture, row, Button, ButtonKind, Fit};
     use neo_theme::icons;
     let mut all = column().spacing(14.0).width(Length::Fill).padding([14.0, 14.0]);
     for entry in entries {
         let shown: Element<M> = match entry {
-            Entry::Said(s) => said(s),
+            Entry::Said(s) => said(s, on_link.clone()),
             Entry::Tool(t) => {
                 let (mark, tone) = match t.state {
                     ToolState::Running => (icons::LOADER, Tone::Muted),
