@@ -17,6 +17,7 @@ mod text;
 mod text_editor;
 mod text_input;
 mod toggle;
+mod tree;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
@@ -24,6 +25,7 @@ pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, Ex
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use dock::{dock, Dock, DockView, Side};
+pub use tree::{tree, Place, Tree, TreeEdit, TreeNode};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};
 pub use icon::{icon, Icon};
 pub use menu::{popup_menu, MenuItem, PopupMenu};
@@ -61,3 +63,9 @@ macro_rules! into_element_generic {
 
 into_element!(Text, Icon, Divider, ProgressBar, Gauge, Sparkline);
 into_element_generic!(PopupMenu, Button, Container, DockView, Scrollable, Segmented, Slider, TextEditor, TextInput, Toggle, Checkbox);
+
+impl<Id: Clone + PartialEq + 'static, M: Clone + 'static> From<Tree<Id, M>> for Element<M> {
+    fn from(w: Tree<Id, M>) -> Self {
+        Element::new(w)
+    }
+}
