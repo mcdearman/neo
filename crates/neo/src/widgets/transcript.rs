@@ -5,12 +5,11 @@
 //! assistant, an agent at work. What has been said is a list the app
 //! keeps and adds to; the last of it can grow as it arrives.
 
-use armature::document::{Action, Document};
+use armature::document::{Action, Document, Pos};
 use armature_render::{Point, Size, TextLayout};
 use neo_theme::{Surface, TextRole};
 
 use super::style::Tone;
-use super::text_editor::text_editor;
 use super::{column, container, scrollable, text};
 use crate::ThemeCx;
 use crate::core::{Align, Cx, DrawCx, Element, EventCx, Length, Limits, Widget};
@@ -191,31 +190,45 @@ fn converse<Id: Clone + 'static, M: Clone + 'static>(entries: &[Entry<Id, M>], o
     scrollable(all).follow_end(true).into()
 }
 
-/// The size of the writing in a prompt, the room round it, and how tall
-/// one line of it is to the size.
-const WRITING: f32 = 14.0;
-const PAD: (f32, f32) = (14.0, 10.0);
-const LINE: f32 = 1.6;
+/// The room round the writing in a prompt.
+const PAD: (f32, f32) = (12.0, 9.0);
+
+#[derive(Default)]
+struct PromptState {
+    /// How far down what is written has been scrolled, to keep the caret in sight.
+    scroll: f32,
+    dragging: bool,
+    /// When it was last clicked, for telling a second click from a first.
+    clicked: Option<std::time::Instant>,
+}
 
 /// A place to write the next thing to say: see [`prompt`].
 pub struct Prompt<M> {
-    editor: [Element<M>; 1],
+    lines: Vec<String>,
+    cursor: Pos,
+    selection: Option<(Pos, Pos)>,
+    on_edit: Box<dyn Fn(Action) -> M>,
     on_submit: Option<M>,
     placeholder: String,
-    hint: Option<TextLayout>,
-    lines: usize,
     most: usize,
-    empty: bool,
+    /// Each line of what is written, wrapped to the width, and where it starts.
+    laid: Vec<(TextLayout, f32)>,
+    hint: Option<TextLayout>,
+    line_h: f32,
 }
 
-/// A few lines to write in, growing with what is written up to a height
-/// and scrolling after. Enter sends it; Shift with Enter starts a new
-/// line. The writing is a `Document` the app keeps: `on_edit` is told
-/// each change to make to it with `Document::apply`, and after sending
-/// the app starts a new one.
+/// A few lines to write in, as prose: wrapped to the width, growing with
+/// what is written up to a height and scrolling after. Enter sends it;
+/// Shift with Enter starts a new line. The writing is a `Document` the
+/// app keeps: `on_edit` is told each change to make to it with
+/// `Document::apply`, and after sending the app starts a new one.
 pub fn prompt<M: Clone + 'static>(doc: &Document, on_edit: impl Fn(Action) -> M + 'static) -> Prompt<M> {
-    let empty = doc.lines().iter().all(String::is_empty);
-    Prompt { editor: [text_editor(doc).gutter(false).font_size(WRITING).on_action(on_edit).width(Length::Fill).into()], on_submit: None, placeholder: String::new(), hint: None, lines: doc.line_count().max(1), most: 8, empty }
+    Prompt { lines: doc.lines().to_vec(), cursor: doc.cursor(), selection: doc.selection(), on_edit: Box::new(on_edit), on_submit: None, placeholder: String::new(), most: 8, laid: vec![], hint: None, line_h: 20.0 }
+}
+
+/// The byte a character of a line begins at.
+fn byte_of(line: &str, col: usize) -> usize {
+    line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
 }
 
 impl<M> Prompt<M> {
@@ -236,6 +249,45 @@ impl<M> Prompt<M> {
         self.most = most.max(1);
         self
     }
+
+    fn empty(&self) -> bool {
+        self.lines.iter().all(String::is_empty)
+    }
+
+    /// Where a place in the writing is, from the top left of all of it.
+    fn point_of(&self, pos: Pos) -> Point {
+        let Some((layout, top)) = self.laid.get(pos.line) else { return Point::ZERO };
+        let at = layout.caret(byte_of(&self.lines[pos.line], pos.col));
+        Point::new(at.x, top + at.y)
+    }
+
+    /// The place in the writing nearest a point, measured the same way.
+    fn pos_at(&self, p: Point) -> Pos {
+        let line = self.laid.iter().rposition(|(_, top)| p.y >= *top).unwrap_or(0);
+        let Some((layout, top)) = self.laid.get(line) else { return Pos::new(0, 0) };
+        let byte = layout.hit(Point::new(p.x.max(0.0), (p.y - top).clamp(0.0, (layout.size().h - 1.0).max(0.0))));
+        let text = &self.lines[line];
+        Pos::new(line, text[..byte.min(text.len())].chars().count())
+    }
+
+    fn written_height(&self) -> f32 {
+        self.laid.last().map_or(self.line_h, |(l, top)| top + l.size().h)
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let mut out = String::new();
+        for line in a.line..=b.line.min(self.lines.len().saturating_sub(1)) {
+            let text = &self.lines[line];
+            let from = if line == a.line { byte_of(text, a.col) } else { 0 };
+            let to = if line == b.line { byte_of(text, b.col) } else { text.len() };
+            out.push_str(&text[from.min(to)..to]);
+            if line != b.line {
+                out.push('\n');
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
 }
 
 impl<M: Clone + 'static> Widget<M> for Prompt<M> {
@@ -243,48 +295,206 @@ impl<M: Clone + 'static> Widget<M> for Prompt<M> {
         Length::Fill
     }
 
-    fn children_mut(&mut self) -> &mut [Element<M>] {
-        &mut self.editor
+    fn focusable(&self) -> bool {
+        true
     }
 
     fn layout(&mut self, cx: &mut Cx, limits: Limits) -> Size {
-        let line = (WRITING * cx.theme().text_scale * LINE).ceil();
-        let height = self.lines.clamp(1, self.most) as f32 * line + PAD.1 * 2.0;
-        let size = limits.constrain(Length::Fill, Length::Shrink).resolve(Size::new(320.0, height));
-        self.editor[0].layout(cx, Limits::tight(size));
-        self.editor[0].set_position(Point::ZERO);
-        let style = armature_render::TextStyle { size: WRITING * cx.theme().text_scale, weight: 400, family: armature_render::FontFamily::Mono, line_height: LINE, letter_spacing: 0.0 };
-        self.hint = (self.empty && !self.placeholder.is_empty()).then(|| cx.text().layout(&self.placeholder, &style, None));
-        size
+        let style = cx.theme().text(TextRole::Body).style();
+        let width = limits.constrain(Length::Fill, Length::Shrink).max.w;
+        let inner = (width - PAD.0 * 2.0).max(40.0);
+        self.line_h = (style.size * style.line_height).round();
+        let mut top = 0.0;
+        self.laid = self
+            .lines
+            .iter()
+            .map(|line| {
+                let layout = cx.text().layout(line, &style, Some(inner));
+                let at = top;
+                top += layout.size().h.max(self.line_h);
+                (layout, at)
+            })
+            .collect();
+        self.hint = (self.empty() && !self.placeholder.is_empty()).then(|| cx.text().layout(&self.placeholder, &style, Some(inner)));
+        let shown = self.written_height().clamp(self.line_h, self.most as f32 * self.line_h);
+        // The caret stays in sight as what is written outgrows its place.
+        let caret = self.point_of(self.cursor).y;
+        let most = (self.written_height() - shown).max(0.0);
+        let st = cx.state::<PromptState>();
+        st.scroll = st.scroll.clamp((caret + self.line_h - shown).max(0.0), caret.max(0.0)).min(most);
+        Size::new(width, shown + PAD.1 * 2.0)
     }
 
     fn draw(&self, cx: &mut DrawCx) {
         let b = cx.bounds();
         let theme = *cx.theme();
+        let p = theme.palette();
+        let scroll = cx.state::<PromptState>().scroll;
         cx.scene.paint(b, theme.small_radius(), &theme.paint(Surface::Inset));
-        cx.scene.push_clip(b);
-        self.editor[0].draw(cx);
+        if cx.is_focused() {
+            cx.scene.fill(b, theme.small_radius(), armature_render::Color::TRANSPARENT, Some((1.5, p.accent_text.with_alpha(0.7))));
+        }
+        let origin = Point::new(b.x + PAD.0, b.y + PAD.1 - scroll);
+        cx.scene.push_clip(armature_render::Rect::new(b.x, b.y + 2.0, b.w, b.h - 4.0));
+        // What is selected, a band to each row of it.
+        if let Some((from, to)) = self.selection {
+            let (a, z) = (self.point_of(from), self.point_of(to));
+            let right = b.w - PAD.0 * 2.0;
+            let band = |cx: &mut DrawCx, x0: f32, x1: f32, y: f32| cx.scene.fill(armature_render::Rect::new(origin.x + x0, origin.y + y, (x1 - x0).max(2.0), self.line_h), 2.0, p.accent.with_alpha(0.3), None);
+            if a.y == z.y {
+                band(cx, a.x, z.x, a.y);
+            } else {
+                band(cx, a.x, right, a.y);
+                let mut y = a.y + self.line_h;
+                while y < z.y {
+                    band(cx, 0.0, right, y);
+                    y += self.line_h;
+                }
+                band(cx, 0.0, z.x, z.y);
+            }
+        }
+        for (layout, top) in &self.laid {
+            cx.scene.text(layout, Point::new(origin.x, origin.y + top), p.text);
+        }
         if let Some(hint) = &self.hint {
-            cx.scene.text(hint, Point::new(b.x + PAD.0, b.y + PAD.1), theme.palette().faint);
+            cx.scene.text(hint, origin, p.faint);
+        }
+        if cx.is_focused() {
+            let at = self.point_of(self.cursor);
+            cx.scene.fill(armature_render::Rect::new((origin.x + at.x).round() - 0.75, origin.y + at.y + 1.0, 1.5, self.line_h - 2.0), 0.75, p.accent_text, None);
         }
         cx.scene.pop_clip();
     }
 
     fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
-        // While it is being written in, Enter sends what is written; with Shift it is a new line.
-        if let Event::Key(k) = event
-            && k.pressed
-            && k.key == Key::Enter
-            && !k.modifiers.shift
-            && !k.modifiers.alt
-            && self.editor[0].has_focus(cx)
-        {
-            if let (Some(m), false) = (&self.on_submit, self.empty) {
-                cx.emit(m.clone());
+        use crate::event::PointerButton;
+        use armature::document::Motion;
+        let b = cx.bounds();
+        let scroll = cx.state::<PromptState>().scroll;
+        let within = |p: Point| Point::new(p.x - b.x - PAD.0, p.y - b.y - PAD.1 + scroll);
+        match event {
+            Event::PointerPressed { pos, button: PointerButton::Primary } if b.contains(*pos) => {
+                cx.request_focus();
+                let at = self.pos_at(within(*pos));
+                let now = cx.now();
+                let st = cx.state::<PromptState>();
+                let twice = st.clicked.replace(now).is_some_and(|t| now.saturating_duration_since(t) < std::time::Duration::from_millis(400));
+                st.dragging = true;
+                cx.emit((self.on_edit)(if twice { Action::SelectWord(at) } else { Action::Click { pos: at, select: cx.modifiers().shift } }));
+                Status::Captured
             }
-            return Status::Captured;
+            Event::PointerMoved { pos } => {
+                if cx.state::<PromptState>().dragging {
+                    cx.emit((self.on_edit)(Action::Drag(self.pos_at(within(*pos)))));
+                    return Status::Captured;
+                }
+                if b.contains(*pos) {
+                    cx.set_cursor(crate::core::CursorIcon::Text);
+                }
+                Status::Ignored
+            }
+            Event::PointerReleased { .. } => {
+                cx.state::<PromptState>().dragging = false;
+                Status::Ignored
+            }
+            Event::Wheel { pos, delta } if b.contains(*pos) => {
+                let most = (self.written_height() - (b.h - PAD.1 * 2.0)).max(0.0);
+                if most <= 0.0 {
+                    return Status::Ignored;
+                }
+                let st = cx.state::<PromptState>();
+                st.scroll = (st.scroll - delta.y).clamp(0.0, most);
+                cx.request_redraw();
+                Status::Captured
+            }
+            Event::Key(k) if k.pressed && cx.is_focused() => {
+                let m = k.modifiers;
+                let cmd = m.command();
+                let word = if cfg!(target_os = "macos") { m.alt } else { m.ctrl };
+                let select = m.shift;
+                let motion = |mo: Motion| Action::Move { motion: mo, select };
+                // Up and down go by the rows as they are wrapped, not by the lines as they were written.
+                let row = |this: &Self, by: f32| {
+                    let at = this.point_of(this.cursor);
+                    let y = at.y + by * this.line_h;
+                    if y < 0.0 {
+                        motion(Motion::DocStart)
+                    } else if y >= this.written_height() {
+                        motion(Motion::DocEnd)
+                    } else {
+                        Action::Click { pos: this.pos_at(Point::new(at.x + 1.0, y + this.line_h * 0.5)), select }
+                    }
+                };
+                let action = match &k.key {
+                    // Enter sends what is written; with Shift or Alt it is a new line.
+                    Key::Enter if !m.shift && !m.alt => {
+                        if let (Some(send), false) = (&self.on_submit, self.empty()) {
+                            cx.emit(send.clone());
+                        }
+                        return Status::Captured;
+                    }
+                    Key::Enter => Action::Enter,
+                    Key::Left if cmd => motion(Motion::LineStart),
+                    Key::Right if cmd => motion(Motion::LineEnd),
+                    Key::Up if cmd => motion(Motion::DocStart),
+                    Key::Down if cmd => motion(Motion::DocEnd),
+                    Key::Left if word => motion(Motion::WordLeft),
+                    Key::Right if word => motion(Motion::WordRight),
+                    Key::Left => motion(Motion::Left),
+                    Key::Right => motion(Motion::Right),
+                    Key::Up => row(self, -1.0),
+                    Key::Down => row(self, 1.0),
+                    Key::Home => motion(if cmd { Motion::DocStart } else { Motion::LineStart }),
+                    Key::End => motion(if cmd { Motion::DocEnd } else { Motion::LineEnd }),
+                    Key::Escape if self.selection.is_some() => Action::Collapse,
+                    Key::Escape => {
+                        cx.release_focus();
+                        cx.request_redraw();
+                        return Status::Captured;
+                    }
+                    Key::Backspace | Key::Delete => {
+                        if self.selection.is_none() && (word || cmd) {
+                            let mo = match (&k.key, cmd) {
+                                (Key::Backspace, true) => Motion::LineStart,
+                                (Key::Backspace, false) => Motion::WordLeft,
+                                (_, true) => Motion::LineEnd,
+                                _ => Motion::WordRight,
+                            };
+                            cx.emit((self.on_edit)(Action::Move { motion: mo, select: true }));
+                        }
+                        if k.key == Key::Backspace { Action::Backspace } else { Action::Delete }
+                    }
+                    Key::Character(c) if cmd => match c.as_str() {
+                        "a" => Action::SelectAll,
+                        "z" if m.shift => Action::Redo,
+                        "z" => Action::Undo,
+                        "y" => Action::Redo,
+                        "c" | "x" => {
+                            let Some(text) = self.selected_text() else { return Status::Captured };
+                            cx.copy(text);
+                            if c == "c" {
+                                return Status::Captured;
+                            }
+                            Action::Backspace
+                        }
+                        "v" => match cx.read_clipboard() {
+                            Some(t) => Action::Insert(t),
+                            None => return Status::Captured,
+                        },
+                        _ => return Status::Ignored,
+                    },
+                    // Tab is for moving on to the next thing, as in any field.
+                    Key::Tab => return Status::Ignored,
+                    _ => match k.text.as_deref().filter(|t| !t.chars().any(char::is_control) && !m.ctrl && !m.logo) {
+                        Some(t) => Action::Insert(t.to_owned()),
+                        None => return Status::Ignored,
+                    },
+                };
+                cx.emit((self.on_edit)(action));
+                Status::Captured
+            }
+            _ => Status::Ignored,
         }
-        Element::event_children(&mut self.editor, cx, event)
     }
 }
 

@@ -260,3 +260,51 @@ fn a_conversation_scrolled_back_stays_where_it_was_put() {
     h.app_mut().entries.push(Entry::Said(Said::new(Speaker::Note, "Really done.")));
     assert!(h.render(1.0) != back);
 }
+
+#[test]
+fn what_is_written_wraps_to_the_width_and_is_edited_as_prose() {
+    let mut h = chat(vec![]);
+    h.click(PROMPT);
+    let row = |px: &[u8], y: usize| px[y * 400 * 4..(y + 1) * 400 * 4].to_vec();
+    let one = h.render(1.0);
+    // A sentence longer than the window is across: it goes on to a second row, and the place grows for it.
+    h.type_text("A sentence that goes on for rather longer than the window is wide, so that it has to turn.");
+    let two = h.render(1.0);
+    assert_eq!(h.app().writing.line_count(), 1, "one line as written");
+    assert_ne!(row(&one, 252), row(&two, 252), "on two rows as shown");
+    // Up goes to the row above within the same line, and what is typed goes in there.
+    h.key(Key::Up, Modifiers::default());
+    h.type_text("^");
+    let at = h.app().writing.text().find('^').unwrap();
+    assert!(at > 20 && at < 70, "part of the way along the first row, above where the caret was: {at}");
+    // Up again, from the first row: the very start. Down from the last: the very end.
+    h.key(Key::Up, Modifiers::default());
+    h.key(Key::Up, Modifiers::default());
+    h.type_text("<");
+    h.key(Key::Down, Modifiers::default());
+    h.key(Key::Down, Modifiers::default());
+    h.key(Key::Down, Modifiers::default());
+    h.type_text(">");
+    let text = h.app().writing.text();
+    assert!(text.starts_with("<A sentence") && text.ends_with("turn.>"), "{text}");
+    // Everything selected and typed over; then a click puts the caret where it lands.
+    let all = if cfg!(target_os = "macos") { Modifiers { logo: true, ..Default::default() } } else { Modifiers { ctrl: true, ..Default::default() } };
+    h.key(Key::Character("a".into()), all);
+    h.type_text("one two three");
+    assert_eq!(h.app().writing.text(), "one two three");
+    h.click(Point::new(14.0, 285.0));
+    h.type_text("zero ");
+    assert_eq!(h.app().writing.text(), "zero one two three");
+    // Many lines: it grows to the most it may and then scrolls, the caret still in sight.
+    h.key(Key::End, Modifiers::default());
+    for _ in 0..9 {
+        h.key(Key::Enter, Modifiers { shift: true, ..Default::default() });
+        h.type_text("more");
+    }
+    let tall = h.render(1.0);
+    assert_eq!(h.app().writing.line_count(), 10);
+    assert_ne!(row(&tall, 215), row(&two, 215), "taller than two rows");
+    assert_eq!(row(&tall, 150), row(&one, 150), "but no taller than four");
+    h.key(Key::Enter, Modifiers::default());
+    assert!(h.app().said.last().is_some_and(|s| s.text.starts_with("zero one two three\nmore") && s.text.lines().count() == 10));
+}
