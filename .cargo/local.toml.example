@@ -1,0 +1,7 @@
+# Copy to `.cargo/local.toml`, which git ignores, to build Neo against a
+# checkout of Armature beside it rather than the revision Cargo.toml names:
+# changes made there are then seen here at once.
+
+[patch."https://github.com/mcdearman/armature"]
+armature = { path = "../armature/crates/armature" }
+armature-render = { path = "../armature/crates/armature-render" }

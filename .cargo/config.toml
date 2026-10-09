@@ -1,3 +1,6 @@
+# Settings of one's own, not kept in the repository: see `local.toml.example`.
+include = [{ path = "local.toml", optional = true }]
+
 [alias]
 # Project tasks: `cargo xtask install`, `cargo xtask uninstall`, `cargo xtask icons`.
 xtask = "run --quiet --package xtask --"

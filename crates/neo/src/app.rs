@@ -1,4 +1,4 @@
-use armature::{Chrome, KeyEvent, Menu, MenuEntry, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
+use armature::{wgpu, Chrome, Graphics, KeyEvent, Menu, MenuEntry, Proxy, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
 use neo_theme::{Scheme, TextRole, Theme};
 
 use crate::core::Element;
@@ -48,6 +48,37 @@ pub trait App: 'static {
     /// Called once before the first frame. Keep the proxy to send messages
     /// from other threads, such as a pty reader or a file watcher.
     fn start(&mut self, _proxy: Proxy<Self::Message>) {}
+
+    /// The optional abilities of the graphics device this app would have
+    /// turned on, out of those the computer's adapter has. Asked once,
+    /// before the device is made; look in [`Graphics::features`] for what
+    /// was given. The default asks for none.
+    fn wanted_features(&self, _available: wgpu::Features) -> wgpu::Features {
+        wgpu::Features::empty()
+    }
+
+    /// The limits the graphics device is to be made with, given the most
+    /// the adapter allows. The default is wgpu's own.
+    fn wanted_limits(&self, _available: &wgpu::Limits) -> wgpu::Limits {
+        wgpu::Limits::default()
+    }
+
+    /// The graphics device the window is drawn with, for an app that draws
+    /// with it too: a game rendering into a texture that is then shown in
+    /// a [`viewport`](crate::widgets::viewport) as an `Image::from_texture`.
+    /// Called once, before the first view; the device and queue are
+    /// handles, to be cloned and kept.
+    fn graphics(&mut self, _graphics: &Graphics) {}
+
+    /// Called before each frame is drawn, after the input that came before
+    /// it, with the time and how long it has been since the last: where a
+    /// game moves on and draws its own frame, so that what the window then
+    /// shows is this frame's. Return true if what the app shows may have
+    /// changed. Frames are drawn only when something asks for one; a
+    /// viewport that is playing asks for every one.
+    fn step(&mut self, _now: std::time::Instant, _dt: std::time::Duration) -> bool {
+        false
+    }
 
     /// Timers that send messages periodically.
     fn subscriptions(&self) -> Vec<Subscription<Self::Message>> {
@@ -154,6 +185,22 @@ impl<A: App> armature::App for Themed<A> {
 
     fn on_key(&self, key: &KeyEvent) -> Option<Self::Message> {
         self.0.on_key(key)
+    }
+
+    fn wanted_features(&self, available: wgpu::Features) -> wgpu::Features {
+        self.0.wanted_features(available)
+    }
+
+    fn wanted_limits(&self, available: &wgpu::Limits) -> wgpu::Limits {
+        self.0.wanted_limits(available)
+    }
+
+    fn graphics(&mut self, graphics: &Graphics) {
+        self.0.graphics(graphics);
+    }
+
+    fn step(&mut self, now: std::time::Instant, dt: std::time::Duration) -> bool {
+        self.0.step(now, dt)
     }
 
     fn start(&mut self, proxy: Proxy<Self::Message>) {

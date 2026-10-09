@@ -127,7 +127,9 @@ fn main() -> Result<(), neo::Error> { neo::run(Counter::default()) }
 
 ## Crates
 
-Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framework with no look of its own, which supplies the windows, input, layout, renderer and test harness. Clone it next to this repository (`../armature`); the workspace finds it there.
+Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framework with no look of its own, which supplies the windows, input, layout, renderer and test harness. Cargo fetches it at the revision `Cargo.toml` names, so nothing needs cloning. To work on both at once, clone Armature next to this repository and copy `.cargo/local.toml.example` to `.cargo/local.toml`, which builds against that checkout instead; a change to Armature that Neo is to use is pushed there and the revision here moved on to it../armature`); the workspace finds it there.
+
+An app that draws a picture of its own, a game say, can share the window's graphics device: `App::graphics` hands it the device and queue (made with whatever `App::wanted_features` and `App::wanted_limits` asked for), `App::step` is called before each frame so it can draw its own first, `Image::from_texture` shows a texture it draws into, and the `viewport` widget puts that picture among Neo's widgets, reports its size and scale, and passes on the pointer and keys while it has the keyboard, holding the pointer for looking around if asked.
 
 | Crate | Role |
 |---|---|

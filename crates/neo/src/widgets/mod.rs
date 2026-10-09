@@ -22,7 +22,7 @@ pub use container::{container, Background, Container};
 pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, ExtraSelection, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
-pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack};
+pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};
 pub use icon::{icon, Icon};
 pub use menu::{popup_menu, MenuItem, PopupMenu};
 pub use scrollable::{scrollable, Scrollable};

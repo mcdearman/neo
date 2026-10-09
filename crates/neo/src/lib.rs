@@ -60,6 +60,8 @@ pub use cx::{FocusRing, ThemeCx};
 pub use armature::{Align, Anim, Cx, CursorIcon, Decorations, DrawCx, Element, Error, EventCx, Length, Limits, Padding, Proxy, ResizeEdge, Subscription, Ui, Widget, WidgetId, WindowGeometry, WindowRequest, WindowSettings, WindowState};
 pub use armature::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use armature::on_menu_chosen;
+/// For an app that draws with the window's own graphics device: see [`App::graphics`].
+pub use armature::{wgpu, Graphics};
 pub use armature::{Menu, MenuEntry, Shortcut};
 
 pub use armature_render::{Corners, FontFamily, Image, Point, Rect, Scene, Size, TextLayout, TextStyle};

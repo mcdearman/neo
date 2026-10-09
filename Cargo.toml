@@ -10,9 +10,10 @@ repository = "https://github.com/mcdearman/neo"
 
 [workspace.dependencies]
 neo-theme = { path = "crates/neo-theme" }
-# The framework lives in its own repository, checked out next to this one.
-armature-render = { path = "../armature/crates/armature-render" }
-armature = { path = "../armature/crates/armature" }
+# The framework underneath, at a revision that is known to work with this
+# one. To work on both side by side, see `.cargo/local.toml.example`.
+armature-render = { git = "https://github.com/mcdearman/armature", rev = "9cd6e9d5da0f8bf546ba1018cb6f31a294f0e42e" }
+armature = { git = "https://github.com/mcdearman/armature", rev = "9cd6e9d5da0f8bf546ba1018cb6f31a294f0e42e" }
 neo = { path = "crates/neo" }
 neo-desktop = { path = "crates/neo-desktop" }
 neo-term = { path = "crates/neo-term" }
