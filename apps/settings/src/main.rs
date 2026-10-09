@@ -22,6 +22,7 @@ use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Appearance, Desktop, SchemePref};
 
 mod bluetooth;
+mod color;
 mod network;
 mod sound;
 mod startup;
@@ -92,12 +93,31 @@ impl About {
     }
 }
 
+/// The colour being picked for the accent.
+struct Picker {
+    hsv: color::Hsv,
+    /// Its code as typed, which is not a colour until it is finished.
+    code: String,
+    /// Every shade of its hue, and every hue, to pick from.
+    shades: Image,
+    hues: Image,
+}
+
+impl Picker {
+    fn of(c: Color) -> Self {
+        let hsv = color::Hsv::of(c);
+        Self { hsv, code: color::hex(c), shades: color::shades(hsv.h), hues: color::hues() }
+    }
+}
+
 struct Settings {
     desktop: Desktop,
     page: Page,
     about: About,
     error: Option<String>,
     proxy: Option<Proxy<Msg>>,
+    /// The picker for an accent of one's own colour, while it is open.
+    picker: Option<Picker>,
     /// The pictures there are to put on the desktop, once looked for, with
     /// a small copy of each as it is made, and the one that is there now.
     wallpapers: Option<Vec<PathBuf>>,
@@ -138,6 +158,16 @@ enum Msg {
     Desktop(neo_desktop::DesktopMsg),
     /// The preview controls do nothing.
     Preview,
+    /// Open the picker for an accent of one's own colour, or put it away.
+    PickAccent,
+    /// A shade was picked: how much colour, and how far down from light.
+    Shade(f32, f32),
+    Hue(f32),
+    /// The colour's code, as it is being typed.
+    Code(String),
+    /// Pick a colour off the screen.
+    Sample,
+    Sampled(Option<Color>),
     /// Put this picture on the desktop.
     Wallpaper(PathBuf),
     /// Choose a picture of one's own for the desktop.
@@ -182,11 +212,14 @@ const TILE_GAP: f32 = 6.0;
 const SOUND_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 const SOUND_SETTLES: std::time::Duration = std::time::Duration::from_millis(900);
 
+/// How large the plane of shades is in the colour picker.
+const PLANE: (f32, f32) = (300.0, 150.0);
+
 const TEXT_SCALES: [(f32, &str); 3] = [(1.0, "Default"), (1.15, "Large"), (1.3, "Larger")];
 
 impl Settings {
     fn new() -> Self {
-        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], sound_changed: None, choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
+        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, picker: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], sound_changed: None, choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
     }
 
     /// Looks up what a page shows, on coming to it: these are things that
@@ -279,6 +312,14 @@ impl Settings {
                 sound::set(change);
             });
         }
+    }
+
+    /// Makes the colour in the picker the accent, and writes its code.
+    fn use_picked(&mut self) {
+        let Some(p) = &mut self.picker else { return };
+        let c = p.hsv.color();
+        p.code = color::hex(c);
+        self.change(|a| a.accent = Accent::from_color(c));
     }
 
     fn change(&mut self, f: impl FnOnce(&mut Appearance)) {
@@ -442,7 +483,57 @@ impl App for Settings {
                 self.tried = None;
             }
             Msg::Scheme(s) => self.change(|a| a.scheme = s),
-            Msg::Accent(c) => self.change(|a| a.accent = c),
+            Msg::Accent(c) => {
+                self.picker = None;
+                self.change(|a| a.accent = c);
+            }
+            Msg::PickAccent => {
+                self.picker = match self.picker.take() {
+                    Some(_) => None,
+                    // From the accent there is, so that it starts where things stand.
+                    None => Some(Picker::of(self.desktop.appearance.accent.swatch())),
+                };
+            }
+            Msg::Shade(s, down) => {
+                if let Some(p) = &mut self.picker {
+                    (p.hsv.s, p.hsv.v) = (s.clamp(0.0, 1.0), (1.0 - down).clamp(0.0, 1.0));
+                    self.use_picked();
+                }
+            }
+            Msg::Hue(h) => {
+                if let Some(p) = &mut self.picker {
+                    // A whole turn is the start again, which the strip does not have twice.
+                    p.hsv.h = h.clamp(0.0, 0.999);
+                    p.shades = color::shades(p.hsv.h);
+                    self.use_picked();
+                }
+            }
+            Msg::Code(code) => {
+                if let Some(p) = &mut self.picker {
+                    p.code = code;
+                    // Not a colour until it is finished: nothing changes while it is being typed.
+                    if let Some(c) = color::parse_hex(&p.code) {
+                        let typed = std::mem::take(&mut p.code);
+                        *p = Picker::of(c);
+                        p.code = typed;
+                        self.change(|a| a.accent = Accent::from_color(c));
+                    }
+                }
+            }
+            Msg::Sample => {
+                if let Some(proxy) = self.proxy.clone() {
+                    color::sample(move |picked| {
+                        proxy.send(Msg::Sampled(picked));
+                    });
+                }
+            }
+            Msg::Sampled(picked) => {
+                // Dismissed, it changes nothing.
+                if let Some(c) = picked {
+                    self.picker = Some(Picker::of(c));
+                    self.change(|a| a.accent = Accent::from_color(c));
+                }
+            }
             Msg::Radius(r) => self.change(|a| a.radius = r),
             Msg::Glass(g) => self.change(|a| a.glass.enabled = g),
             Msg::GlassOpacity(o) => self.change(|a| a.glass.opacity = o),
@@ -520,25 +611,22 @@ impl Settings {
         let scheme_idx = SchemePref::ALL.iter().position(|s| *s == a.scheme);
         let swatches = Accent::PRESETS.iter().fold(row().spacing(8.0), |r, c| r.push(Button::new(container(Space::new(18.0, 18.0)).background(Background::Color(c.swatch())).radius(9.0)).round().padding(7.0).selected(*c == a.accent).on_press(Msg::Accent(*c))));
         let preview = row().spacing(12.0).align(Align::Center).push(button("Cancel").on_press(Msg::Preview)).push(Button::new(text("Save changes").role(TextRole::Strong)).kind(ButtonKind::Accent).on_press(Msg::Preview)).push(toggle(true, |_| Msg::Preview)).push(container(progress_bar(0.62)).width(120.0));
+        // And one of one's own colour: the swatch of it, or the way to choosing one.
+        let own = matches!(a.accent, Accent::Custom { .. });
+        let own_face: Element<Msg> = if own { container(Space::new(18.0, 18.0)).background(Background::Color(a.accent.swatch())).radius(9.0).into() } else { container(icon(icons::PIPETTE).size(14.0).tone(Tone::Muted)).width(18.0).height(18.0).center().into() };
+        let swatches = swatches.push(Button::new(own_face).round().padding(7.0).selected(own || self.picker.is_some()).on_press(Msg::PickAccent));
+        let mut look =
+            vec![setting("Colour scheme", "Auto follows your system's light or dark setting.", segmented(["Auto", "Light", "Dark"], scheme_idx, |i| Msg::Scheme(SchemePref::ALL[i]))), setting("Accent", &if own { format!("Your own, from {}.", self.picker.as_ref().map_or_else(|| color::hex(a.accent.swatch()), |p| color::hex(p.hsv.color()))) } else { a.accent.name().to_owned() }, swatches)];
+        if let Some(p) = &self.picker {
+            look.push(self.picker_row(p));
+        }
+        look.push(setting("Corner radius", &format!("{} px. Applies to windows and controls.", a.radius), container(slider(4.0..=28.0, a.radius, Msg::Radius).step(1.0)).width(220.0)));
         let mut glass = vec![setting("Glass windows", "Makes windows translucent and blurs what is behind them.", toggle(a.glass.enabled, Msg::Glass))];
         if a.glass.enabled {
             glass.push(setting("Opacity", &format!("{:.0}%. Lower shows more of the desktop.", a.glass.opacity * 100.0), container(slider(0.3..=0.95, a.glass.opacity, Msg::GlassOpacity).step(0.05)).width(220.0)));
             glass.push(setting("Blur", &format!("{:.0} px.", a.glass.blur), container(slider(0.0..=40.0, a.glass.blur, Msg::GlassBlur).step(1.0)).width(220.0)));
         }
-        column()
-            .spacing(18.0)
-            .width(Length::Fill)
-            .push(group(vec![
-                setting("Colour scheme", "Auto follows your system's light or dark setting.", segmented(["Auto", "Light", "Dark"], scheme_idx, |i| Msg::Scheme(SchemePref::ALL[i]))),
-                setting("Accent", a.accent.name(), swatches),
-                setting("Corner radius", &format!("{} px. Applies to windows and controls.", a.radius), container(slider(4.0..=28.0, a.radius, Msg::Radius).step(1.0)).width(220.0)),
-            ]))
-            .push(group(glass))
-            .push(section("Wallpaper"))
-            .push(self.wallpaper_section())
-            .push(section("Preview"))
-            .push(container(preview).surface(Surface::Well).padding(18.0).width(Length::Fill))
-            .into()
+        column().spacing(18.0).width(Length::Fill).push(group(look)).push(group(glass)).push(section("Wallpaper")).push(self.wallpaper_section()).push(section("Preview")).push(container(preview).surface(Surface::Well).padding(18.0).width(Length::Fill)).into()
     }
 
     fn accessibility(&self) -> Element<Msg> {
@@ -550,6 +638,29 @@ impl Settings {
             .push(group(vec![setting("Text size", "Scales text in every Neo app.", segmented(TEXT_SCALES.map(|(_, n)| n), scale_idx, |i| Msg::TextScale(TEXT_SCALES[i].0))), setting("Reduce motion", "Turns off transitions and animation, including notifications sliding in and the flash after a screenshot.", toggle(a.reduce_motion, Msg::ReduceMotion))]))
             .push(text("Text and controls meet WCAG AA contrast in both colour schemes with the royal blue accent.").role(TextRole::Caption).tone(Tone::Muted))
             .into()
+    }
+
+    /// The picker: a plane of the hue's shades and a strip of hues to drag
+    /// in, the colour's code to type, and the eyedropper.
+    fn picker_row(&self, p: &Picker) -> Element<Msg> {
+        let chosen = p.hsv.color();
+        let accent = Accent::from_color(chosen);
+        let planes = column().spacing(8.0).push(Element::new(color::Plane::new(p.shades.clone(), (p.hsv.s, 1.0 - p.hsv.v), Size::new(PLANE.0, PLANE.1), Msg::Shade))).push(Element::new(color::Plane::new(p.hues.clone(), (p.hsv.h, 0.5), Size::new(PLANE.0, 16.0), |h, _| Msg::Hue(h))));
+        // How it comes out in each scheme, which is the colour itself only where that can be read.
+        let shown = |label: &str, scheme: Scheme| -> Element<Msg> {
+            let pill = container(text(label).role(TextRole::Caption).tone(Tone::Custom(accent.on_tone(scheme)))).background(Background::Color(accent.tone(scheme))).radius(10.0).padding([12.0, 5.0]);
+            pill.into()
+        };
+        let mut side = column()
+            .spacing(10.0)
+            .width(Length::Fill)
+            .push(row().spacing(8.0).align(Align::Center).push(container(Space::new(26.0, 26.0)).background(Background::Color(chosen)).radius(13.0)).push(text_input("#3F5BC4", p.code.clone()).on_input(Msg::Code).width(120.0)))
+            .push(row().spacing(6.0).push(shown("On light", Scheme::Light)).push(shown("On dark", Scheme::Dark)))
+            .push(text("Drag in the colours, type a code, or pick one off the screen. A colour too pale or too dark to read is shifted just far enough for each scheme.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill));
+        if color::can_sample() {
+            side = side.push(row().push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::PIPETTE).size(14.0)).push(text("Pick from the Screen"))).on_press(Msg::Sample)));
+        }
+        row().spacing(18.0).width(Length::Fill).push(planes).push(side).into()
     }
 
     /// The desktop picture: those there are to choose from, and the one that is set.
@@ -761,6 +872,7 @@ fn snapshots(dir: std::path::PathBuf) {
     for (name, page, scheme) in [
         ("settings-appearance", Page::Appearance, SchemePref::Light),
         ("settings-about", Page::About, SchemePref::Dark),
+        ("settings-picker", Page::Appearance, SchemePref::Dark),
         ("settings-sound", Page::Sound, SchemePref::Dark),
         ("settings-network", Page::Network, SchemePref::Light),
         ("settings-bluetooth", Page::Bluetooth, SchemePref::Dark),
@@ -776,6 +888,11 @@ fn snapshots(dir: std::path::PathBuf) {
             Page::Network => app.network = Some(network::read()),
             Page::Bluetooth => app.bluetooth = Some(bluetooth::read()),
             _ => {}
+        }
+        // The picker, open on a colour of one's own. (Shown, not saved: this is a picture of it.)
+        if name == "settings-picker" {
+            app.picker = Some(Picker::of(Color::hex(0xE0569B)));
+            app.desktop.appearance.accent = Accent::from_color(Color::hex(0xE0569B));
         }
         // With no thread to make them on here, the first pictures are made small in place.
         for path in app.wallpapers.clone().unwrap_or_default().into_iter().take(12) {
@@ -807,6 +924,47 @@ mod tests {
         assert!(other.poll(), "another app sees the change");
         assert_eq!(other.appearance.accent, Accent::Teal);
         assert_eq!(other.theme(Scheme::Light).scheme, Scheme::Dark);
+        // An accent of one's own colour: picked by dragging, by its code, or off the screen.
+        settings.update(Msg::PickAccent);
+        assert!(settings.picker.is_some() && settings.desktop.appearance.accent == Accent::Teal, "opening it changes nothing yet");
+        settings.update(Msg::Hue(0.9));
+        settings.update(Msg::Shade(0.82, 0.0));
+        let picked = settings.picker.as_ref().unwrap().hsv.color();
+        assert_eq!(settings.desktop.appearance.accent, Accent::from_color(picked));
+        assert_eq!(settings.picker.as_ref().unwrap().code, color::hex(picked), "its code is written as it is dragged");
+        // Kept as its codes, so what another app reads is the same to the eye.
+        let kept = Desktop::load().appearance.accent;
+        let codes = |a: Accent| (color::hex(a.tone(Scheme::Light)), color::hex(a.tone(Scheme::Dark)));
+        assert_eq!(codes(kept), codes(Accent::from_color(picked)), "and it is written down for other apps to take up");
+        // A code half typed changes nothing; finished, it is the accent, and the mark moves to it.
+        settings.update(Msg::Code("#3F5B".into()));
+        assert_eq!(settings.desktop.appearance.accent, Accent::from_color(picked));
+        settings.update(Msg::Code("#3f5bc4".into()));
+        assert_eq!(settings.desktop.appearance.accent, Accent::from_color(Color::hex(0x3F5BC4)));
+        assert_eq!((settings.picker.as_ref().unwrap().code.as_str(), color::hex(settings.picker.as_ref().unwrap().hsv.color())), ("#3f5bc4", "#3F5BC4".to_owned()), "what was typed is left as typed");
+        // Off the screen: a colour comes back, or none if it was dismissed.
+        settings.update(Msg::Sampled(None));
+        assert_eq!(settings.desktop.appearance.accent, Accent::from_color(Color::hex(0x3F5BC4)));
+        settings.update(Msg::Sampled(Some(Color::hex(0xFF2D95))));
+        assert_eq!((settings.desktop.appearance.accent, settings.picker.as_ref().unwrap().code.as_str()), (Accent::from_color(Color::hex(0xFF2D95)), "#FF2D95"));
+        // It draws, and dragging in the plane of shades picks one.
+        let mut h = neo::testing::Harness::new(settings, Size::new(920.0, 640.0)).unwrap();
+        h.render(1.0);
+        let before = h.app().picker.as_ref().unwrap().hsv;
+        let plane = (0..60).map(|i| neo::Point::new(300.0, 120.0 + i as f32 * 8.0)).find(|p| {
+            h.move_to(*p);
+            h.cursor() == neo::CursorIcon::Crosshair
+        });
+        h.click(plane.expect("the plane of shades is on the page"));
+        let after = h.app().picker.as_ref().unwrap().hsv;
+        assert!(after != before && after.h == before.h, "a shade of the same hue: {before:?} then {after:?}");
+        let mut settings = std::mem::replace(h.app_mut(), Settings::new());
+        // A preset puts the picker away.
+        settings.update(Msg::Accent(Accent::Teal));
+        assert!(settings.picker.is_none() && settings.desktop.appearance.accent == Accent::Teal);
+        settings.update(Msg::Scheme(SchemePref::Dark));
+        other.poll();
+
         // Every page draws, with whatever this computer has or has not.
         use neo::testing::Harness;
         let mut h = Harness::new(settings, Size::new(920.0, 640.0)).unwrap();

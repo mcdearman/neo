@@ -38,6 +38,26 @@ pub enum Accent {
 impl Accent {
     pub const PRESETS: [Accent; 4] = [Accent::Royal, Accent::Teal, Accent::Coral, Accent::Amber];
 
+    /// An accent of a colour of the user's own choosing. Each scheme gets
+    /// the colour itself where that reads against the scheme's background,
+    /// and otherwise the nearest shade of it that does: darker for the
+    /// light scheme, lighter for the dark. So a pale yellow is still a
+    /// yellow on a white window, and can still be read there.
+    pub fn from_color(color: Color) -> Self {
+        let color = color.with_alpha(1.0);
+        let fit = |toward: Color, scheme: Scheme| {
+            let background = Palette::new(scheme, Accent::Royal).bg;
+            let mut shade = color;
+            let mut t = 0.0;
+            while shade.contrast(background) < 4.5 && t < 1.0 {
+                t += 0.02;
+                shade = color.mix(toward, t);
+            }
+            shade
+        };
+        Accent::Custom { light: fit(Color::BLACK, Scheme::Light), dark: fit(Color::WHITE, Scheme::Dark) }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Accent::Royal => "Royal blue",
@@ -427,6 +447,22 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accent_of_any_colour_reads_in_both_schemes() {
+        for hex in [0xFFF2A8, 0x101820, 0xFF2D95, 0x3F5BC4, 0xFFFFFF, 0x000000, 0x7BC96F] {
+            let Accent::Custom { light, dark } = Accent::from_color(Color::hex(hex)) else { panic!("a custom accent") };
+            let (on_light, on_dark) = (Palette::new(Scheme::Light, Accent::Royal).bg, Palette::new(Scheme::Dark, Accent::Royal).bg);
+            assert!(light.contrast(on_light) >= 4.5 && dark.contrast(on_dark) >= 4.5, "{hex:06X}: {} and {}", light.contrast(on_light), dark.contrast(on_dark));
+        }
+        // One that reads already is kept as it is, in the scheme where it does.
+        let royal = Color::hex(0x3F5BC4);
+        assert!(matches!(Accent::from_color(royal), Accent::Custom { light, .. } if light == royal));
+        // A pale one is darkened for the light scheme and is still of its own hue: more red and green than blue.
+        let Accent::Custom { light, dark } = Accent::from_color(Color::hex(0xFFF2A8)) else { unreachable!() };
+        assert!(light.r > light.b && light.g > light.b && light.luminance() < dark.luminance());
+        assert_eq!(dark, Color::hex(0xFFF2A8), "and kept as it is for the dark one");
+    }
 
     #[test]
     fn text_contrast_meets_wcag_aa() {

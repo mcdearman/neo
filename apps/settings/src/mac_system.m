@@ -144,3 +144,25 @@ int neo_bluetooth_power(void) {
 void neo_bluetooth_set_power(int on) {
     IOBluetoothPreferenceSetControllerPowerState(on ? 1 : 0);
 }
+
+// ---- Picking a colour off the screen.
+
+static NSColorSampler *neo_sampler;
+
+// Brings up the system's eyedropper, a magnifier that follows the
+// pointer, and calls `callback` with the colour clicked on, as sRGB from
+// 0 to 1, or with `ok` 0 if it was dismissed. To be called on the main
+// thread; the callback comes on the main thread too.
+void neo_sample_color(void (*callback)(int ok, double r, double g, double b)) {
+    // Kept until it has answered: let go of, it would vanish from the screen.
+    neo_sampler = [NSColorSampler new];
+    [neo_sampler showSamplerWithSelectionHandler:^(NSColor *picked) {
+        NSColor *color = [picked colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+        if (color == nil) {
+            callback(0, 0, 0, 0);
+        } else {
+            callback(1, color.redComponent, color.greenComponent, color.blueComponent);
+        }
+        neo_sampler = nil;
+    }];
+}
