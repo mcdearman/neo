@@ -2077,6 +2077,8 @@ dependencies = [
 name = "neo-shell"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "global-hotkey",
  "image",
  "neo",
  "neo-desktop",

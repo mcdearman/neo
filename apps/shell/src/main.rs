@@ -11,14 +11,18 @@
 //!     cargo run -p neo-shell -- --snapshot target/snapshots
 
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use global_hotkey::hotkey::{Code, HotKey, Modifiers as HotMods};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use neo::prelude::*;
 use neo::{Cx, DrawCx, Event, EventCx, Image, Limits, Point, Proxy, Rect, Size, Status, Widget, WindowGeometry};
 use neo_desktop::Desktop;
 use neo_desktop::notify::{Inbox, Notification};
 
 mod reminders;
+mod windows;
 use reminders::{Later, Reminder};
 
 const CARD_W: f32 = 400.0;
@@ -58,6 +62,11 @@ struct Shell {
     reminders: Vec<Reminder>,
     kept_in: Option<PathBuf>,
     proxy: Option<Proxy<Msg>>,
+    /// The keys that work the tiling, bound only while it is on, and
+    /// where what they ask for is sent.
+    hotkeys: Option<GlobalHotKeyManager>,
+    tiling_keys: bool,
+    tiling: Option<Sender<windows::Action>>,
 }
 
 /// A picture read and shrunk off the main thread: its size and pixels.
@@ -81,6 +90,8 @@ enum Msg {
     Open(u64),
     Geometry(WindowGeometry),
     Poll,
+    /// Tiling has been turned on, or off.
+    Tiling(bool),
 }
 
 /// Holds a card `by` pixels to the right of its place, at its full width.
@@ -128,7 +139,7 @@ impl Shell {
     fn new() -> Self {
         // Tests and snapshots keep clear of the reminders that are really set.
         let kept_in = (!cfg!(test)).then(reminders::file);
-        Self { desktop: Desktop::load(), cards: vec![], next_id: 1, now: Instant::now(), screen: Rect::ZERO, reminders: vec![], kept_in, proxy: None }
+        Self { desktop: Desktop::load(), cards: vec![], next_id: 1, now: Instant::now(), screen: Rect::ZERO, reminders: vec![], kept_in, proxy: None, hotkeys: None, tiling_keys: false, tiling: None }
     }
 
     /// Puts a card aside, to be shown again `later` after `wall`.
@@ -171,6 +182,43 @@ impl Shell {
                 _ => self.show(note, None, true, now),
             }
         }
+    }
+
+    /// Starts what keeps windows tiled, which does nothing until tiling
+    /// is turned on in Settings.
+    fn start_tiling(&mut self) {
+        let Some(proxy) = self.proxy.clone() else { return };
+        let (to, actions) = std::sync::mpsc::channel();
+        self.tiling = Some(to.clone());
+        std::thread::spawn(move || {
+            windows::run(actions, move |on| {
+                proxy.send(Msg::Tiling(on));
+            });
+        });
+        // Global keys are the window manager's own to bind on Linux.
+        if cfg!(all(unix, not(target_os = "macos"))) {
+            return;
+        }
+        if let Ok(manager) = GlobalHotKeyManager::new() {
+            let keys: Vec<(u32, windows::Action)> = tiling_keys().into_iter().map(|(key, action)| (key.id(), action)).collect();
+            GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+                if let (HotKeyState::Pressed, Some((_, action))) = (e.state(), keys.iter().find(|(id, _)| *id == e.id())) {
+                    let _ = to.send(*action);
+                }
+            }));
+            self.hotkeys = Some(manager);
+        }
+    }
+
+    /// Binds the tiling's keys while it is on, and gives them back to
+    /// whatever else uses them when it is off.
+    fn bind_tiling_keys(&mut self, on: bool) {
+        let Some(manager) = self.hotkeys.as_ref().filter(|_| on != self.tiling_keys) else { return };
+        for (key, _) in tiling_keys() {
+            // One that something else has taken is done without.
+            let _ = if on { manager.register(key) } else { manager.unregister(key) };
+        }
+        self.tiling_keys = on;
     }
 
     fn still(&self) -> bool {
@@ -322,6 +370,10 @@ impl App for Shell {
                 }
             }
         });
+        // Tests must not move this computer's windows about.
+        if !cfg!(test) {
+            self.start_tiling();
+        }
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
@@ -375,6 +427,7 @@ impl App for Shell {
             Msg::Poll => {
                 self.desktop.poll();
             }
+            Msg::Tiling(on) => self.bind_tiling_keys(on),
         }
     }
 
@@ -384,6 +437,13 @@ impl App for Shell {
         let slide = CARD_W + MARGIN;
         self.cards.iter().fold(column().spacing(GAP).padding(MARGIN).width(Length::Fill), |col, c| col.push(Element::new(Shifted { card: [self.card(c)], by: (self.offset(c) * slide).round() }))).into()
     }
+}
+
+/// The keys that work the tiling, each with Control and Option: in the
+/// order of `neo_desktop::tiling::KEYS`, which says what they do.
+fn tiling_keys() -> [(HotKey, windows::Action); 10] {
+    use windows::Action::*;
+    [(Code::KeyJ, FocusNext), (Code::KeyK, FocusPrevious), (Code::Enter, Promote), (Code::KeyL, Grow), (Code::KeyH, Shrink), (Code::Period, MoreMasters), (Code::Comma, FewerMasters), (Code::Space, NextLayout), (Code::KeyF, ToggleFloat), (Code::KeyR, Retile)].map(|(code, action)| (HotKey::new(Some(HotMods::CONTROL | HotMods::ALT), code), action))
 }
 
 /// Keeps NeoShell starting at login, for an installed copy, so that

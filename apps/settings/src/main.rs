@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use neo::prelude::*;
 use neo::{Image, Point, Proxy, Rect, Size};
 use neo_desktop::fs::human_bytes_binary;
+use neo_desktop::tiling::{self, Layout, Mode, NewWindow, Windowing};
 use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Appearance, Desktop, SchemePref};
 
@@ -27,10 +28,12 @@ mod network;
 mod sound;
 mod startup;
 mod wallpaper;
+mod windowing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Appearance,
+    Windows,
     Sound,
     Network,
     Bluetooth,
@@ -42,11 +45,12 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 9] = [Page::Appearance, Page::Sound, Page::Network, Page::Bluetooth, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
+    const ALL: [Page; 10] = [Page::Appearance, Page::Windows, Page::Sound, Page::Network, Page::Bluetooth, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
 
     fn name(self) -> &'static str {
         match self {
             Page::Appearance => "Appearance",
+            Page::Windows => "Windows",
             Page::Sound => "Sound",
             Page::Network => "Network",
             Page::Bluetooth => "Bluetooth",
@@ -61,6 +65,7 @@ impl Page {
     fn icon(self) -> neo::theme::Icon {
         match self {
             Page::Appearance => icons::PALETTE,
+            Page::Windows => icons::APP_WINDOW,
             Page::Sound => icons::VOLUME_2,
             Page::Network => icons::WIFI,
             Page::Bluetooth => icons::BLUETOOTH,
@@ -139,6 +144,20 @@ struct Settings {
     starting: [bool; 4],
     /// What came of sending a notification to try them.
     tried: Option<(Tone, String)>,
+    /// How windows are laid out, and what NeoShell says of doing it:
+    /// whether it is running, and how its tiling is going.
+    windowing: Windowing,
+    tiler: Option<(bool, Option<tiling::Status>)>,
+    /// How many windows the picture of the layout shows.
+    sample_windows: usize,
+    /// The name being typed of an app whose windows are to float.
+    float_name: String,
+    /// When the layout was last changed here: what was read from the file
+    /// a moment before is not to undo it.
+    windows_changed: Option<std::time::Instant>,
+    /// Whether the Windows page follows what NeoShell is doing. Not in a
+    /// picture of the page, which is of what it was given to show.
+    follows: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +218,24 @@ enum Msg {
     /// Send a notification, to see how they look.
     TryNotification,
     StartShell,
+    WindowMode(Mode),
+    WindowLayout(Layout),
+    /// The share of the screen the main windows take.
+    MasterShare(f32),
+    Masters(u32),
+    WindowGap(f32),
+    WindowMargin(f32),
+    NewWindows(NewWindow),
+    SampleWindows(f32),
+    /// An app whose windows are to float: its name as typed, added, and taken off.
+    FloatName(String),
+    AddFloat,
+    RemoveFloat(usize),
+    /// Time to see how the tiling is going, and whether its keys changed anything.
+    WindowTick,
+    Tiler(bool, Option<tiling::Status>, Windowing),
+    /// Open the system's settings where leave to move windows is given.
+    OpenAccessibility,
 }
 
 /// How large a picture is shown to choose it by, how many go across, and
@@ -211,6 +248,8 @@ const TILE_GAP: f32 = 6.0;
 /// long after a change made here it leaves the system to catch up.
 const SOUND_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 const SOUND_SETTLES: std::time::Duration = std::time::Duration::from_millis(900);
+/// How often the Windows page asks how the tiling is going.
+const WINDOWS_EVERY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// How large the plane of shades is in the colour picker.
 const PLANE: (f32, f32) = (300.0, 150.0);
@@ -219,7 +258,31 @@ const TEXT_SCALES: [(f32, &str); 3] = [(1.0, "Default"), (1.15, "Large"), (1.3, 
 
 impl Settings {
     fn new() -> Self {
-        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, picker: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], sound_changed: None, choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
+        Self {
+            desktop: Desktop::load(),
+            page: Page::Appearance,
+            about: About::gather(),
+            error: None,
+            proxy: None,
+            picker: None,
+            wallpapers: None,
+            thumbs: HashMap::new(),
+            wallpaper: None,
+            levels: None,
+            devices: vec![],
+            sound_changed: None,
+            choosing: None,
+            network: None,
+            bluetooth: None,
+            starting: [false; 4],
+            tried: None,
+            windowing: Windowing::load(),
+            tiler: None,
+            sample_windows: 3,
+            float_name: String::new(),
+            windows_changed: None,
+            follows: !cfg!(test),
+        }
     }
 
     /// Looks up what a page shows, on coming to it: these are things that
@@ -252,6 +315,12 @@ impl Settings {
             Page::Network | Page::Bluetooth => self.ask(self.page, 0),
             Page::Startup => self.starting = if cfg!(test) { self.starting } else { startup::ITEMS.map(|item| item.on()) },
             Page::Notifications => self.tried = None,
+            Page::Windows => {
+                if self.follows {
+                    self.windowing = Windowing::load();
+                }
+                self.update(Msg::WindowTick);
+            }
             _ => {}
         }
     }
@@ -322,6 +391,13 @@ impl Settings {
         self.change(|a| a.accent = Accent::from_color(c));
     }
 
+    /// Changes how windows are laid out, and keeps it: NeoShell follows.
+    fn arrange(&mut self, f: impl FnOnce(&mut Windowing)) {
+        f(&mut self.windowing);
+        self.windows_changed = Some(std::time::Instant::now());
+        self.error = self.windowing.save().err().map(|e| format!("Could not save {}: {e}", Windowing::path().display()));
+    }
+
     fn change(&mut self, f: impl FnOnce(&mut Appearance)) {
         let mut a = self.desktop.appearance;
         f(&mut a);
@@ -359,6 +435,10 @@ impl App for Settings {
         // While the Sound page shows, it follows the volume keys and devices coming and going.
         if self.page == Page::Sound {
             subs.push(Subscription::every(SOUND_EVERY, Msg::SoundTick));
+        }
+        // And the Windows page what NeoShell is doing, and what the tiling's keys change.
+        if self.page == Page::Windows {
+            subs.push(Subscription::every(WINDOWS_EVERY, Msg::WindowTick));
         }
         subs
     }
@@ -482,6 +562,52 @@ impl App for Settings {
                 }
                 self.tried = None;
             }
+            Msg::WindowMode(mode) => {
+                self.arrange(|w| w.mode = mode);
+                // What NeoShell said before is of how things were.
+                self.tiler = None;
+            }
+            Msg::WindowLayout(layout) => self.arrange(|w| w.layout = layout),
+            Msg::MasterShare(share) => self.arrange(|w| w.ratio = share.clamp(tiling::RATIOS.0, tiling::RATIOS.1)),
+            Msg::Masters(n) => self.arrange(|w| w.masters = n.clamp(1, tiling::MOST_MASTERS)),
+            Msg::WindowGap(gap) => self.arrange(|w| w.gap = gap),
+            Msg::WindowMargin(margin) => self.arrange(|w| w.margin = margin),
+            Msg::NewWindows(place) => self.arrange(|w| w.new_window = place),
+            Msg::SampleWindows(n) => self.sample_windows = (n.round() as usize).clamp(1, 6),
+            Msg::FloatName(name) => self.float_name = name,
+            Msg::AddFloat => {
+                let name = std::mem::take(&mut self.float_name).trim().to_owned();
+                if !name.is_empty() && !self.windowing.floats(&name) {
+                    self.arrange(|w| w.floating.push(name));
+                }
+            }
+            Msg::RemoveFloat(i) => {
+                if i < self.windowing.floating.len() {
+                    self.arrange(|w| drop(w.floating.remove(i)));
+                }
+            }
+            Msg::WindowTick => {
+                // Asked off the main thread: NeoShell not running takes a moment to find out.
+                if let Some(proxy) = self.proxy.clone().filter(|_| self.follows) {
+                    std::thread::spawn(move || {
+                        proxy.send(Msg::Tiler(neo_desktop::notify::shell_running(), tiling::Status::load(), Windowing::load()));
+                    });
+                }
+            }
+            Msg::Tiler(running, status, kept) => {
+                if self.page == Page::Windows {
+                    // The keys change the layout too, and what they change shows here.
+                    self.tiler = Some((running, status));
+                    if self.windows_changed.is_none_or(|t| t.elapsed() >= SOUND_SETTLES) {
+                        self.windowing = kept;
+                    }
+                }
+            }
+            Msg::OpenAccessibility => {
+                if cfg!(target_os = "macos") && !cfg!(test) {
+                    let _ = std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+                }
+            }
             Msg::Scheme(s) => self.change(|a| a.scheme = s),
             Msg::Accent(c) => {
                 self.picker = None;
@@ -565,6 +691,7 @@ impl Settings {
         }
         let body = match self.page {
             Page::Appearance => self.appearance(),
+            Page::Windows => self.windows_page(),
             Page::Sound => self.sound_page(),
             Page::Network => self.network_page(),
             Page::Bluetooth => self.bluetooth_page(),
@@ -789,6 +916,78 @@ impl Settings {
         page.push(text("Pairing a new device, and connecting or disconnecting one, are done in the system's own Bluetooth settings for now.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into()
     }
 
+    fn windows_page(&self) -> Element<Msg> {
+        let w = &self.windowing;
+        let tiling = w.mode == Mode::Tiling;
+        let wide = |control: Slider<Msg>| container(control).width(220.0);
+        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Windows are", if tiling { "Tiled: laid out to share the screen, and laid out again as they open and close." } else { "Floating: each stays where you put it." }, segmented(["Floating", "Tiling"], Some(usize::from(tiling)), |i| Msg::WindowMode(if i == 1 { Mode::Tiling } else { Mode::Floating })))]));
+        if !tiling {
+            return page.push(text("Tiling arranges the windows of every app so that none covers another, the way a tiling window manager does. Turn it on to choose a layout.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into();
+        }
+        // How it is going, which is NeoShell's to say.
+        let line = |tone: Tone, said: &str, button_for: Option<(&str, Msg)>| -> Element<Msg> {
+            let mut line = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(container(notice(tone, said)).width(Length::Fill));
+            if let Some((label, m)) = button_for {
+                line = line.push(button(label).on_press(m));
+            }
+            line.into()
+        };
+        if !cfg!(target_os = "macos") {
+            page = page.push(line(Tone::Warn, "On this system the desktop's own window manager places windows. What is set here is kept for Neo's own.", None));
+        } else {
+            match &self.tiler {
+                Some((false, _)) => page = page.push(line(Tone::Warn, "NeoShell lays the windows out, and it is not running.", Some(("Start NeoShell", Msg::StartShell)))),
+                Some((true, Some(status))) if !status.allowed => page = page.push(line(Tone::Warn, "NeoShell needs your leave to move other apps' windows. Turn it on under Privacy & Security, Accessibility.", Some(("Open Accessibility", Msg::OpenAccessibility)))),
+                Some((true, Some(status))) => {
+                    page = page.push(line(
+                        Tone::Good,
+                        &match status.windows {
+                            0 => "Tiling. No windows are open to lay out.".to_owned(),
+                            1 => "Tiling 1 window.".to_owned(),
+                            n => format!("Tiling {n} windows."),
+                        },
+                        None,
+                    ))
+                }
+                _ => {}
+            }
+        }
+        // The layout, with a picture of it.
+        let layout_idx = Layout::ALL.iter().position(|l| *l == w.layout);
+        let picture = row().spacing(22.0).align(Align::Center).width(Length::Fill).push(Element::new(windowing::Preview::new(w, self.sample_windows, 300.0))).push(
+            column()
+                .spacing(10.0)
+                .width(Length::Fill)
+                .push(text(w.layout.name()).role(TextRole::Strong))
+                .push(text(w.layout.about()).tone(Tone::Muted).width(Length::Fill))
+                .push(text(format!("Shown with {} window{}.", self.sample_windows, if self.sample_windows == 1 { "" } else { "s" })).role(TextRole::Caption).tone(Tone::Muted))
+                .push(container(slider(1.0..=6.0, self.sample_windows as f32, Msg::SampleWindows).step(1.0)).width(160.0)),
+        );
+        let mut layout = vec![picture.into(), setting("Layout", "The tiling's keys change it too.", segmented(["Main + stack", "Columns", "Grid", "Monocle"], layout_idx, |i| Msg::WindowLayout(Layout::ALL[i])))];
+        if w.layout == Layout::MasterStack {
+            layout.push(setting("Main window's share", &format!("{:.0}% of the screen's width.", w.ratio * 100.0), wide(slider(tiling::RATIOS.0..=tiling::RATIOS.1, w.ratio, Msg::MasterShare).step(0.05))));
+            layout.push(setting("Main windows", "How many are large on the left.", segmented(["1", "2", "3", "4"], Some(w.masters as usize - 1), |i| Msg::Masters(i as u32 + 1))));
+        }
+        layout.push(setting("A new window", if w.new_window == NewWindow::Master { "Becomes the main window." } else { "Goes to the end of the stack." }, segmented(["Joins the stack", "Becomes main"], Some(usize::from(w.new_window == NewWindow::Master)), |i| Msg::NewWindows(if i == 1 { NewWindow::Master } else { NewWindow::Stack }))));
+        let spacing = vec![setting("Gap between windows", &format!("{:.0} px.", w.gap), wide(slider(0.0..=tiling::WIDEST_GAP, w.gap, Msg::WindowGap).step(1.0))), setting("Margin at the screen's edge", &format!("{:.0} px.", w.margin), wide(slider(0.0..=tiling::WIDEST_GAP, w.margin, Msg::WindowMargin).step(1.0)))];
+        // Apps whose windows are left alone.
+        let mut floats: Vec<Element<Msg>> = w.floating.iter().enumerate().map(|(i, app)| row().spacing(16.0).align(Align::Center).width(Length::Fill).push(text(app.clone()).width(Length::Fill)).push(button("Remove").on_press(Msg::RemoveFloat(i))).into()).collect();
+        floats.push(row().spacing(10.0).align(Align::Center).width(Length::Fill).push(text_input("An app's name, as in its menu bar", self.float_name.clone()).on_input(Msg::FloatName).on_submit(Msg::AddFloat).width(Length::Fill)).push(button("Add").on_press(Msg::AddFloat)).into());
+        let mac = cfg!(target_os = "macos");
+        let keys = tiling::KEYS.iter().map(|(key, what)| row().spacing(16.0).align(Align::Center).width(Length::Fill).push(text(*what).width(Length::Fill)).push(container(text(if mac { format!("⌃ ⌥ {key}") } else { format!("Ctrl + Alt + {key}") }).mono().role(TextRole::Strong)).surface(Surface::Pressed).radius(6.0).padding([10.0, 4.0])).into()).collect();
+        page.push(section("Layout"))
+            .push(group(layout))
+            .push(section("Spacing"))
+            .push(group(spacing))
+            .push(section("Always floating"))
+            .push(group(floats))
+            .push(text("Windows of these apps are never tiled. Dialogs, panels and windows that are minimised or full screen are left alone as well.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
+            .push(section("Keys"))
+            .push(group(keys))
+            .push(text("These work from anywhere while tiling is on. Dragging a window onto another swaps the two; dropped anywhere else it goes back to its place.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
+            .into()
+    }
+
     fn notifications(&self) -> Element<Msg> {
         let a = &self.desktop.appearance;
         let mut col = column()
@@ -878,15 +1077,19 @@ fn snapshots(dir: std::path::PathBuf) {
         ("settings-bluetooth", Page::Bluetooth, SchemePref::Dark),
         ("settings-startup", Page::Startup, SchemePref::Dark),
         ("settings-shortcuts", Page::Shortcuts, SchemePref::Light),
+        ("settings-windows", Page::Windows, SchemePref::Dark),
     ] {
         let mut app = Settings::new();
         app.page = page;
         app.desktop.appearance = Appearance { scheme, ..Appearance::default() };
+        app.follows = false;
         app.arrive();
         // With no thread to ask on here, what takes a moment is asked in place.
         match page {
             Page::Network => app.network = Some(network::read()),
             Page::Bluetooth => app.bluetooth = Some(bluetooth::read()),
+            // As it is with tiling on, whatever is set on this computer. (Shown, not saved.)
+            Page::Windows => (app.windowing, app.tiler) = (Windowing { mode: Mode::Tiling, floating: vec!["System Settings".into()], ..Windowing::default() }, Some((true, Some(tiling::Status { allowed: true, windows: 3, possible: true })))),
             _ => {}
         }
         // The picker, open on a colour of one's own. (Shown, not saved: this is a picture of it.)
@@ -973,7 +1176,53 @@ mod tests {
             h.render(1.0);
         }
         let mut settings = std::mem::replace(h.app_mut(), Settings::new());
-        assert_eq!(Page::ALL.len(), 9);
+        assert_eq!(Page::ALL.len(), 10);
+
+        // Windows: floating until tiling is asked for, and what is set is kept for NeoShell to follow.
+        settings.update(Msg::Page(Page::Windows));
+        assert_eq!((settings.windowing.clone(), Windowing::path().exists()), (Windowing::default(), false), "nothing is tiled, or written, until asked");
+        settings.update(Msg::WindowMode(Mode::Tiling));
+        settings.update(Msg::WindowLayout(Layout::Grid));
+        settings.update(Msg::WindowLayout(Layout::MasterStack));
+        settings.update(Msg::MasterShare(0.65));
+        settings.update(Msg::MasterShare(4.0));
+        settings.update(Msg::Masters(2));
+        settings.update(Msg::Masters(40));
+        settings.update(Msg::WindowGap(12.0));
+        settings.update(Msg::WindowMargin(0.0));
+        settings.update(Msg::NewWindows(NewWindow::Master));
+        for name in ["  System Settings ", "", "system settings", "NeoCal"] {
+            settings.update(Msg::FloatName(name.into()));
+            settings.update(Msg::AddFloat);
+        }
+        settings.update(Msg::RemoveFloat(1));
+        settings.update(Msg::RemoveFloat(7));
+        let set = Windowing { mode: Mode::Tiling, layout: Layout::MasterStack, ratio: 0.8, masters: 4, gap: 12.0, margin: 0.0, new_window: NewWindow::Master, floating: vec!["System Settings".into()] };
+        assert_eq!((settings.windowing.clone(), Windowing::load(), settings.error.clone(), settings.float_name.as_str()), (set.clone(), set.clone(), None, ""), "kept within bounds, and written as it is changed");
+        assert_eq!(settings.subscriptions().len(), 2, "the page follows what NeoShell is doing");
+        // What the tiling's keys change shows here, and so does how it is going.
+        settings.update(Msg::SampleWindows(5.4));
+        settings.update(Msg::Tiler(true, None, Windowing::default()));
+        assert_eq!(settings.windowing, set, "what was read just before a change made here does not undo it");
+        settings.windows_changed = None;
+        settings.update(Msg::Tiler(true, Some(tiling::Status { allowed: false, windows: 0, possible: true }), Windowing { layout: Layout::Columns, ..set.clone() }));
+        assert_eq!((settings.windowing.layout, settings.sample_windows, settings.tiler.as_ref().map(|t| t.0)), (Layout::Columns, 5, Some(true)));
+        settings.update(Msg::OpenAccessibility);
+        let mut h = Harness::new(settings, Size::new(920.0, 640.0)).unwrap();
+        for (running, status) in [(false, None), (true, None), (true, Some(tiling::Status { allowed: false, windows: 0, possible: true })), (true, Some(tiling::Status { allowed: true, windows: 4, possible: true }))] {
+            h.app_mut().tiler = Some((running, status));
+            for layout in Layout::ALL {
+                h.app_mut().update(Msg::WindowLayout(layout));
+                h.render(1.0);
+            }
+        }
+        let mut settings = std::mem::replace(h.app_mut(), Settings::new());
+        // Turned off, an answer that comes late from another page is not taken.
+        settings.update(Msg::WindowMode(Mode::Floating));
+        assert_eq!((settings.tiler.clone(), Windowing::load().mode), (None, Mode::Floating));
+        settings.update(Msg::Page(Page::About));
+        settings.update(Msg::Tiler(true, None, set));
+        assert_eq!((settings.windowing.mode, settings.subscriptions().len()), (Mode::Floating, 1));
 
         // The desktop picture: one chosen is the one shown as set.
         settings.update(Msg::Page(Page::Appearance));

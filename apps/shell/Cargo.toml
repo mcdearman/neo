@@ -9,3 +9,8 @@ license.workspace = true
 neo.workspace = true
 neo-desktop.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The keys that move between tiled windows and change their layout.
+global-hotkey = "0.8"
+
+[build-dependencies]
+cc = "1"

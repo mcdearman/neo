@@ -31,6 +31,7 @@ mod appearance;
 pub mod autostart;
 pub mod fs;
 pub mod notify;
+pub mod tiling;
 mod prefs;
 pub mod ui;
 
