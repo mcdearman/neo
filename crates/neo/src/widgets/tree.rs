@@ -94,6 +94,9 @@ struct TreeState {
     clicked: Option<(usize, std::time::Instant)>,
 }
 
+/// What is said when one row is dragged to another.
+type Moved<Id, M> = Rc<dyn Fn(Id, Id, Place) -> M>;
+
 /// Shows a tree: see [`tree`].
 pub struct Tree<Id, M> {
     rows: Vec<Row<Id>>,
@@ -101,7 +104,7 @@ pub struct Tree<Id, M> {
     selected: Option<Id>,
     on_select: Option<Rc<dyn Fn(Id) -> M>>,
     on_toggle: Option<Rc<dyn Fn(Id, bool) -> M>>,
-    on_move: Option<Rc<dyn Fn(Id, Id, Place) -> M>>,
+    on_move: Option<Moved<Id, M>>,
     on_edit: Option<Rc<dyn Fn(TreeEdit<Id>) -> M>>,
     /// The row whose name is being edited, and the field it is edited in.
     editing: Option<(usize, String)>,
