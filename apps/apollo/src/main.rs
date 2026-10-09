@@ -259,6 +259,9 @@ struct Apollo {
     /// A question from outside the window (the search bar, the command
     /// line) that is waiting for the model to be ready or free.
     waiting_question: Option<String>,
+    /// What came with a question from outside, for it to be answered from:
+    /// the question it came with, and the facts.
+    given: Option<(String, String)>,
     /// Files the system says have changed, waiting to be read.
     pending: Vec<PathBuf>,
     /// Tells of changes in the folders that are read. Dropped to stop.
@@ -290,6 +293,9 @@ enum Msg {
     /// A question from outside the window: the search bar, or another
     /// Apollo started with one.
     Ask(String),
+    /// A question from outside that comes with what its asker found out,
+    /// to be answered from that.
+    AskAbout(String, String),
     Piece(String),
     Answered(Result<Answer, String>),
     StopAnswer,
@@ -566,6 +572,7 @@ impl Apollo {
             looked_over: None,
             tell: |_| false,
             waiting_question: None,
+            given: None,
             pending: vec![],
             hearing: None,
             log: Default::default(),
@@ -892,7 +899,10 @@ impl Apollo {
         // Apollo draws on the memory only once it has been unlocked. What
         // it is told and asked is written down either way.
         let (open, keep) = (self.store.is_some(), self.settings.remember_conversations);
-        let aware = assistant::Aware { reading: (self.reading && self.progress.total > 0).then_some((self.progress.done, self.progress.total)), look: LOOK_FOR_ANSWER };
+        // What came with this question, if it is the one that came with something.
+        let given = self.given.take().filter(|(asked, _)| *asked == question).map(|(_, facts)| facts);
+        let about_facts = given.is_some();
+        let aware = assistant::Aware { reading: (self.reading && self.progress.total > 0).then_some((self.progress.done, self.progress.total)), look: LOOK_FOR_ANSWER, given };
         self.work(move |send| {
             let mut store = memory.and_then(|(db, key)| Store::open_for(&db, &key, &*model).ok());
             if let Some(note) = assistant::told_to_remember(&question) {
@@ -916,7 +926,8 @@ impl Apollo {
                     !stop.load(Ordering::Relaxed)
                 },
             );
-            if let (Ok(a), true, Some(store)) = (&answer, keep, store.as_mut())
+            // What a process was doing a moment ago is not something to remember.
+            if let (Ok(a), true, Some(store)) = (&answer, keep && !about_facts, store.as_mut())
                 && !a.text.is_empty()
             {
                 let _ = assistant::keep_exchange(store, &*model, &question, &a.text);
@@ -1317,6 +1328,7 @@ impl App for Apollo {
                 while let Ok(asked) = questions.next() {
                     let heard = match asked {
                         neo_desktop::apollo::Asked::Question(question) if !question.trim().is_empty() => Msg::Ask(question),
+                        neo_desktop::apollo::Asked::About(question, facts) if !question.trim().is_empty() => Msg::AskAbout(question, facts),
                         _ => Msg::Show,
                     };
                     if !proxy.send(heard) {
@@ -1429,6 +1441,10 @@ impl Apollo {
             Msg::Suggest(text) => {
                 self.draft = text;
                 self.send();
+            }
+            Msg::AskAbout(question, facts) => {
+                self.given = Some((question.trim().to_owned(), facts));
+                self.update(Msg::Ask(question));
             }
             Msg::Ask(question) => {
                 self.in_sight = true;
@@ -2346,8 +2362,10 @@ fn main() {
     // `neo-apollo --ask "question"` asks it: of the Apollo that is running,
     // if one is, and otherwise of this one once it is up.
     let question = args.iter().position(|a| a == "--ask").and_then(|i| args.get(i + 1)).filter(|q| !q.trim().is_empty()).cloned();
+    // With `--facts "…"`, it is answered from those: see `neo_desktop::apollo::ask_about`.
+    let facts = args.iter().position(|a| a == "--facts").and_then(|i| args.get(i + 1)).filter(|f| !f.trim().is_empty()).cloned();
     if let Some(question) = &question
-        && neo_desktop::apollo::send_to(&neo_desktop::apollo::port_file(), question)
+        && neo_desktop::notify::send_to(&neo_desktop::apollo::port_file(), &neo_desktop::notify::Notification::new(question.clone(), facts.clone().unwrap_or_default()))
     {
         return;
     }
@@ -2358,6 +2376,7 @@ fn main() {
     let mut app = Apollo::new();
     // Started at login, it waits out of sight for the search bar.
     app.in_sight = !args.iter().any(|a| a == "--hidden") || question.is_some();
+    app.given = question.clone().zip(facts).map(|(q, f)| (q.trim().to_owned(), f));
     app.waiting_question = question.clone();
     app.draft = question.unwrap_or_default();
     if let Err(e) = neo::run(app) {

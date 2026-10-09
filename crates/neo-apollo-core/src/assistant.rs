@@ -228,6 +228,10 @@ pub struct Aware {
     /// How many photos and videos that are only listed may be looked at
     /// to answer one question.
     pub look: usize,
+    /// What whoever asked has found out that bears on the question: System
+    /// Monitor, of a process. The answer is then made from this and not
+    /// from the memory of the user's files, and it is shown with the answer.
+    pub given: Option<String>,
 }
 
 fn now() -> u64 {
@@ -349,10 +353,26 @@ pub fn put(question: &str, recalled: &[Hit], listing: Option<(&Wanted, &[Memory]
     out
 }
 
+/// A question as it is put to the model with facts its asker found out:
+/// the facts first, and what to make of them after, for the reason
+/// [`put`] gives.
+pub fn put_given(question: &str, facts: &str) -> String {
+    format!("These facts were just found on this computer:\n\n{facts}\n\nQuestion: {question}\n\nAnswer in three or four sentences, from these facts. Say what it is and where it comes from, then what it is doing and why that takes what it is using, going by the files it has open and where its processor time went. Say what happens if it is ended only if the facts say; do not say it is safe to end otherwise. Do not repeat the facts as a list.")
+}
+
 /// Answers `question`, which follows `earlier` in the conversation. With
 /// a `store`, from memory; without, the model is told its memory is
 /// locked. `piece` hears the answer as it comes.
 pub fn ask(mut store: Option<&mut Store>, model: &dyn Model, earlier: &[Turn], question: &str, aware: &Aware, looking: &mut dyn FnMut(usize, usize) -> bool, piece: &mut dyn FnMut(&str) -> bool) -> Result<Answer, String> {
+    if let Some(facts) = aware.given.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        let today = neo_desktop::fs::full_time(SystemTime::now());
+        let turns = [Turn::new(Role::System, format!("{WHO} It is {today}.")), Turn::new(Role::User, put_given(question, facts))];
+        let text = model.chat(&turns, piece)?;
+        // What was found is the better part of the answer, and is shown
+        // whatever the model made of it.
+        let said = if says_something(&text) { format!("{}\n\n", text.trim()) } else { String::new() };
+        return Ok(Answer { text: format!("{said}What was found:\n{}", facts.lines().map(|l| if l.trim().is_empty() { String::new() } else { format!("• {l}") }).collect::<Vec<_>>().join("\n")), recalled: vec![], listed: vec![] });
+    }
     let asks = wanted(question, Local::now());
     // A question about a kind of thing or a stretch of time is answered
     // from a list of just those; meaning alone would bring back whatever
@@ -482,6 +502,36 @@ pub fn keep_exchange(store: &mut Store, model: &dyn Model, question: &str, answe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// By hand, with the real model: what it makes of facts it is given.
+    /// `NEO_APOLLO_QUERY="…" NEO_APOLLO_FACTS=file cargo test -p neo-apollo-core real_facts -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_facts() {
+        let model = crate::model::Ollama::from_settings(&crate::settings::Settings::load());
+        let facts = std::fs::read_to_string(std::env::var("NEO_APOLLO_FACTS").unwrap()).unwrap();
+        let answer = ask(None, &model, &[], &std::env::var("NEO_APOLLO_QUERY").unwrap(), &Aware { reading: None, look: 0, given: Some(facts) }, &mut |_, _| true, &mut |_| true).unwrap();
+        println!("{}", answer.text);
+    }
+
+    #[test]
+    fn a_question_that_comes_with_facts_is_answered_from_them_and_shows_them() {
+        let model = crate::model::fake::Fake::default();
+        let facts = "mediaanalysisd (PID 7) is run by chris.\nIt is part of macOS itself.\n\nother (PID 8) is run by root.";
+        let mut heard = String::new();
+        let answer = ask(None, &model, &[], "What is the process “mediaanalysisd”?", &Aware { reading: None, look: 3, given: Some(facts.into()) }, &mut |_, _| panic!("no file is looked at"), &mut |piece| {
+            heard.push_str(piece);
+            true
+        })
+        .unwrap();
+        assert!(answer.recalled.is_empty() && answer.listed.is_empty(), "the memory of the user's files is not what answers");
+        assert!(answer.text.ends_with("What was found:\n• mediaanalysisd (PID 7) is run by chris.\n• It is part of macOS itself.\n\n• other (PID 8) is run by root."), "{}", answer.text);
+        let put = put_given("What is it?", facts);
+        assert!(put.starts_with("These facts were just found on this computer:\n\nmediaanalysisd (PID 7)") && put.contains("Question: What is it?") && put.contains("do not say it is safe to end otherwise"));
+        // With nothing given, it is an ordinary question.
+        let plain = ask(None, &model, &[], "Hello?", &Aware { reading: None, look: 3, given: Some("  ".into()) }, &mut |_, _| true, &mut |_| true).unwrap();
+        assert!(!plain.text.contains("What was found"));
+    }
     use crate::model::fake::Fake;
     use std::path::Path;
 
@@ -604,7 +654,7 @@ mod tests {
         add(Kind::Video, "/m/hike.mp4", "A video of a mountain hiking trail.", now - 60);
         add(Kind::Video, "/m/old.mov", "A video of a cat.", 1_000_000);
         add(Kind::Document, "/d/videos.md", "Notes about videos and films to watch this month.", now - 60);
-        let answer = ask(Some(&mut s), &model, &[], "What videos do I have from this year?", &Aware { reading: Some((40, 900)), look: 0 }, &mut |_, _| true, &mut |_| true).unwrap();
+        let answer = ask(Some(&mut s), &model, &[], "What videos do I have from this year?", &Aware { reading: Some((40, 900)), look: 0, given: None }, &mut |_, _| true, &mut |_| true).unwrap();
         assert_eq!(answer.listed.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["hike.mp4"], "the video from this year, not the old one, and not the document that talks of videos");
         assert!(answer.recalled.iter().all(|h| h.memory.kind == Kind::Video));
         let wants = wanted("What videos do I have from this year?", Local::now());
@@ -612,7 +662,7 @@ mod tests {
         assert!(told.starts_with("The user asks about videos from this year. There is 1, below.\n\n1. A video, in the folder /m, from ") && !told.contains("hike.mp4"), "{told}");
         assert_eq!(told.matches("A video of a mountain hiking trail.").count(), 1, "not listed twice for being near in meaning as well");
         assert!(put("q", &[], Some((&wants, &answer.listed, 40))).contains("There are 40; the newest 1 are below."));
-        let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)), look: 0 })));
+        let knows = briefing(Some((&s.stats().unwrap(), &Aware { reading: Some((40, 900)), look: 0, given: None })));
         assert!(knows.contains("40 of 900 files so far") && knows.contains("Your memory holds 2 videos, 1 documents"), "{knows}");
         assert_eq!(sources(&answer.listed, &answer.recalled).len(), 1);
         // None of that kind and time: said, and nothing offered in its place.
@@ -654,7 +704,7 @@ mod tests {
             &model,
             &[],
             "What photos do I have?",
-            &Aware { reading: None, look: 2 },
+            &Aware { reading: None, look: 2, given: None },
             &mut |i, n| {
                 steps.push((i, n));
                 true
@@ -669,7 +719,7 @@ mod tests {
         // With none allowed, or the looking stopped, it answers from what it has.
         let before = s.stats().unwrap().light;
         ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware::default(), &mut |_, _| panic!("none may be looked at"), &mut |_| true).unwrap();
-        ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware { reading: None, look: 5 }, &mut |_, _| false, &mut |_| true).unwrap();
+        ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware { reading: None, look: 5, given: None }, &mut |_, _| false, &mut |_| true).unwrap();
         assert_eq!(s.stats().unwrap().light, before);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -21,35 +21,56 @@ pub struct About {
 /// small model reads well, and more than anyone means to ask about.
 pub const MOST: usize = 12;
 
-fn described(p: &About) -> String {
-    let program = p.program.as_deref().filter(|at| !at.is_empty()).map_or(String::new(), |at| format!(", the program at {at}"));
-    format!("“{}” (PID {}{program}, run by {}, using {:.1}% of the CPU and {} of memory)", p.name, p.pid, if p.user.is_empty() { "an unknown user" } else { &p.user }, p.cpu, neo_desktop::fs::human_bytes_binary(p.memory))
-}
-
 /// The question to ask of these processes, or nothing if there are none.
-/// Several of one name, as a browser's many helpers are, are asked about
-/// once, with how many there are.
+/// It is short: what was found out about them goes beside it, as facts.
 pub fn question(chosen: &[About]) -> Option<String> {
     match chosen {
         [] => None,
-        [one] => Some(format!("What is the process {} on this computer? What does it do, is it part of the system or of an app, and is it safe to end it?", described(one))),
+        [one] => Some(format!("What is the process “{}”, where does it come from, and why is it using what it is?", one.name)),
         many => {
-            let mut kinds: Vec<(&About, usize)> = vec![];
+            let mut names: Vec<&str> = vec![];
             for p in many {
-                match kinds.iter_mut().find(|(k, _)| k.name == p.name) {
-                    Some((_, n)) => *n += 1,
-                    None => kinds.push((p, 1)),
+                if !names.contains(&p.name.as_str()) {
+                    names.push(&p.name);
                 }
             }
-            let more = kinds.len().saturating_sub(MOST);
-            let mut lines: Vec<String> = kinds.iter().take(MOST).map(|(p, n)| if *n > 1 { format!("- {}, one of {n} with that name", described(p)) } else { format!("- {}", described(p)) }).collect();
+            let more = names.len().saturating_sub(MOST);
+            let mut list = names.iter().take(MOST).map(|n| format!("“{n}”")).collect::<Vec<_>>().join(", ");
             if more > 0 {
-                lines.push(format!("- and {more} more not named here"));
+                list.push_str(&format!(" and {more} more"));
             }
-            Some(format!("What are these processes on this computer? For each, say briefly what it does, whether it is part of the system or of an app, and whether it is safe to end.\n{}", lines.join("\n")))
+            Some(format!("What are these processes, and where does each come from? {list}"))
         }
     }
 }
+
+/// The facts found about several processes, set out one process to a
+/// paragraph, and kept short enough to be sent: the first lines of each.
+pub fn set_out(found: &[Vec<String>]) -> String {
+    let each = (MOST_SENT / found.len().max(1)).max(200);
+    let mut out = String::new();
+    for facts in found {
+        let mut part = String::new();
+        for fact in facts {
+            if part.len() + fact.len() + 1 > each && !part.is_empty() {
+                break;
+            }
+            part.push_str(fact);
+            part.push('\n');
+        }
+        out.push_str(part.trim_end());
+        out.push_str("\n\n");
+    }
+    let mut out = out.trim_end().to_owned();
+    while out.len() > MOST_SENT {
+        out.pop();
+    }
+    out
+}
+
+/// The most that is sent to Apollo with a question, in bytes: it goes in
+/// one packet, and the model that reads it is a small one.
+pub const MOST_SENT: usize = 5000;
 
 #[cfg(test)]
 mod tests {
@@ -60,24 +81,22 @@ mod tests {
     }
 
     #[test]
-    fn one_process_is_asked_about_with_what_is_known_of_it() {
+    fn the_question_is_short_and_names_what_is_asked_about() {
         assert_eq!(question(&[]), None);
-        let q = question(&[about("mds_stores", 412)]).unwrap();
-        assert_eq!(q, "What is the process “mds_stores” (PID 412, the program at /usr/libexec/mds_stores, run by chris, using 12.3% of the CPU and 300 MiB of memory) on this computer? What does it do, is it part of the system or of an app, and is it safe to end it?");
-        // What is not known is left out, not made up.
-        let bare = question(&[About { program: None, user: String::new(), ..about("kernel_task", 0) }]).unwrap();
-        assert!(bare.contains("“kernel_task” (PID 0, run by an unknown user, using") && !bare.contains("program at"), "{bare}");
+        assert_eq!(question(&[about("mds_stores", 412)]).as_deref(), Some("What is the process “mds_stores”, where does it come from, and why is it using what it is?"));
+        // Several: those of one name once.
+        assert_eq!(question(&[about("Safari", 1), about("WebKit", 2), about("WebKit", 3), about("mds", 5)]).as_deref(), Some("What are these processes, and where does each come from? “Safari”, “WebKit”, “mds”"));
+        let many: Vec<About> = (0..40).map(|i| about(&format!("helper{i}"), i)).collect();
+        assert!(question(&many).unwrap().ends_with("“helper11” and 28 more"));
     }
 
     #[test]
-    fn several_are_asked_about_together_and_those_of_one_name_once() {
-        let q = question(&[about("Safari", 1), about("WebKit", 2), about("WebKit", 3), about("WebKit", 4), about("mds", 5)]).unwrap();
-        let lines: Vec<&str> = q.lines().collect();
-        assert_eq!(lines.len(), 4, "{q}");
-        assert!(lines[0].starts_with("What are these processes") && lines[1].starts_with("- “Safari” (PID 1,") && lines[2].ends_with("one of 3 with that name") && lines[3].starts_with("- “mds”"), "{q}");
-        // A great many: the first dozen, and how many more there were.
-        let many: Vec<About> = (0..40).map(|i| about(&format!("helper{i}"), i)).collect();
-        let q = question(&many).unwrap();
-        assert_eq!((q.lines().count(), q.lines().last()), (MOST + 2, Some("- and 28 more not named here")));
+    fn what_was_found_is_set_out_a_process_to_a_paragraph_and_kept_short() {
+        let one = vec!["A is run by chris.".to_owned(), "Its program is /a.".to_owned()];
+        assert_eq!(set_out(&[one.clone(), vec!["B is run by root.".to_owned()]]), "A is run by chris.\nIts program is /a.\n\nB is run by root.");
+        // A great deal found about a great many: each keeps its first lines, and the whole fits.
+        let long: Vec<Vec<String>> = (0..30).map(|i| (0..20).map(|j| format!("Process {i} fact {j} {}", "x".repeat(60))).collect()).collect();
+        let out = set_out(&long);
+        assert!(out.len() <= MOST_SENT && out.contains("Process 0 fact 0") && out.contains("Process 20 fact 0") && !out.contains("Process 0 fact 9"), "{}", out.len());
     }
 }

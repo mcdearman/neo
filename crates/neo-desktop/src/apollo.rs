@@ -30,7 +30,11 @@ impl Questions {
 
     /// Waits for the next thing asked of it.
     pub fn next(&self) -> std::io::Result<Asked> {
-        self.0.recv().map(|note| if note.title == SHOW { Asked::Show } else { Asked::Question(note.title) })
+        self.0.recv().map(|note| match note {
+            note if note.title == SHOW => Asked::Show,
+            note if note.body.trim().is_empty() => Asked::Question(note.title),
+            note => Asked::About(note.title, note.body),
+        })
     }
 }
 
@@ -38,6 +42,9 @@ impl Questions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Asked {
     Question(String),
+    /// A question, and what the asker found out that bears on it: to be
+    /// answered from that, not from Apollo's memory of the user's files.
+    About(String, String),
     /// Only to show its window: it was opened again while running out of sight.
     Show,
 }
@@ -76,6 +83,19 @@ pub fn ask(question: &str) -> std::io::Result<()> {
         return Ok(());
     }
     if crate::fs::open_with("neo-apollo", "Apollo", &["--ask", question]) { Ok(()) } else { Err(std::io::Error::other("Apollo is not installed")) }
+}
+
+/// Asks Apollo `question` with `facts` the asker has found out, which it
+/// answers from and shows with its answer: System Monitor asking what a
+/// process is, with what the system says of it.
+pub fn ask_about(question: &str, facts: &str) -> std::io::Result<()> {
+    if crate::notify::send_to(&port_file(), &Notification::new(question, facts)) {
+        if cfg!(target_os = "macos") {
+            std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn()?;
+        }
+        return Ok(());
+    }
+    if crate::fs::open_with("neo-apollo", "Apollo", &["--ask", question, "--facts", facts]) { Ok(()) } else { Err(std::io::Error::other("Apollo is not installed")) }
 }
 
 #[cfg(test)]

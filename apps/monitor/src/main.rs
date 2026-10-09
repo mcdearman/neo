@@ -8,6 +8,7 @@
 
 mod ask;
 mod detail;
+mod evidence;
 mod heat;
 mod inspect;
 mod net;
@@ -135,12 +136,24 @@ enum Msg {
     Extend(isize),
     /// Ask Apollo what the selected processes are.
     AskApollo,
+    /// What was found out about them, to send with the question.
+    FoundOut(String, String),
     End,
     ConfirmEnd,
     CancelEnd,
     Poll,
     /// The Settings entry and panel every Neo app has.
     Desktop(neo_desktop::DesktopMsg),
+}
+
+/// Where a process's program is. The system does not always say, of one
+/// that is not the user's own; `ps` is asked then, which may.
+fn program_of(sys: &System, pid: Pid) -> Option<String> {
+    let known = sys.process(pid).and_then(|p| p.exe()).map(|e| e.display().to_string()).filter(|e| !e.is_empty());
+    known.or_else(|| {
+        let out = std::process::Command::new("ps").args(["-p", &pid.as_u32().to_string(), "-o", "comm="]).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|p| p.starts_with('/'))
+    })
 }
 
 fn filled(n: usize) -> VecDeque<f32> {
@@ -283,7 +296,7 @@ impl Monitor {
 
     /// What is known of the selected processes, for asking Apollo about them.
     fn asked_about(&self) -> Vec<ask::About> {
-        self.chosen().into_iter().map(|p| ask::About { name: p.name.clone(), pid: p.pid.as_u32(), user: p.user.clone(), program: self.sys.process(p.pid).and_then(|s| s.exe()).map(|e| e.display().to_string()), cpu: p.cpu, memory: p.memory }).collect()
+        self.chosen().into_iter().map(|p| ask::About { name: p.name.clone(), pid: p.pid.as_u32(), user: p.user.clone(), program: program_of(&self.sys, p.pid), cpu: p.cpu, memory: p.memory }).collect()
     }
 }
 
@@ -423,9 +436,47 @@ impl App for Monitor {
                 self.anchor = began.filter(|b| Some(*b) != self.selected);
             }
             Msg::AskApollo => {
-                let Some(question) = ask::question(&self.asked_about()) else { return };
+                let about = self.asked_about();
+                let Some(question) = ask::question(&about) else { return };
+                // What the system keeps of each, to hand: what started it, how, and when.
+                // Each one's parents, command line, seconds running and threads.
+                type Known = (Vec<String>, Vec<String>, u64, Option<u32>);
+                let known: Vec<Known> = about
+                    .iter()
+                    .map(|a| {
+                        let pid = Pid::from_u32(a.pid);
+                        let mut parents = vec![];
+                        let mut at = self.sys.process(pid).and_then(|p| p.parent());
+                        while let Some(p) = at.and_then(|p| self.sys.process(p)).filter(|_| parents.len() < 6) {
+                            parents.push(p.name().to_string_lossy().into_owned());
+                            at = p.parent();
+                        }
+                        let process = self.sys.process(pid);
+                        (parents, process.map(|p| p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()).unwrap_or_default(), process.map_or(0, |p| p.run_time()), self.procs.iter().find(|p| p.pid == pid).and_then(|p| p.threads))
+                    })
+                    .collect();
+                // One is looked at closely, which takes a second or two; several are only described.
+                let closely = about.len() == 1 && !cfg!(test);
+                let find = move || {
+                    let found: Vec<Vec<String>> = about.iter().zip(known).map(|(a, (parents, command, running, threads))| evidence::gather(&evidence::Subject { about: a, parents, command, running, threads }, closely)).collect();
+                    ask::set_out(&found)
+                };
+                match self.proxy.clone() {
+                    Some(proxy) => {
+                        self.status = Some((Tone::Good, "Looking at what it is doing, to ask Apollo…".into()));
+                        std::thread::spawn(move || {
+                            proxy.send(Msg::FoundOut(question, find()));
+                        });
+                    }
+                    None => {
+                        let found = find();
+                        self.update(Msg::FoundOut(question, found));
+                    }
+                }
+            }
+            Msg::FoundOut(question, found) => {
                 // Tests must not start Apollo, or put questions to the one that is running.
-                let asked = if cfg!(test) { Ok(()) } else { neo_desktop::apollo::ask(&question) };
+                let asked = if cfg!(test) { Ok(()) } else { neo_desktop::apollo::ask_about(&question, &found) };
                 self.status = asked.err().map(|e| (Tone::Bad, format!("Apollo could not be asked: {e}")));
             }
             Msg::Move(d) => {
@@ -786,6 +837,21 @@ fn snapshots(dir: std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is found out about a real process, to look at by hand:
+    /// `NEO_ASK_PID=123 cargo test -p neo-monitor found_out -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn found_out() {
+        let pid: u32 = std::env::var("NEO_ASK_PID").expect("NEO_ASK_PID").parse().expect("a number");
+        let mut m = Monitor::new();
+        m.update(Msg::Select(Pid::from_u32(pid)));
+        let about = m.asked_about();
+        let process = m.sys.process(Pid::from_u32(pid)).expect("a process");
+        let parents = process.parent().and_then(|p| m.sys.process(p)).map(|p| vec![p.name().to_string_lossy().into_owned()]).unwrap_or_default();
+        let facts = evidence::gather(&evidence::Subject { about: &about[0], parents, command: process.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect(), running: process.run_time(), threads: None }, true);
+        println!("{}\n\n{}", ask::question(&about).unwrap(), ask::set_out(&[facts]));
+    }
 
     #[test]
     fn several_processes_are_selected_with_shift_and_asked_about_together() {
