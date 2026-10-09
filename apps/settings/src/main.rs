@@ -16,11 +16,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use neo::prelude::*;
-use neo::{Image, Proxy, Size};
+use neo::{Image, Point, Proxy, Rect, Size};
 use neo_desktop::fs::human_bytes_binary;
 use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Appearance, Desktop, SchemePref};
 
+mod bluetooth;
+mod network;
 mod sound;
 mod startup;
 mod wallpaper;
@@ -28,8 +30,9 @@ mod wallpaper;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Appearance,
-    Wallpaper,
     Sound,
+    Network,
+    Bluetooth,
     Notifications,
     Startup,
     Shortcuts,
@@ -38,13 +41,14 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 8] = [Page::Appearance, Page::Wallpaper, Page::Sound, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
+    const ALL: [Page; 9] = [Page::Appearance, Page::Sound, Page::Network, Page::Bluetooth, Page::Notifications, Page::Startup, Page::Shortcuts, Page::Accessibility, Page::About];
 
     fn name(self) -> &'static str {
         match self {
             Page::Appearance => "Appearance",
-            Page::Wallpaper => "Wallpaper",
             Page::Sound => "Sound",
+            Page::Network => "Network",
+            Page::Bluetooth => "Bluetooth",
             Page::Notifications => "Notifications",
             Page::Startup => "Startup",
             Page::Shortcuts => "Shortcuts",
@@ -56,8 +60,9 @@ impl Page {
     fn icon(self) -> neo::theme::Icon {
         match self {
             Page::Appearance => icons::PALETTE,
-            Page::Wallpaper => icons::WALLPAPER,
             Page::Sound => icons::VOLUME_2,
+            Page::Network => icons::WIFI,
+            Page::Bluetooth => icons::BLUETOOTH,
             Page::Notifications => icons::BELL,
             Page::Startup => icons::ROCKET,
             Page::Shortcuts => icons::KEYBOARD,
@@ -100,6 +105,13 @@ struct Settings {
     wallpaper: Option<PathBuf>,
     /// How loud things are, once asked. `None` where the system does not say.
     levels: Option<sound::Levels>,
+    /// What sound can come out of and go into.
+    devices: Vec<sound::Device>,
+    /// Which list of devices is open, for sound in or out, and where it hangs from.
+    choosing: Option<(bool, Point)>,
+    /// How this computer is connected, and Bluetooth, once each has been asked.
+    network: Option<network::Network>,
+    bluetooth: Option<bluetooth::Bluetooth>,
     /// Which of the background apps start at login, as last looked.
     starting: [bool; 4],
     /// What came of sending a notification to try them.
@@ -132,6 +144,18 @@ enum Msg {
     Volume(f32),
     Mute(bool),
     Input(f32),
+    /// Open the list of devices for sound in (true) or out, under its control.
+    ChooseDevice(bool, Rect),
+    CloseChoice,
+    /// Make a device the one used for sound in, or out.
+    PickDevice(u32, bool),
+    /// What the system says of the network, and of Bluetooth.
+    Network(network::Network),
+    Bluetooth(bluetooth::Bluetooth),
+    Wifi(bool),
+    BluetoothPower(bool),
+    /// Open System Monitor, where what is passing over the network is shown.
+    OpenMonitor,
     /// Whether one of the background apps starts at login.
     Starting(usize, bool),
     /// Send a notification, to see how they look.
@@ -149,20 +173,22 @@ const TEXT_SCALES: [(f32, &str); 3] = [(1.0, "Default"), (1.15, "Large"), (1.3, 
 
 impl Settings {
     fn new() -> Self {
-        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, starting: [false; 4], tried: None }
+        Self { desktop: Desktop::load(), page: Page::Appearance, about: About::gather(), error: None, proxy: None, wallpapers: None, thumbs: HashMap::new(), wallpaper: None, levels: None, devices: vec![], choosing: None, network: None, bluetooth: None, starting: [false; 4], tried: None }
     }
 
     /// Looks up what a page shows, on coming to it: these are things that
     /// can have changed behind Settings' back.
     fn arrive(&mut self) {
+        self.choosing = None;
         match self.page {
-            Page::Wallpaper => {
+            Page::Appearance => {
                 self.wallpaper = wallpaper::current();
                 if self.wallpapers.is_none() {
                     // Where the system keeps its own, and wherever the one that is set came
                     // from: a folder of one's own pictures is then all there to choose from.
-                    let mut folders = wallpaper::folders();
-                    folders.extend(self.wallpaper.as_deref().and_then(Path::parent).map(Path::to_path_buf));
+                    // One's own come first: the folder the picture now set is in.
+                    let mut folders: Vec<PathBuf> = self.wallpaper.as_deref().and_then(Path::parent).map(Path::to_path_buf).into_iter().collect();
+                    folders.extend(wallpaper::folders());
                     let mut all = wallpaper::pictures_in(&folders);
                     // The one that is set, if it is from somewhere else.
                     if let Some(now) = self.wallpaper.clone().filter(|now| !all.contains(now)) {
@@ -172,11 +198,30 @@ impl Settings {
                     self.wallpapers = Some(all);
                 }
             }
-            Page::Sound => self.levels = if cfg!(test) { self.levels } else { sound::read() },
+            Page::Sound => {
+                if !cfg!(test) {
+                    (self.levels, self.devices) = (sound::read(), sound::devices());
+                }
+            }
+            Page::Network | Page::Bluetooth => self.ask(self.page, 0),
             Page::Startup => self.starting = if cfg!(test) { self.starting } else { startup::ITEMS.map(|item| item.on()) },
             Page::Notifications => self.tried = None,
             _ => {}
         }
+    }
+
+    /// Asks the system about the network or Bluetooth, off the main
+    /// thread as it takes a second or so, after `wait` milliseconds: a
+    /// change just made takes that long to show.
+    fn ask(&mut self, page: Page, wait: u64) {
+        let Some(proxy) = self.proxy.clone() else { return };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(wait));
+            match page {
+                Page::Network => proxy.send(Msg::Network(network::read())),
+                _ => proxy.send(Msg::Bluetooth(bluetooth::read())),
+            };
+        });
     }
 
     /// Has small copies made of these pictures, off the main thread, each
@@ -250,6 +295,8 @@ impl App for Settings {
 
     fn start(&mut self, proxy: Proxy<Msg>) {
         self.proxy = Some(proxy);
+        // The page it opens on has things to look up too.
+        self.arrive();
     }
 
     fn subscriptions(&self) -> Vec<Subscription<Msg>> {
@@ -286,6 +333,60 @@ impl App for Settings {
             Msg::Volume(level) => self.change_sound(sound::Change::Output(level)),
             Msg::Mute(muted) => self.change_sound(sound::Change::Muted(muted)),
             Msg::Input(level) => self.change_sound(sound::Change::Input(level)),
+            Msg::ChooseDevice(input, under) => self.choosing = Some((input, Point::new(under.x, under.bottom() + 4.0))),
+            Msg::CloseChoice => self.choosing = None,
+            Msg::PickDevice(id, input) => {
+                self.choosing = None;
+                // Tests must not change what this computer plays through.
+                if cfg!(test) || sound::set_default(id, input) {
+                    for d in &mut self.devices {
+                        if input {
+                            d.default_input = d.id == id;
+                        } else {
+                            d.default_output = d.id == id;
+                        }
+                    }
+                    self.error = None;
+                    // Another device has its own loudness.
+                    if !cfg!(test) {
+                        self.levels = sound::read();
+                    }
+                } else {
+                    self.error = Some("The system would not use that device.".into());
+                }
+            }
+            Msg::Network(found) => self.network = Some(found),
+            Msg::Bluetooth(found) => self.bluetooth = Some(found),
+            Msg::Wifi(on) => {
+                let device = self.network.as_ref().and_then(|n| n.connections.iter().find(|c| c.wifi)).map(|c| c.device.clone());
+                match device.map(|d| if cfg!(test) { Ok(()) } else { network::set_wifi(&d, on) }) {
+                    Some(Ok(())) => {
+                        if let Some(n) = &mut self.network {
+                            n.wifi_on = Some(on);
+                        }
+                        self.error = None;
+                        // It takes a few seconds to join a network, or to leave one.
+                        self.ask(Page::Network, 4000);
+                    }
+                    Some(Err(e)) => self.error = Some(e),
+                    None => {}
+                }
+            }
+            Msg::BluetoothPower(on) => {
+                if cfg!(test) || bluetooth::set_power(on) {
+                    if let Some(b) = &mut self.bluetooth {
+                        b.on = Some(on);
+                    }
+                    self.ask(Page::Bluetooth, 2500);
+                } else {
+                    self.error = Some("Bluetooth could not be changed.".into());
+                }
+            }
+            Msg::OpenMonitor => {
+                if !cfg!(test) {
+                    neo_desktop::fs::open_with("neo-monitor", "System Monitor", &[]);
+                }
+            }
             Msg::Starting(i, on) => {
                 if let Some(item) = startup::ITEMS.get(i) {
                     // Tests must not change what starts when this computer does.
@@ -339,8 +440,9 @@ impl Settings {
         }
         let body = match self.page {
             Page::Appearance => self.appearance(),
-            Page::Wallpaper => self.wallpaper_page(),
             Page::Sound => self.sound_page(),
+            Page::Network => self.network_page(),
+            Page::Bluetooth => self.bluetooth_page(),
             Page::Notifications => self.notifications(),
             Page::Startup => self.startup_page(),
             Page::Shortcuts => self.shortcuts(),
@@ -351,7 +453,18 @@ impl Settings {
         if let Some(e) = &self.error {
             main = main.push(notice(Tone::Bad, e.clone()));
         }
-        split(side, scrollable(container(main).padding([30.0, 26.0]).max_width(720.0)))
+        let page = split(side, scrollable(container(main).padding([30.0, 26.0]).max_width(720.0)));
+        // The list of sound devices hangs over everything, from the control that opened it.
+        match self.choosing {
+            Some((input, at)) => {
+                let mut items: Vec<MenuItem<Msg>> = self.devices.iter().filter(|d| if input { d.input } else { d.output }).map(|d| if (input && d.default_input) || (!input && d.default_output) { MenuItem::new(d.name.clone(), Msg::CloseChoice).icon(icons::CHECK) } else { MenuItem::new(d.name.clone(), Msg::PickDevice(d.id, input)) }).collect();
+                if items.is_empty() {
+                    items.push(MenuItem::disabled("None"));
+                }
+                stack().width(Length::Fill).height(Length::Fill).push(page).push(popup_menu(at, items, Msg::CloseChoice)).into()
+            }
+            None => page,
+        }
     }
 }
 
@@ -387,6 +500,8 @@ impl Settings {
                 setting("Corner radius", &format!("{} px. Applies to windows and controls.", a.radius), container(slider(4.0..=28.0, a.radius, Msg::Radius).step(1.0)).width(220.0)),
             ]))
             .push(group(glass))
+            .push(section("Wallpaper"))
+            .push(self.wallpaper_section())
             .push(section("Preview"))
             .push(container(preview).surface(Surface::Well).padding(18.0).width(Length::Fill))
             .into()
@@ -403,7 +518,8 @@ impl Settings {
             .into()
     }
 
-    fn wallpaper_page(&self) -> Element<Msg> {
+    /// The desktop picture: those there are to choose from, and the one that is set.
+    fn wallpaper_section(&self) -> Element<Msg> {
         let now = self.wallpaper.as_deref();
         let said = match now {
             Some(path) => format!("{} is on the desktop.", wallpaper::name(path)),
@@ -429,19 +545,103 @@ impl Settings {
             grid = grid.push(text("No pictures were found on this computer. Choose one of your own.").tone(Tone::Muted));
         }
         let note = if cfg!(target_os = "macos") { "The picture goes on every screen, for the desktop that is showing now. Pictures of your own in Pictures/Wallpapers are listed here too." } else { "Pictures of your own in Pictures/Wallpapers are listed here too." };
-        column().spacing(18.0).width(Length::Fill).push(top).push(grid).push(text(note).role(TextRole::Caption).tone(Tone::Muted)).into()
+        column().spacing(14.0).width(Length::Fill).push(top).push(grid).push(text(note).role(TextRole::Caption).tone(Tone::Muted)).into()
     }
 
     fn sound_page(&self) -> Element<Msg> {
-        let Some(levels) = self.levels else {
-            return group(vec![text("How loud this computer is cannot be read here: its sound is set somewhere Settings cannot ask, such as on a display or an audio interface.").tone(Tone::Muted).width(Length::Fill).into()]);
-        };
         let percent = |level: f32| format!("{:.0}%", level * 100.0);
-        let mut rows = vec![setting("Output volume", &if levels.muted { "Muted.".to_owned() } else { format!("{}. How loud everything plays.", percent(levels.output)) }, container(slider(0.0..=1.0, levels.output, Msg::Volume).step(0.05)).width(240.0)), setting("Mute", "Silences everything without losing where the volume was.", toggle(levels.muted, Msg::Mute))];
-        if let Some(input) = levels.input {
-            rows.push(setting("Input volume", &format!("{}. How loud the microphone is taken, in recordings and calls.", percent(input)), container(slider(0.0..=1.0, input, Msg::Input).step(0.05)).width(240.0)));
+        // The device in use for sound in or out, as a control that opens the list of them.
+        let chooser = |input: bool| -> Element<Msg> {
+            let now = self.devices.iter().find(|d| if input { d.default_input } else { d.default_output }).map_or("None".to_owned(), |d| d.name.clone());
+            let face = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text(now).no_wrap().width(Length::Fill)).push(icon(icons::CHEVRONS_UP_DOWN).size(14.0).tone(Tone::Muted));
+            mouse_area(container(face).surface(Surface::Raised).radius(8.0).padding([12.0, 7.0]).width(260.0)).on_press_in(move |at| Msg::ChooseDevice(input, at)).into()
+        };
+        let has = |input: bool| self.devices.iter().any(|d| if input { d.input } else { d.output });
+        let mut output = vec![];
+        if has(false) {
+            output.push(setting("Play through", "Where sound comes out, unless an app chooses otherwise.", chooser(false)));
         }
-        column().spacing(18.0).width(Length::Fill).push(group(rows)).push(text("These are the system's own levels: changing them here is the same as changing them with the keyboard's volume keys.").role(TextRole::Caption).tone(Tone::Muted)).into()
+        match self.levels {
+            Some(levels) => {
+                output.push(setting("Output volume", &if levels.muted { "Muted.".to_owned() } else { format!("{}. How loud everything plays.", percent(levels.output)) }, container(slider(0.0..=1.0, levels.output, Msg::Volume).step(0.05)).width(260.0)));
+                output.push(setting("Mute", "Silences everything without losing where the volume was.", toggle(levels.muted, Msg::Mute)));
+            }
+            None => output.push(text("How loud this device plays is set on the device itself, such as a display or an audio interface.").tone(Tone::Muted).width(Length::Fill).into()),
+        }
+        let mut input = vec![];
+        if has(true) {
+            input.push(setting("Listen through", "The microphone used for recordings and calls, unless an app chooses otherwise.", chooser(true)));
+        }
+        if let Some(level) = self.levels.and_then(|l| l.input) {
+            input.push(setting("Input volume", &format!("{}. How loud the microphone is taken.", percent(level)), container(slider(0.0..=1.0, level, Msg::Input).step(0.05)).width(260.0)));
+        }
+        let mut page = column().spacing(18.0).width(Length::Fill).push(section("Output")).push(group(output));
+        if !input.is_empty() {
+            page = page.push(section("Input")).push(group(input));
+        }
+        page.push(text("These are the system's own: changing them here is the same as changing them in its sound settings or with the keyboard's volume keys.").role(TextRole::Caption).tone(Tone::Muted)).into()
+    }
+
+    fn network_page(&self) -> Element<Msg> {
+        let Some(net) = &self.network else {
+            return text("Asking how this computer is connected…").tone(Tone::Muted).into();
+        };
+        let mut page = column().spacing(18.0).width(Length::Fill);
+        if let Some(on) = net.wifi_on {
+            page = page.push(group(vec![setting("Wi-Fi", if on { "On. Turning it off leaves every Wi-Fi network." } else { "Off." }, toggle(on, Msg::Wifi))]));
+        }
+        let fact = |k: &str, v: String| -> Element<Msg> { row().spacing(16.0).width(Length::Fill).push(text(k).tone(Tone::Muted).width(140.0)).push(text(v).mono().role(TextRole::Caption).width(Length::Fill)).into() };
+        for c in &net.connections {
+            let state = if c.connected() {
+                ("Connected", Tone::Good)
+            } else if c.wifi && net.wifi_on == Some(false) {
+                ("Off", Tone::Muted)
+            } else {
+                ("Not connected", Tone::Muted)
+            };
+            let head = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(icon(if c.wifi { icons::WIFI } else { icons::NETWORK }).size(18.0).tone(Tone::Accent)).push(text(c.name.clone()).role(TextRole::Strong).width(Length::Fill)).push(text(state.0).role(TextRole::Caption).tone(state.1));
+            let mut rows: Vec<Element<Msg>> = vec![head.into()];
+            if let Some(address) = &c.address {
+                rows.push(fact("Address", format!("{address}{}", if c.automatic { "  ·  given by the network" } else { "  ·  set by hand" })));
+                if let Some(router) = &c.router {
+                    rows.push(fact("Router", router.clone()));
+                }
+                rows.push(fact("Name servers", if c.dns.is_empty() { "The network's own".to_owned() } else { c.dns.join(", ") }));
+            }
+            if !c.mac.is_empty() {
+                rows.push(fact("Hardware address", c.mac.clone()));
+            }
+            rows.push(fact("Interface", c.device.clone()));
+            page = page.push(group(rows));
+        }
+        if net.connections.is_empty() {
+            page = page.push(group(vec![text("This computer is not connected to a network.").tone(Tone::Muted).into()]));
+        }
+        page.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("What is passing over the network, and which programs are using it, is in System Monitor.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).push(button("Open System Monitor").on_press(Msg::OpenMonitor))).into()
+    }
+
+    fn bluetooth_page(&self) -> Element<Msg> {
+        let Some(bt) = &self.bluetooth else {
+            return text("Asking about Bluetooth…").tone(Tone::Muted).into();
+        };
+        let Some(on) = bt.on else {
+            return group(vec![text("This computer has no Bluetooth, or does not say whether it is on.").tone(Tone::Muted).width(Length::Fill).into()]);
+        };
+        let mut page = column().spacing(18.0).width(Length::Fill).push(group(vec![setting("Bluetooth", if on { "On." } else { "Off. Devices that connect by it will not." }, toggle(on, Msg::BluetoothPower))]));
+        let mut rows: Vec<Element<Msg>> = vec![];
+        for d in &bt.devices {
+            let about = [d.kind.clone(), d.battery.clone().map(|b| format!("battery {b}")).unwrap_or_default()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("  ·  ");
+            let mut words = column().spacing(1.0).width(Length::Fill).push(text(d.name.clone()).role(TextRole::Strong).no_wrap());
+            if !about.is_empty() {
+                words = words.push(text(about).role(TextRole::Caption).tone(Tone::Muted));
+            }
+            rows.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(icon(icons::BLUETOOTH).size(16.0).tone(if d.connected && on { Tone::Accent } else { Tone::Faint })).push(words).push(text(if d.connected && on { "Connected" } else { "Not connected" }).role(TextRole::Caption).tone(if d.connected && on { Tone::Good } else { Tone::Muted })).into());
+        }
+        if rows.is_empty() {
+            rows.push(text("No devices have been paired with this computer.").tone(Tone::Muted).into());
+        }
+        page = page.push(section("Devices")).push(group(rows));
+        page.push(text("Pairing a new device, and connecting or disconnecting one, are done in the system's own Bluetooth settings for now.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).into()
     }
 
     fn notifications(&self) -> Element<Msg> {
@@ -524,11 +724,25 @@ fn main() {
 fn snapshots(dir: std::path::PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, page, scheme) in [("settings-appearance", Page::Appearance, SchemePref::Light), ("settings-about", Page::About, SchemePref::Dark), ("settings-wallpaper", Page::Wallpaper, SchemePref::Dark), ("settings-sound", Page::Sound, SchemePref::Light), ("settings-startup", Page::Startup, SchemePref::Dark), ("settings-shortcuts", Page::Shortcuts, SchemePref::Light)] {
+    for (name, page, scheme) in [
+        ("settings-appearance", Page::Appearance, SchemePref::Light),
+        ("settings-about", Page::About, SchemePref::Dark),
+        ("settings-sound", Page::Sound, SchemePref::Dark),
+        ("settings-network", Page::Network, SchemePref::Light),
+        ("settings-bluetooth", Page::Bluetooth, SchemePref::Dark),
+        ("settings-startup", Page::Startup, SchemePref::Dark),
+        ("settings-shortcuts", Page::Shortcuts, SchemePref::Light),
+    ] {
         let mut app = Settings::new();
         app.page = page;
         app.desktop.appearance = Appearance { scheme, ..Appearance::default() };
         app.arrive();
+        // With no thread to ask on here, what takes a moment is asked in place.
+        match page {
+            Page::Network => app.network = Some(network::read()),
+            Page::Bluetooth => app.bluetooth = Some(bluetooth::read()),
+            _ => {}
+        }
         // With no thread to make them on here, the first pictures are made small in place.
         for path in app.wallpapers.clone().unwrap_or_default().into_iter().take(12) {
             if let Some((w, h, rgba)) = wallpaper::thumbnail(&path) {
@@ -567,11 +781,11 @@ mod tests {
             h.render(1.0);
         }
         let mut settings = std::mem::replace(h.app_mut(), Settings::new());
-        assert_eq!(Page::ALL.len(), 8);
+        assert_eq!(Page::ALL.len(), 9);
 
         // The desktop picture: one chosen is the one shown as set.
-        settings.update(Msg::Page(Page::Wallpaper));
-        assert!(settings.wallpapers.is_some(), "looked for on coming to the page");
+        settings.update(Msg::Page(Page::Appearance));
+        assert!(settings.wallpapers.is_some(), "looked for on coming to the page it is on");
         let picture = dir.join("mine.png");
         image::RgbImage::from_pixel(64, 40, image::Rgb([200, 60, 60])).save(&picture).unwrap();
         settings.update(Msg::Wallpaper(picture.clone()));
@@ -591,6 +805,34 @@ mod tests {
         settings.levels = None;
         settings.update(Msg::Volume(0.7));
         assert_eq!(settings.levels, None);
+
+        // The devices sound goes through: the list opens under its control, and one picked is the one in use.
+        let device = |id, name: &str, input: bool, default: bool| sound::Device { id, name: name.into(), input, output: !input, default_input: input && default, default_output: !input && default };
+        settings.devices = vec![device(1, "Speakers", false, true), device(2, "Headphones", false, false), device(3, "Microphone", true, true), device(4, "Headset Mic", true, false)];
+        settings.levels = Some(sound::Levels { output: 0.4, muted: false, input: Some(0.5) });
+        settings.update(Msg::ChooseDevice(false, Rect::new(500.0, 200.0, 260.0, 32.0)));
+        assert_eq!(settings.choosing, Some((false, Point::new(500.0, 236.0))));
+        let mut h = Harness::new(settings, Size::new(920.0, 640.0)).unwrap();
+        h.render(1.0);
+        h.key(neo::Key::Escape, neo::Modifiers::default());
+        let mut settings = std::mem::replace(h.app_mut(), Settings::new());
+        assert_eq!(settings.choosing, None, "Escape closes the list");
+        settings.update(Msg::PickDevice(2, false));
+        settings.update(Msg::PickDevice(4, true));
+        assert_eq!(settings.devices.iter().filter(|d| d.default_output || d.default_input).map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Headphones", "Headset Mic"], "one of each, and only one");
+
+        // The network and Bluetooth: what the system said is shown, and a switch shows at once.
+        settings.update(Msg::Page(Page::Network));
+        assert_eq!(settings.network, None, "asked for, and not there yet");
+        let wifi = network::Connection { name: "Wi-Fi".into(), device: "en0".into(), mac: "7a:41".into(), address: Some("192.168.1.20".into()), router: Some("192.168.1.1".into()), automatic: true, dns: vec![], wifi: true };
+        settings.update(Msg::Network(network::Network { connections: vec![wifi], wifi_on: Some(true) }));
+        settings.update(Msg::Wifi(false));
+        assert_eq!(settings.network.as_ref().and_then(|n| n.wifi_on), Some(false));
+        settings.update(Msg::Page(Page::Bluetooth));
+        settings.update(Msg::Bluetooth(bluetooth::Bluetooth { on: Some(true), devices: vec![bluetooth::Device { name: "Magic Keyboard".into(), kind: "Keyboard".into(), connected: true, battery: Some("80%".into()) }] }));
+        settings.update(Msg::BluetoothPower(false));
+        assert_eq!(settings.bluetooth.as_ref().and_then(|b| b.on), Some(false));
+        settings.update(Msg::OpenMonitor);
 
         // Startup, and trying a notification.
         settings.update(Msg::Page(Page::Startup));

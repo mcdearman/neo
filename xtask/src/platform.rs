@@ -96,6 +96,10 @@ fn info_plist(app: &AppInfo) -> String {
                 // macOS refuses microphone access to apps that do not say why they want it.
                 extra.push_str("\n    <key>NSMicrophoneUsageDescription</key><string>NeoCap records sound from the microphone when you turn that option on.</string>");
             }
+            if app.bin == "neo-settings" {
+                // And Bluetooth, which Settings turns on and off.
+                extra.push_str("\n    <key>NSBluetoothAlwaysUsageDescription</key><string>Settings turns Bluetooth on and off and shows the devices it knows.</string>");
+            }
             extra
         },
     )

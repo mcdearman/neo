@@ -2069,6 +2069,7 @@ dependencies = [
  "neo",
  "neo-desktop",
  "rfd",
+ "serde_json",
  "sysinfo",
 ]
 
