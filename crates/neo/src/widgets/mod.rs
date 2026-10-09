@@ -3,6 +3,7 @@
 mod button;
 mod container;
 mod data;
+mod dock;
 pub(crate) mod frame;
 mod highlight;
 mod icon;
@@ -22,6 +23,7 @@ pub use container::{container, Background, Container};
 pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, ExtraSelection, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
+pub use dock::{dock, Dock, DockView, Side};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};
 pub use icon::{icon, Icon};
 pub use menu::{popup_menu, MenuItem, PopupMenu};
@@ -58,4 +60,4 @@ macro_rules! into_element_generic {
 }
 
 into_element!(Text, Icon, Divider, ProgressBar, Gauge, Sparkline);
-into_element_generic!(PopupMenu, Button, Container, Scrollable, Segmented, Slider, TextEditor, TextInput, Toggle, Checkbox);
+into_element_generic!(PopupMenu, Button, Container, DockView, Scrollable, Segmented, Slider, TextEditor, TextInput, Toggle, Checkbox);

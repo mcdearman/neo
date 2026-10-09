@@ -131,6 +131,8 @@ Neo is built on [Armature](https://github.com/mcdearman/armature), a GUI framewo
 
 An app that draws a picture of its own, a game say, can share the window's graphics device: `App::graphics` hands it the device and queue (made with whatever `App::wanted_features` and `App::wanted_limits` asked for), `App::step` is called before each frame so it can draw its own first, `Image::from_texture` shows a texture it draws into, and the `viewport` widget puts that picture among Neo's widgets, reports its size and scale, and passes on the pointer and keys while it has the keyboard, holding the pointer for looking around if asked.
 
+`dock` arranges panels in a window: side by side, one above another, or behind one another as tabs. The arrangement is a `Dock` value the app keeps; the widget shows it and hands back what it would be after a tab is chosen, a bar between groups is dragged, or a tab is dragged onto another group or to one side of it. `Dock::encode` writes it as a line of text (`row(0.25, tabs(*scene, assets), column(0.7, tabs(*view), tabs(*console, log)))`) to keep in a settings file, and `Dock::parse` reads it back.
+
 | Crate | Role |
 |---|---|
 | `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |
