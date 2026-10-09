@@ -176,7 +176,6 @@ impl Monitor {
         self.sys.refresh_memory();
         self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cpu().with_memory().with_user(UpdateKind::OnlyIfNotSet));
         self.networks.refresh(true);
-        let cores = self.sys.cpus().len().max(1) as f32;
         push(&mut self.cpu, self.sys.global_cpu_usage());
         let total = self.sys.total_memory().max(1) as f32;
         push(&mut self.memory, self.sys.used_memory() as f32 / total * 100.0);
@@ -203,7 +202,11 @@ impl Monitor {
                 pid: p.pid(),
                 name: p.name().to_string_lossy().into_owned(),
                 user: p.user_id().and_then(|u| self.users.get_user_by_id(u)).map(|u| u.name().to_string()).unwrap_or_default(),
-                cpu: p.cpu_usage() / cores,
+                // Of one core, as the system's own monitor and `top` give it: a
+                // process busy on two cores reads 200%. Shared out over every
+                // core instead, a process flat out on one of ten read 10% and
+                // looked idle.
+                cpu: p.cpu_usage(),
                 // The footprint where the system keeps one, as its own
                 // monitor shows; otherwise what is resident.
                 memory: quick.get(&p.pid().as_u32()).and_then(|q| q.footprint).unwrap_or(p.memory()),
@@ -506,7 +509,7 @@ impl Monitor {
         let header = header.push(header_cell("Threads", SortBy::Threads, Length::Fixed(76.0), Align::End)).push(header_cell("PID", SortBy::Pid, Length::Fixed(70.0), Align::End));
         let mut rows = column().spacing(1.0).width(Length::Fill).padding([10.0, 4.0, 10.0, 10.0]);
         for p in v.iter().take(MAX_PROCESSES) {
-            let cpu = row().spacing(8.0).align(Align::Center).width(120.0).push(Space::fill_x()).push(progress_bar((p.cpu / 50.0).min(1.0)).width(44.0).height(6.0)).push(text(format!("{:.1}%", p.cpu)).mono().role(TextRole::Caption).align(Align::End).width(50.0));
+            let cpu = row().spacing(8.0).align(Align::Center).width(120.0).push(Space::fill_x()).push(progress_bar((p.cpu / 100.0).min(1.0)).width(44.0).height(6.0)).push(text(format!("{:.1}%", p.cpu)).mono().role(TextRole::Caption).align(Align::End).width(50.0));
             let mut content = row()
                 .spacing(12.0)
                 .align(Align::Center)

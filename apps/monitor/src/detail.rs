@@ -181,7 +181,7 @@ impl Monitor {
         let tiles = row()
             .spacing(12.0)
             .width(Length::Fill)
-            .push(tile("CPU", proc.map_or("—".into(), |p| format!("{:.1}%", p.cpu)), "Of the whole machine".into()))
+            .push(tile("CPU", proc.map_or("—".into(), |p| format!("{:.1}%", p.cpu)), "Of one core; over 100% is more than one".into()))
             .push(tile("Memory", proc.map_or("—".into(), |p| human_bytes_binary(p.memory)), proc.map_or(String::new(), |p| format!("In RAM: {} · Virtual: {}", human_bytes_binary(p.resident), human_bytes_binary(p.virtual_memory)))))
             .push(tile("Swap", swap_value, swap_note))
             .push(tile("Threads", count, if inspect.threads.is_ok() { format!("{running} running now") } else { String::new() }));
