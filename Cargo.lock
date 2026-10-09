@@ -2064,8 +2064,11 @@ dependencies = [
 name = "neo-settings"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "image",
  "neo",
  "neo-desktop",
+ "rfd",
  "sysinfo",
 ]
 

@@ -1565,6 +1565,10 @@ impl Apollo {
             Msg::Background(on) => {
                 self.settings.background = on;
                 self.save_settings();
+                // Asked for here, it is wanted at login again whatever Settings was told before.
+                if on && !cfg!(test) {
+                    let _ = neo_desktop::autostart::set_declined("org.neo.Apollo", false);
+                }
                 keep_at_startup(on);
                 self.serve_anew_quietly();
             }
@@ -2260,6 +2264,8 @@ fn keep_at_startup(wanted: bool) {
         return;
     }
     let entry = neo_desktop::autostart::Entry { id: "org.neo.Apollo", name: "Apollo", program: &program, args: &["--hidden"] };
+    // Turned off in Settings, it stays off though it is set to stay ready.
+    let wanted = wanted && !neo_desktop::autostart::declined(entry.id);
     match (wanted, neo_desktop::autostart::is_enabled(&entry)) {
         (true, false) => drop(neo_desktop::autostart::enable(&entry)),
         (false, true) => drop(neo_desktop::autostart::disable(&entry)),

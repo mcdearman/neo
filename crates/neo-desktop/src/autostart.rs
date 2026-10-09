@@ -65,6 +65,40 @@ fn command_line(e: &Entry) -> String {
     std::iter::once(e.program.to_string_lossy().into_owned()).chain(e.args.iter().map(|a| a.to_string())).map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(" ")
 }
 
+/// Where it is noted which apps the user has said are not to start at login.
+fn declined_file() -> std::path::PathBuf {
+    crate::config_dir().join("startup.conf")
+}
+
+/// The apps noted in `text` as not to start at login, by their IDs.
+fn declined_in(text: &str) -> Vec<String> {
+    text.lines().filter_map(|l| l.split_once('=')).filter(|(_, v)| v.trim() == "false").map(|(id, _)| id.trim().to_owned()).filter(|id| !id.is_empty()).collect()
+}
+
+/// Whether the user has said this app is not to start at login. Neo's
+/// background apps set themselves to start when they are first run, so
+/// that their shortcuts work after a restart; one turned off in Settings
+/// is to stay off, and this is how it knows.
+pub fn declined(id: &str) -> bool {
+    declined_in(&std::fs::read_to_string(declined_file()).unwrap_or_default()).iter().any(|d| d == id)
+}
+
+/// Notes that the user does not want this app started at login, or that
+/// they do again.
+pub fn set_declined(id: &str, declined: bool) -> std::io::Result<()> {
+    let path = declined_file();
+    let mut ids = declined_in(&std::fs::read_to_string(&path).unwrap_or_default());
+    ids.retain(|d| d != id);
+    if declined {
+        ids.push(id.to_owned());
+    }
+    ids.sort();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, ids.iter().map(|id| format!("{id} = false\n")).collect::<String>())
+}
+
 /// Whether the app is set to start at login exactly as `e` describes. A
 /// startup item that points at an older copy of the program counts as not set.
 pub fn is_enabled(e: &Entry) -> bool {
@@ -116,6 +150,12 @@ pub fn disable(e: &Entry) -> std::io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apps_turned_off_at_login_are_noted() {
+        assert_eq!(declined_in("org.neo.Shell = false\norg.neo.Launcher=true\n\n org.neo.Apollo = false \nnonsense\n"), ["org.neo.Shell", "org.neo.Apollo"]);
+        assert_eq!(declined_in(""), Vec::<String>::new());
+    }
 
     #[test]
     fn describes_the_program_and_its_arguments() {

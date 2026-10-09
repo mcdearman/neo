@@ -367,7 +367,8 @@ fn keep_at_startup() {
     if !installed {
         return;
     }
-    let wanted = !std::fs::read_to_string(neo_desktop::config_dir().join("launcher.conf")).unwrap_or_default().lines().any(|l| l.replace(' ', "") == "launch-at-startup=false");
+    // Turned off in `launcher.conf`, or in Settings.
+    let wanted = !std::fs::read_to_string(neo_desktop::config_dir().join("launcher.conf")).unwrap_or_default().lines().any(|l| l.replace(' ', "") == "launch-at-startup=false") && !neo_desktop::autostart::declined("org.neo.Launcher");
     let Ok(program) = std::env::current_exe() else { return };
     let entry = neo_desktop::autostart::Entry { id: "org.neo.Launcher", name: "Launcher", program: &program, args: &["--hidden"] };
     let _ = if !wanted {

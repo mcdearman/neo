@@ -287,6 +287,12 @@ pub fn reveal(path: &Path) -> std::io::Result<()> {
     open(path.parent().unwrap_or(path))
 }
 
+/// Where another Neo app's program is, if it is installed: beside this
+/// one, in a bundle beside this one's, or in the user's Applications.
+pub fn neo_app(program: &str, bundle: &str) -> Option<PathBuf> {
+    neo_app_candidates(program, bundle).into_iter().find(|p| p.is_file())
+}
+
 /// Starts another Neo app with these arguments. Returns false if that
 /// app is not installed.
 pub fn open_with(program: &str, bundle: &str, args: &[&str]) -> bool {
