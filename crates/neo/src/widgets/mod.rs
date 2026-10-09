@@ -5,6 +5,7 @@ mod color;
 mod container;
 mod data;
 mod dock;
+mod drop;
 pub(crate) mod frame;
 mod highlight;
 mod icon;
@@ -30,6 +31,7 @@ pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, Ex
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use dock::{dock, Dock, DockView, Side};
+pub use drop::{drop_area, DropArea};
 pub use tree::{tree, Place, Tree, TreeEdit, TreeNode};
 pub use transcript::{conversation, conversation_linked, prompt, transcript, Asking, Entry, Prompt, Said, Speaker, ToolRow, ToolState};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};

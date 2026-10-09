@@ -112,6 +112,7 @@ pub struct Tree<Id, M> {
     layouts: Vec<TextLayout>,
     chevrons: Option<(TextLayout, TextLayout)>,
     icons: Vec<Option<TextLayout>>,
+    carries: bool,
 }
 
 /// A tree of `nodes`, with the one `selected` marked. It is as tall as its
@@ -130,7 +131,7 @@ pub fn tree<Id: Clone + PartialEq + 'static, M>(nodes: &[TreeNode<Id>], selected
     }
     let (mut rows, mut labels) = (vec![], vec![]);
     flatten(nodes, 0, &mut rows, &mut labels);
-    Tree { rows, labels, selected: selected.cloned(), on_select: None, on_toggle: None, on_move: None, on_edit: None, editing: None, field: vec![], layouts: vec![], chevrons: None, icons: vec![] }
+    Tree { rows, labels, selected: selected.cloned(), on_select: None, on_toggle: None, on_move: None, on_edit: None, editing: None, field: vec![], layouts: vec![], chevrons: None, icons: vec![], carries: false }
 }
 
 impl<Id: Clone + PartialEq + 'static, M: Clone + 'static> Tree<Id, M> {
@@ -150,6 +151,14 @@ impl<Id: Clone + PartialEq + 'static, M: Clone + 'static> Tree<Id, M> {
     /// before or after it. Never a row onto itself or into what is inside it.
     pub fn on_move(mut self, f: impl Fn(Id, Id, Place) -> M + 'static) -> Self {
         self.on_move = Some(Rc::new(f));
+        self
+    }
+
+    /// Lets rows be dragged out of the tree: a row dragged carries its ID,
+    /// for a [`drop_area`](super::drop_area) of that kind to be given
+    /// when it is let go there.
+    pub fn draggable(mut self, carries: bool) -> Self {
+        self.carries = carries;
         self
     }
 
@@ -291,8 +300,13 @@ impl<Id: Clone + PartialEq + 'static, M: Clone + 'static> Widget<M> for Tree<Id,
                 let over = self.row_at(b, *pos);
                 let st = cx.state::<TreeState>();
                 st.pointer = *pos;
-                if let Some((_, from)) = st.pressed {
-                    st.moving |= self.on_move.is_some() && ((pos.x - from.x).abs() > SLACK || (pos.y - from.y).abs() > SLACK);
+                if let Some((row, from)) = st.pressed {
+                    let began = !st.moving && (self.on_move.is_some() || self.carries) && ((pos.x - from.x).abs() > SLACK || (pos.y - from.y).abs() > SLACK);
+                    st.moving |= began;
+                    // Carried, for whatever else it may be let go on: a field that refers to one of these.
+                    if began && self.carries {
+                        cx.start_drag(self.rows[row].id.clone());
+                    }
                     cx.request_redraw();
                     if cx.state::<TreeState>().moving {
                         cx.set_cursor(CursorIcon::Grabbing);
