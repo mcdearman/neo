@@ -1,6 +1,7 @@
 //! Built-in widgets. Most have a lower-case shorthand constructor.
 
 mod button;
+mod color;
 mod container;
 mod data;
 mod dock;
@@ -8,6 +9,7 @@ pub(crate) mod frame;
 mod highlight;
 mod icon;
 mod menu;
+mod number;
 mod scrollable;
 mod segmented;
 mod slider;
@@ -21,6 +23,7 @@ mod tree;
 
 pub use button::{button, icon_button, Button, ButtonKind};
 pub use container::{container, Background, Container};
+pub use color::{hex, hues, parse_hex, shades, Hsv, Plane};
 pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, ExtraSelection, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
@@ -29,6 +32,7 @@ pub use tree::{tree, Place, Tree, TreeEdit, TreeNode};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};
 pub use icon::{icon, Icon};
 pub use menu::{popup_menu, MenuItem, PopupMenu};
+pub use number::{number_field, reference_field, vector_field, vector_field_scrubbed, NumberField, AXES};
 pub use scrollable::{scrollable, Scrollable};
 pub use segmented::{segmented, Segmented};
 pub use slider::{slider, Slider};

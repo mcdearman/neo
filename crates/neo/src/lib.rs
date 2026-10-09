@@ -45,7 +45,7 @@ pub mod widgets;
 
 // Where widgets expect to find the framework's types.
 mod core {
-    pub use armature::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, Widget, WindowRequest};
+    pub use armature::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WindowRequest};
 }
 mod event {
     pub use armature::{Event, Key, Modifiers, PointerButton, Status};

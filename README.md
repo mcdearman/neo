@@ -141,6 +141,8 @@ An app that draws a picture of its own, a game say, can share the window's graph
 
 `tree` shows things inside things, from `TreeNode`s that carry an ID of the app's own: rows open and close, one is selected with the pointer or the arrow keys, a name is edited where it stands (a double click, Enter or F2), and a row is dragged into another or between two. Which rows are open, which is selected and what is being typed are the app's to keep; the widget says what was done.
 
+For the properties of things: `number_field` is a number dragged like a slider with no ends, nudged with the arrow keys or typed over, kept to a step and a range, and saying when a drag begins and ends; `vector_field` is one to each part of a vector, named and coloured as axes; `reference_field` stands for something else, an entity or a file, and is clicked to choose another. The plane of shades, the strip of hues and the hex codes that Settings picks a colour with (`Plane`, `shades`, `hues`, `Hsv`, `hex`, `parse_hex`) are in the toolkit for any app.
+
 | Crate | Role |
 |---|---|
 | `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |
