@@ -143,6 +143,8 @@ An app that draws a picture of its own, a game say, can share the window's graph
 
 For the properties of things: `number_field` is a number dragged like a slider with no ends, nudged with the arrow keys or typed over, kept to a step and a range, and saying when a drag begins and ends; `vector_field` is one to each part of a vector, named and coloured as axes; `reference_field` stands for something else, an entity or a file, and is clicked to choose another. The plane of shades, the strip of hues and the hex codes that Settings picks a colour with (`Plane`, `shades`, `hues`, `Hsv`, `hex`, `parse_hex`) are in the toolkit for any app.
 
+For a conversation: `transcript` shows what has been said (`Said`, by `Speaker::You`, `Them` or a `Note`), scrolling and kept at its end as more arrives; `prompt` is a few lines to write the next thing in, growing with what is written, where Enter sends it and Shift with Enter starts a new line.
+
 | Crate | Role |
 |---|---|
 | `neo-theme` | Neo's design tokens: palettes, surface materials, type scale, bundled fonts and 1,539 Lucide icons. |

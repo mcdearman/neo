@@ -85,6 +85,8 @@ pub struct TextEditor<M> {
     rows: Vec<TextLayout>,
     numbers: Vec<TextLayout>,
     longest: f32,
+    /// Whether lines are numbered down the left: not, for a few lines of prose.
+    gutter: bool,
 }
 
 impl<M> TextEditor<M> {
@@ -127,6 +129,7 @@ impl<M> TextEditor<M> {
             rows: vec![],
             numbers: vec![],
             longest: 0.0,
+            gutter: true,
         }
     }
 
@@ -232,6 +235,13 @@ impl<M> TextEditor<M> {
     }
 
     /// Font size before the user's text scale.
+    /// Without the numbered margin down the left: for a few lines of
+    /// prose, a message being written say, where lines are not counted.
+    pub fn gutter(mut self, gutter: bool) -> Self {
+        self.gutter = gutter;
+        self
+    }
+
     pub fn font_size(mut self, s: f32) -> Self {
         self.font_size = s;
         self
@@ -527,7 +537,7 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
         self.char_w = digit.size().w.max(1.0);
         self.line_h = digit.size().h.max(1.0);
         let digits = self.lines.len().to_string().len().max(3);
-        self.gutter_w = (digits as f32 * self.char_w + GUTTER_PAD * 2.0).round();
+        self.gutter_w = if self.gutter { (digits as f32 * self.char_w + GUTTER_PAD * 2.0).round() } else { 0.0 };
         self.longest = self.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32 * self.char_w;
 
         let theme = *cx.theme();
@@ -808,8 +818,10 @@ impl<M: 'static> Widget<M> for TextEditor<M> {
 
         // Gutter: separator and line numbers.
         let sep = Rect::new(b.x + self.gutter_w - 1.0, b.y, 1.0, b.h);
-        cx.scene.fill(sep, 0.0, p.line.with_alpha(0.7), None);
-        for (i, n) in self.numbers.iter().enumerate() {
+        if self.gutter {
+            cx.scene.fill(sep, 0.0, p.line.with_alpha(0.7), None);
+        }
+        for (i, n) in self.numbers.iter().enumerate().filter(|_| self.gutter) {
             let line = self.first + i;
             let y = self.line_y(b, scroll, line);
             let current = sel.map_or(line == self.cursor.line, |(s, e)| line >= s.line && line <= e.line);
