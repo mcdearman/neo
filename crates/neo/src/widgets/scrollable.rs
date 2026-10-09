@@ -14,6 +14,8 @@ struct ScrollLook {
     hover: Anim,
     /// The last request to bring something into view that was met.
     revealed: u64,
+    /// How tall the content was and how tall the view, when last laid out.
+    was: Option<(f32, f32)>,
 }
 
 /// Scrolls its child vertically.
@@ -25,11 +27,12 @@ pub struct Scrollable<M> {
     /// A request to bring one of the content's children into view: its
     /// number, and which child.
     reveal: Option<(u64, usize)>,
+    follow_end: bool,
 }
 
 impl<M: 'static> Scrollable<M> {
     pub fn new(child: impl Into<Element<M>>) -> Self {
-        Self { child: [child.into()], width: Length::Fill, height: Length::Fill, logic: ScrollLogic::default(), reveal: None }
+        Self { child: [child.into()], width: Length::Fill, height: Length::Fill, logic: ScrollLogic::default(), reveal: None, follow_end: false }
     }
 
     pub fn width(mut self, w: impl Into<Length>) -> Self {
@@ -48,6 +51,16 @@ impl<M: 'static> Scrollable<M> {
     /// asks for nothing.
     pub fn reveal(mut self, serial: u64, index: usize) -> Self {
         self.reveal = (serial != 0).then_some((serial, index));
+        self
+    }
+}
+
+impl<M: 'static> Scrollable<M> {
+    /// Stays at the end as the content grows, for as long as it is at the
+    /// end: a conversation, a log. Scrolled back to read something
+    /// earlier, it stays where it was put until it is scrolled to the end again.
+    pub fn follow_end(mut self, follow: bool) -> Self {
+        self.follow_end = follow;
         self
     }
 }
@@ -96,6 +109,14 @@ impl<M: 'static> Widget<M> for Scrollable<M> {
                 st.offset = top - room;
             } else if bottom + room > st.offset + size.h {
                 st.offset = bottom + room - size.h;
+            }
+        }
+        // At the end before, it is at the end now, however much more there is.
+        if self.follow_end {
+            let offset = cx.state::<ScrollState>().offset;
+            let was = cx.state::<ScrollLook>().was.replace((cs.h, size.h));
+            if was.is_none_or(|(content, view)| offset >= content - view - 2.0) {
+                cx.state::<ScrollState>().offset = (cs.h - size.h).max(0.0);
             }
         }
         let off = self.logic.clamp(cx, size.h);

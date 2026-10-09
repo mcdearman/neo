@@ -30,7 +30,7 @@ pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
 pub use dock::{dock, Dock, DockView, Side};
 pub use tree::{tree, Place, Tree, TreeEdit, TreeNode};
-pub use transcript::{prompt, transcript, Prompt, Said, Speaker};
+pub use transcript::{conversation, prompt, transcript, Asking, Entry, Prompt, Said, Speaker, ToolRow, ToolState};
 pub use armature::widgets::{column, fit_rect, label, mouse_area, picture, row, stack, viewport, Column, Fit, Flex, Justify, Label, Map, MouseArea, Picture, Row, Space, Stack, Viewport, ViewportEvent};
 pub use icon::{icon, Icon};
 pub use menu::{popup_menu, MenuItem, PopupMenu};

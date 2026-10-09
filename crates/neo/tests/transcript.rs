@@ -103,3 +103,160 @@ fn a_long_conversation_is_kept_at_its_end() {
     let above = |px: &[u8]| px[..200 * 400 * 4].to_vec();
     assert!(above(&shown) == above(&after) || shown != after);
 }
+
+/// An agent at work: it says something, uses tools, and asks leave.
+mod agent {
+    use neo::prelude::*;
+    use neo::testing::Harness;
+    use neo::{Event, Point, Size};
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Msg {
+        Toggled(u32, bool),
+        Allow,
+        Always,
+        Refuse,
+    }
+
+    pub struct Agent {
+        pub entries: Vec<Entry<u32, Msg>>,
+        pub heard: Vec<Msg>,
+    }
+
+    impl App for Agent {
+        type Message = Msg;
+
+        fn update(&mut self, m: Msg) {
+            self.heard.push(m.clone());
+            match m {
+                Msg::Toggled(id, open) => {
+                    for e in &mut self.entries {
+                        if let Entry::Tool(t) = e
+                            && t.id == id
+                        {
+                            t.open = open;
+                        }
+                    }
+                }
+                // Answered, what was asked becomes a note of the answer.
+                answer => {
+                    for e in &mut self.entries {
+                        if matches!(e, Entry::Ask(_)) {
+                            *e = Entry::Said(Said::new(Speaker::Note, format!("{answer:?}")));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn view(&self) -> Element<Msg> {
+            conversation(&self.entries, Msg::Toggled)
+        }
+
+        fn window(&self) -> neo::WindowSettings {
+            neo::WindowSettings { decorations: Decorations::System, ..Default::default() }
+        }
+    }
+
+    pub fn working() -> Harness<Agent> {
+        let mut read = ToolRow::new(7, "read_file", "src/main.rs");
+        (read.state, read.input, read.result) = (ToolState::Done, "{ \"path\": \"src/main.rs\" }".into(), "fn main() {\n    println!(\"hello\");\n}".into());
+        let entries = vec![
+            Entry::Said(Said::new(Speaker::You, "Make it say goodbye.")),
+            Entry::Said(Said::new(Speaker::Them, "I'll look at the file first.")),
+            Entry::Tool(read),
+            Entry::Tool(ToolRow::new(8, "run", "cargo build")),
+            Entry::Ask(Asking { what: "Run this command?".into(), detail: "cargo build --release".into(), choices: vec![("Allow once".into(), Msg::Allow), ("Always allow".into(), Msg::Always), ("Refuse".into(), Msg::Refuse)] }),
+        ];
+        let mut h = Harness::new(Agent { entries, heard: vec![] }, Size::new(420.0, 640.0)).expect("a GPU adapter is required for these tests");
+        h.render(1.0);
+        h
+    }
+
+    /// Clicks down the window from `from` until something is heard, and says where that was.
+    pub fn click_until_heard(h: &mut Harness<Agent>, x: f32, from: f32) -> Option<f32> {
+        let before = h.app().heard.len();
+        (0..120).map(|i| from + i as f32 * 3.0).find(|y| {
+            h.click(Point::new(x, *y));
+            h.render(1.0);
+            h.app().heard.len() > before
+        })
+    }
+
+    pub fn wheel(h: &mut Harness<Agent>, by: f32) {
+        h.event(Event::Wheel { pos: Point::new(200.0, 200.0), delta: Point::new(0.0, by) });
+        h.render(1.0);
+    }
+}
+
+#[test]
+fn a_tools_row_opens_to_show_what_went_in_and_what_came_out() {
+    use agent::*;
+    let mut h = working();
+    let shut = h.render(1.0);
+    // The first row that hears a click is the first tool's: it is to be opened.
+    let at = click_until_heard(&mut h, 200.0, 20.0).expect("a tool's row");
+    assert_eq!(h.app().heard, [Msg::Toggled(7, true)]);
+    let open = h.render(1.0);
+    assert!(open != shut, "what it was given and what came back are shown");
+    // Clicked again where its line is, it shuts, and the picture is as it was.
+    h.click(neo::Point::new(200.0, at));
+    assert_eq!(h.app().heard.last(), Some(&Msg::Toggled(7, false)));
+    assert!(h.render(1.0) == shut);
+    // The one below it is still running, and opens to say there is nothing yet.
+    let below = click_until_heard(&mut h, 200.0, at + 24.0).expect("the second tool's row");
+    assert!(below > at && h.app().heard.last() == Some(&Msg::Toggled(8, true)));
+}
+
+#[test]
+fn what_is_asked_is_answered_with_a_button_and_becomes_a_note() {
+    use agent::*;
+    let mut h = working();
+    // Past the tools' rows, the first thing that answers a click at the left is the first answer.
+    let mut heard = vec![];
+    for y in (150..620).step_by(4) {
+        h.click(neo::Point::new(50.0, y as f32));
+        h.render(1.0);
+        if let Some(m) = h.app().heard.last().filter(|m| !matches!(m, Msg::Toggled(..))) {
+            heard.push(m.clone());
+            break;
+        }
+    }
+    assert_eq!(heard, [Msg::Allow], "the first button is the usual answer");
+    assert!(h.app().entries.iter().all(|e| !matches!(e, Entry::Ask(_))), "and nothing is being asked any more");
+    assert!(matches!(h.app().entries.last(), Some(Entry::Said(s)) if s.who == Speaker::Note && s.text == "Allow"));
+}
+
+#[test]
+fn a_conversation_scrolled_back_stays_where_it_was_put() {
+    use agent::*;
+    let mut h = working();
+    let lines = |n: usize| (0..n).map(|i| format!("Line {i} of a long answer.")).collect::<Vec<_>>().join("\n");
+    h.app_mut().entries.push(Entry::Said(Said::new(Speaker::Them, lines(60))));
+    let at_end = h.render(1.0);
+    // More arrives: at the end, it follows.
+    if let Some(Entry::Said(s)) = h.app_mut().entries.last_mut() {
+        s.text.push_str("\nAnd a last line, WWWWWWWWWWWWWWWW.");
+    }
+    let followed = h.render(1.0);
+    assert!(followed != at_end);
+    // Scrolled back to read something earlier: more arriving moves nothing.
+    // (Whichever way the wheel turns for that here.)
+    wheel(&mut h, 600.0);
+    let back = if h.render(1.0) == followed { -1.0 } else { 1.0 };
+    wheel(&mut h, 600.0 * back);
+    let reading = h.render(1.0);
+    assert!(reading != followed);
+    if let Some(Entry::Said(s)) = h.app_mut().entries.last_mut() {
+        s.text.push_str("\nStill more, MMMMMMMMMMMMMMMM.");
+    }
+    h.app_mut().entries.push(Entry::Said(Said::new(Speaker::Note, "Done.")));
+    // All but the bar at the right, which is shorter now that there is more to scroll.
+    let words = |px: &[u8]| px.chunks(420 * 4).flat_map(|row| row[..400 * 4].to_vec()).collect::<Vec<u8>>();
+    assert!(words(&h.render(1.0)) == words(&reading), "what is being read stays put");
+    // Scrolled to the end again, it follows again.
+    wheel(&mut h, -100_000.0 * back);
+    let back = h.render(1.0);
+    h.app_mut().entries.push(Entry::Said(Said::new(Speaker::Note, "Really done.")));
+    assert!(h.render(1.0) != back);
+}
