@@ -19,6 +19,7 @@
 
 mod apps;
 mod fuzzy;
+mod habit;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ use neo::{Image, Key, KeyEvent, Point, Proxy, Rect, Size, WindowGeometry, Window
 use neo_desktop::Desktop;
 
 use apps::AppEntry;
+use habit::Habits;
 
 /// How many matches are listed.
 const ROWS: usize = 8;
@@ -47,7 +49,8 @@ struct Launcher {
     apps: Vec<AppEntry>,
     icons: HashMap<PathBuf, Image>,
     /// How many times each app has been opened from here.
-    uses: HashMap<PathBuf, u32>,
+    /// Which apps are opened, how often and how lately.
+    habits: Habits,
     query: String,
     /// The indices into `apps` of the best matches, best first.
     results: Vec<usize>,
@@ -90,47 +93,39 @@ fn history_path() -> PathBuf {
     neo_desktop::config_dir().join("launcher-history")
 }
 
-fn load_uses() -> HashMap<PathBuf, u32> {
-    std::fs::read_to_string(history_path())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let (count, path) = l.split_once('\t')?;
-            Some((PathBuf::from(path), count.parse().ok()?))
-        })
-        .collect()
+fn load_habits() -> Habits {
+    Habits::decode(&std::fs::read_to_string(history_path()).unwrap_or_default(), habit::now())
 }
 
-fn save_uses(uses: &HashMap<PathBuf, u32>) {
+fn save_habits(habits: &Habits) {
     let path = history_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut lines: Vec<String> = uses.iter().map(|(p, n)| format!("{n}\t{}", p.display())).collect();
-    lines.sort();
-    let _ = std::fs::write(path, lines.join("\n") + "\n");
+    let _ = std::fs::write(path, habits.encode(habit::now()));
 }
 
 impl Launcher {
-    fn new(register_hotkey: bool, apps: Vec<AppEntry>, uses: HashMap<PathBuf, u32>) -> Self {
-        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), uses, query: String::new(), results: vec![], selected: 0, asking: false, shown: true, focused: false, showings: 0, screen: Rect::ZERO, error: None, hotkeys: None, register_hotkey, quit: false };
+    fn new(register_hotkey: bool, apps: Vec<AppEntry>, habits: Habits) -> Self {
+        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), habits, query: String::new(), results: vec![], selected: 0, asking: false, shown: true, focused: false, showings: 0, screen: Rect::ZERO, error: None, hotkeys: None, register_hotkey, quit: false };
         l.search();
         l
     }
 
     /// Ranks every app against the query and keeps the best.
     fn search(&mut self) {
+        let now = habit::now();
         let mut ranked: Vec<(i64, usize)> = self
             .apps
             .iter()
             .enumerate()
             .map(|(i, app)| {
-                // Apps opened often get a nudge, never enough to beat a much better match.
-                let habit = self.uses.get(&app.path).copied().unwrap_or(0).min(20) as i64;
-                (fuzzy::score(&self.query, &app.name).0 as i64 + habit * 4, i)
+                // Apps opened often and lately get a nudge, never enough to beat a much better match.
+                (fuzzy::score(&self.query, &app.name).0 as i64 + self.habits.nudge(&app.path, now), i)
             })
             .collect();
-        // With nothing typed every score is zero: most used first, then by name.
+        // With nothing typed every name fits alike: what is opened most and
+        // most lately comes first, and the rest by name.
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| self.apps[a.1].name.to_lowercase().cmp(&self.apps[b.1].name.to_lowercase())));
         self.results = ranked.into_iter().take(ROWS).map(|(_, i)| i).collect();
         self.selected = 0;
@@ -171,9 +166,9 @@ impl Launcher {
         let Some(app) = self.results.get(row).and_then(|i| self.apps.get(*i)).cloned() else { return };
         match apps::launch(&app) {
             Ok(()) => {
-                *self.uses.entry(app.path.clone()).or_insert(0) += 1;
+                self.habits.opened(&app.path, habit::now());
                 if self.register_hotkey {
-                    save_uses(&self.uses);
+                    save_habits(&self.habits);
                 }
                 self.hide();
             }
@@ -391,7 +386,7 @@ fn main() {
         return;
     }
     keep_at_startup();
-    let mut app = Launcher::new(true, apps::discover(), load_uses());
+    let mut app = Launcher::new(true, apps::discover(), load_habits());
     app.shown = !args.iter().any(|a| a == "--hidden");
     // `neo-launcher --ask` opens as the bar for asking Apollo: for a window
     // manager's own key binding, where this cannot bind one itself.
@@ -406,7 +401,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
     for (name, query, scheme) in [("launcher-empty", "", neo_desktop::SchemePref::Light), ("launcher-search", "sys", neo_desktop::SchemePref::Dark), ("launcher-closest", "fierfx", neo_desktop::SchemePref::Dark)] {
-        let mut app = Launcher::new(false, apps::discover(), HashMap::new());
+        let mut app = Launcher::new(false, apps::discover(), Habits::default());
         app.desktop.appearance.scheme = scheme;
         let mut h = Harness::new(app, Size::new(WIDTH, HEIGHT)).expect("GPU");
         h.app_mut().update(Msg::Query(query.into()));
@@ -420,7 +415,7 @@ fn snapshots(dir: PathBuf) {
         println!("wrote {}", path.display());
     }
     // The bar for asking Apollo.
-    let mut app = Launcher::new(false, vec![], HashMap::new());
+    let mut app = Launcher::new(false, vec![], Habits::default());
     app.desktop.appearance.scheme = neo_desktop::SchemePref::Dark;
     app.asking = true;
     app.update(Msg::Query("which photos show a girl with pink hair?".into()));
@@ -439,7 +434,7 @@ mod tests {
     }
 
     fn launcher() -> Launcher {
-        Launcher::new(false, ["Safari", "Firefox", "Finder", "Notes", "Calendar", "Calculator"].map(app).to_vec(), HashMap::new())
+        Launcher::new(false, ["Safari", "Firefox", "Finder", "Notes", "Calendar", "Calculator"].map(app).to_vec(), Habits::default())
     }
 
     fn names(l: &Launcher) -> Vec<&str> {
@@ -520,12 +515,36 @@ mod tests {
         // "cal" fits Calendar and Calculator about as well; the one used more wins.
         l.update(Msg::Query("cal".into()));
         assert_eq!(names(&l)[0], "Calendar");
-        l.uses.insert(app("Calculator").path, 9);
+        for _ in 0..9 {
+            l.habits.opened(&app("Calculator").path, habit::now());
+        }
         l.update(Msg::Query("cal".into()));
         assert_eq!(names(&l)[0], "Calculator");
         // But a habit does not beat typing a different app's name.
         l.update(Msg::Query("calendar".into()));
         assert_eq!(names(&l)[0], "Calendar");
+    }
+
+    #[test]
+    fn with_nothing_typed_what_is_opened_most_and_latest_comes_first() {
+        let mut l = launcher();
+        assert_eq!(names(&l), ["Calculator", "Calendar", "Finder", "Firefox", "Notes", "Safari"], "nothing opened yet: by name");
+        let (now, day) = (habit::now(), 24 * 3600);
+        // Notes every day this week; Safari five times a month ago; Finder once yesterday.
+        for d in 0..7 {
+            l.habits.opened(&app("Notes").path, now - d * day);
+        }
+        for _ in 0..5 {
+            l.habits.opened(&app("Safari").path, now - 30 * day);
+        }
+        l.habits.opened(&app("Finder").path, now - day);
+        l.search();
+        assert_eq!(names(&l), ["Notes", "Finder", "Safari", "Calculator", "Calendar", "Firefox"], "the daily one, then yesterday's, then last month's, then the rest by name");
+        // Opening one moves it up at once.
+        l.habits.opened(&app("Firefox").path, now);
+        l.habits.opened(&app("Firefox").path, now);
+        l.search();
+        assert_eq!(names(&l)[..2], ["Notes", "Firefox"]);
     }
 
     #[test]
