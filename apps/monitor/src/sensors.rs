@@ -294,18 +294,7 @@ mod tests {
 
     #[test]
     fn sorts_generic_labels_into_kinds() {
-        for (label, kind) in [
-            ("coretemp Core 0", Kind::Cpu),
-            ("k10temp Tctl", Kind::Cpu),
-            ("PMU tdie3", Kind::Cpu),
-            ("amdgpu edge", Kind::Gpu),
-            ("GPU MTR Temp Sensor1", Kind::Gpu),
-            ("nvme Composite", Kind::Storage),
-            ("NAND CH0 temp", Kind::Storage),
-            ("spd5118 temp1", Kind::Memory),
-            ("gas gauge battery", Kind::Battery),
-            ("acpitz temp1", Kind::Other),
-        ] {
+        for (label, kind) in [("coretemp Core 0", Kind::Cpu), ("k10temp Tctl", Kind::Cpu), ("PMU tdie3", Kind::Cpu), ("amdgpu edge", Kind::Gpu), ("GPU MTR Temp Sensor1", Kind::Gpu), ("nvme Composite", Kind::Storage), ("NAND CH0 temp", Kind::Storage), ("spd5118 temp1", Kind::Memory), ("gas gauge battery", Kind::Battery), ("acpitz temp1", Kind::Other)] {
             assert_eq!(classify(label), kind, "{label}");
         }
     }
@@ -327,7 +316,11 @@ mod tests {
     /// Reads the real hardware, so it only checks what any computer has.
     #[test]
     fn reads_this_computer() {
-        let brand = { let mut s = sysinfo::System::new(); s.refresh_cpu_all(); s.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default() };
+        let brand = {
+            let mut s = sysinfo::System::new();
+            s.refresh_cpu_all();
+            s.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default()
+        };
         let reading = Reader::new(&brand).read();
         assert!(reading.sensors.iter().all(|s| s.idle || plausible(s.celsius)));
         assert!(reading.fans.iter().all(|f| f.rpm >= 0.0 && f.rpm < 30_000.0));

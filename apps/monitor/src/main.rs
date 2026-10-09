@@ -7,8 +7,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod detail;
-mod inspect;
 mod heat;
+mod inspect;
+mod net;
 mod power;
 mod sensors;
 #[cfg(target_os = "macos")]
@@ -19,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use neo::prelude::*;
 use neo::{Key, KeyEvent, Proxy, Size};
+use neo_desktop::Desktop;
 use neo_desktop::fs::{human_bytes_binary, human_size};
 use neo_desktop::ui::{nav_item, notice, section, split};
-use neo_desktop::Desktop;
 use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind, Users};
 
 const HISTORY: usize = 60;
@@ -33,6 +34,7 @@ enum Page {
     Processes,
     Resources,
     Sensors,
+    Network,
     Storage,
 }
 
@@ -97,6 +99,12 @@ struct Monitor {
     heat: Option<sensors::Reading>,
     cpu_heat: VecDeque<f32>,
     gpu_heat: VecDeque<f32>,
+    /// The interfaces worth showing, as last read.
+    interfaces: Vec<net::Interface>,
+    /// Which programs are using the network, once it has been asked.
+    net_using: Option<Vec<net::Using>>,
+    /// Tells the thread that asks whether anyone is looking, as with the sensors.
+    watching_net: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tells the sensor thread whether anyone is looking, so it rests otherwise.
     watching_heat: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -104,6 +112,8 @@ struct Monitor {
 #[derive(Clone, Debug)]
 enum Msg {
     Page(Page),
+    /// Which programs are using the network, just asked.
+    NetUsing(Vec<net::Using>),
     Sample,
     Query(String),
     Sort(SortBy),
@@ -164,6 +174,9 @@ impl Monitor {
             heat: None,
             cpu_heat: VecDeque::new(),
             gpu_heat: VecDeque::new(),
+            interfaces: vec![],
+            net_using: None,
+            watching_net: Default::default(),
             watching_heat: Default::default(),
             proxy: None,
         };
@@ -189,6 +202,7 @@ impl Monitor {
         let (rx, tx) = self.networks.list().values().fold((0u64, 0u64), |(r, t), n| (r + n.received(), t + n.transmitted()));
         push(&mut self.rx, rx as f32 / secs);
         push(&mut self.tx, tx as f32 / secs);
+        self.interfaces = net::interfaces(&self.networks, secs);
         let pids: Vec<u32> = self.sys.processes().values().filter(|p| p.thread_kind().is_none()).map(|p| p.pid().as_u32()).collect();
         let quick = inspect::quick(&pids);
         let shares: std::collections::HashMap<u32, f32> = self.sys.processes().values().filter(|p| p.thread_kind().is_none()).map(|p| (p.pid().as_u32(), p.cpu_usage())).collect();
@@ -271,6 +285,35 @@ impl App for Monitor {
 
     fn start(&mut self, proxy: Proxy<Msg>) {
         self.proxy = Some(proxy.clone());
+        // Asking which programs use the network takes the best part of a
+        // second, so a thread does it, and only while the Network page is open.
+        if let Some(proxy) = self.proxy.clone() {
+            let watching = self.watching_net.clone();
+            std::thread::spawn(move || {
+                let mut watcher = net::Watcher::default();
+                let mut last: Option<Instant> = None;
+                loop {
+                    if !watching.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Away from the page, what was counted goes stale: begin afresh on return.
+                        if last.take().is_some() {
+                            watcher = net::Watcher::default();
+                        }
+                    } else if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+                        last = Some(Instant::now());
+                        match watcher.sample() {
+                            Some(using) => {
+                                if !proxy.send(Msg::NetUsing(using)) {
+                                    return;
+                                }
+                            }
+                            // This system does not say: nothing to keep asking.
+                            None => return,
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
         // Reading sensors takes tens of milliseconds, so a thread does it,
         // and only while the Sensors page is open.
         let watching = self.watching_heat.clone();
@@ -314,7 +357,9 @@ impl App for Monitor {
             Msg::Page(p) => {
                 self.page = p;
                 self.watching_heat.store(p == Page::Sensors, std::sync::atomic::Ordering::Relaxed);
+                self.watching_net.store(p == Page::Network, std::sync::atomic::Ordering::Relaxed);
             }
+            Msg::NetUsing(using) => self.net_using = Some(using),
             Msg::Heat(reading) => {
                 // With no core sensor reporting, the chart follows the chips beside them.
                 if let Some(t) = reading.hottest(sensors::Kind::Cpu).or_else(|| reading.beside_cpu()) {
@@ -410,17 +455,10 @@ impl Monitor {
         let cpu = *self.cpu.back().unwrap_or(&0.0);
         let mem = *self.memory.back().unwrap_or(&0.0);
         let mut side = column().spacing(2.0).width(Length::Fill).push(section("Monitor"));
-        for (page, glyph, name) in [(Page::Processes, icons::LIST, "Processes"), (Page::Resources, icons::ACTIVITY, "Resources"), (Page::Sensors, icons::THERMOMETER, "Sensors"), (Page::Storage, icons::HARD_DRIVE, "Storage")] {
+        for (page, glyph, name) in [(Page::Processes, icons::LIST, "Processes"), (Page::Resources, icons::ACTIVITY, "Resources"), (Page::Sensors, icons::THERMOMETER, "Sensors"), (Page::Network, icons::NETWORK, "Network"), (Page::Storage, icons::HARD_DRIVE, "Storage")] {
             side = side.push(nav_item(glyph, name, self.page == page, Msg::Page(page)));
         }
-        let mini = |label: &str, v: f32, tone: Tone| -> Element<Msg> {
-            column()
-                .spacing(6.0)
-                .width(Length::Fill)
-                .push(row().width(Length::Fill).push(text(label).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(format!("{v:.0}%")).mono().role(TextRole::Caption)))
-                .push(progress_bar(v / 100.0).height(8.0).tone(tone))
-                .into()
-        };
+        let mini = |label: &str, v: f32, tone: Tone| -> Element<Msg> { column().spacing(6.0).width(Length::Fill).push(row().width(Length::Fill).push(text(label).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(format!("{v:.0}%")).mono().role(TextRole::Caption))).push(progress_bar(v / 100.0).height(8.0).tone(tone)).into() };
         let mut meters = column().spacing(12.0).width(Length::Fill).push(mini("CPU", cpu, Tone::Accent)).push(mini("Memory", mem, Tone::Good));
         // Swap across the whole system, on computers that have any.
         let swap_total = self.sys.total_swap();
@@ -439,6 +477,7 @@ impl Monitor {
             },
             Page::Resources => self.resources(),
             Page::Sensors => self.sensors(),
+            Page::Network => self.network(),
             Page::Storage => self.storage(),
         };
         split(side, body)
@@ -463,20 +502,10 @@ impl Monitor {
 }
 
 pub(crate) fn panel<M: 'static>(title: &str, detail: String, body: impl Into<Element<M>>) -> Element<M> {
-    container(
-        column()
-            .spacing(12.0)
-            .width(Length::Fill)
-            .push(row().width(Length::Fill).align(Align::Center).push(text(title).role(TextRole::Title)).push(Space::fill_x()).push(text(detail).mono().role(TextRole::Caption).tone(Tone::Muted)))
-            .push(body),
-    )
-    .surface(Surface::Well)
-    .padding(18.0)
-    .width(Length::Fill)
-    .into()
+    container(column().spacing(12.0).width(Length::Fill).push(row().width(Length::Fill).align(Align::Center).push(text(title).role(TextRole::Title)).push(Space::fill_x()).push(text(detail).mono().role(TextRole::Caption).tone(Tone::Muted))).push(body)).surface(Surface::Well).padding(18.0).width(Length::Fill).into()
 }
 
-fn rate(bytes_per_sec: f32) -> String {
+pub(crate) fn rate(bytes_per_sec: f32) -> String {
     format!("{}/s", human_size(bytes_per_sec as u64))
 }
 
@@ -491,14 +520,7 @@ impl Monitor {
             }
             Button::new(r).kind(ButtonKind::Ghost).padding([6.0, 6.0]).width(width).align_x(align).on_press(Msg::Sort(by)).into()
         };
-        let mut header = row()
-            .spacing(12.0)
-            .width(Length::Fill)
-            .padding([4.0, 22.0, 4.0, 14.0])
-            .push(header_cell("Name", SortBy::Name, Length::Fill, Align::Start))
-            .push(header_cell("User", SortBy::User, Length::Fixed(110.0), Align::Start))
-            .push(header_cell("CPU", SortBy::Cpu, Length::Fixed(120.0), Align::End))
-            .push(header_cell("Memory", SortBy::Memory, Length::Fixed(90.0), Align::End));
+        let mut header = row().spacing(12.0).width(Length::Fill).padding([4.0, 22.0, 4.0, 14.0]).push(header_cell("Name", SortBy::Name, Length::Fill, Align::Start)).push(header_cell("User", SortBy::User, Length::Fixed(110.0), Align::Start)).push(header_cell("CPU", SortBy::Cpu, Length::Fixed(120.0), Align::End)).push(header_cell("Memory", SortBy::Memory, Length::Fixed(90.0), Align::End));
         if inspect::QUICK_SWAP {
             header = header.push(header_cell("Swap", SortBy::Swap, Length::Fixed(80.0), Align::End));
         }
@@ -510,14 +532,7 @@ impl Monitor {
         let mut rows = column().spacing(1.0).width(Length::Fill).padding([10.0, 4.0, 10.0, 10.0]);
         for p in v.iter().take(MAX_PROCESSES) {
             let cpu = row().spacing(8.0).align(Align::Center).width(120.0).push(Space::fill_x()).push(progress_bar((p.cpu / 100.0).min(1.0)).width(44.0).height(6.0)).push(text(format!("{:.1}%", p.cpu)).mono().role(TextRole::Caption).align(Align::End).width(50.0));
-            let mut content = row()
-                .spacing(12.0)
-                .align(Align::Center)
-                .width(Length::Fill)
-                .push(text(p.name.clone()).no_wrap().width(Length::Fill))
-                .push(text(p.user.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap().width(110.0))
-                .push(cpu)
-                .push(text(human_bytes_binary(p.memory)).mono().role(TextRole::Caption).align(Align::End).width(90.0));
+            let mut content = row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(p.name.clone()).no_wrap().width(Length::Fill)).push(text(p.user.clone()).role(TextRole::Caption).tone(Tone::Muted).no_wrap().width(110.0)).push(cpu).push(text(human_bytes_binary(p.memory)).mono().role(TextRole::Caption).align(Align::End).width(90.0));
             if inspect::QUICK_SWAP {
                 content = content.push(text(p.swap.map_or("—".into(), human_bytes_binary)).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(80.0));
             }
@@ -530,9 +545,7 @@ impl Monitor {
                 };
                 content = content.push(text(p.energy.map_or("—".into(), power::watts)).mono().role(TextRole::Caption).tone(tone).align(Align::End).width(80.0));
             }
-            let content = content
-                .push(text(p.threads.map_or("—".into(), |n| n.to_string())).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(76.0))
-                .push(text(p.pid.to_string()).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(70.0));
+            let content = content.push(text(p.threads.map_or("—".into(), |n| n.to_string())).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(76.0)).push(text(p.pid.to_string()).mono().role(TextRole::Caption).tone(Tone::Muted).align(Align::End).width(70.0));
             rows = rows.push(Button::new(content).kind(ButtonKind::Ghost).selected(self.selected == Some(p.pid)).padding([10.0, 6.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Select(p.pid)));
         }
         let toolbar = row()
@@ -561,9 +574,7 @@ impl Monitor {
                     Some((tone, msg)) => r.push(notice(*tone, msg.clone())),
                     None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads or end it.".into())).role(TextRole::Caption).tone(Tone::Muted)),
                 };
-                r.push(Space::fill_x())
-                    .push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect)))
-                    .push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
+                r.push(Space::fill_x()).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
             }
         };
         column().width(Length::Fill).height(Length::Fill).push(toolbar).push(Divider::horizontal()).push(header).push(scrollable(rows).height(Length::Fill)).push(Divider::horizontal()).push(footer).into()
@@ -579,24 +590,14 @@ impl Monitor {
             let mut line = row().spacing(16.0).width(Length::Fill);
             for (i, c) in chunk.iter().enumerate() {
                 let n = ci * 4 + i + 1;
-                line = line.push(
-                    column()
-                        .spacing(4.0)
-                        .width(Length::Fill)
-                        .push(row().width(Length::Fill).push(text(format!("Core {n}")).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(format!("{:.0}%", c.cpu_usage())).mono().role(TextRole::Caption)))
-                        .push(progress_bar(c.cpu_usage() / 100.0).height(6.0)),
-                );
+                line = line.push(column().spacing(4.0).width(Length::Fill).push(row().width(Length::Fill).push(text(format!("Core {n}")).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(format!("{:.0}%", c.cpu_usage())).mono().role(TextRole::Caption))).push(progress_bar(c.cpu_usage() / 100.0).height(6.0)));
             }
             for _ in chunk.len()..4 {
                 line = line.push(Space::fill_x());
             }
             grid = grid.push(line);
         }
-        let cpu_panel = panel(
-            "Processor",
-            format!("{cpu:.0}% · load {:.2} {:.2} {:.2}", load.one, load.five, load.fifteen),
-            column().spacing(16.0).width(Length::Fill).push(sparkline(Vec::from(self.cpu.clone()), 0.0, 100.0).height(90.0)).push(grid),
-        );
+        let cpu_panel = panel("Processor", format!("{cpu:.0}% · load {:.2} {:.2} {:.2}", load.one, load.five, load.fifteen), column().spacing(16.0).width(Length::Fill).push(sparkline(Vec::from(self.cpu.clone()), 0.0, 100.0).height(90.0)).push(grid));
         let (used, total) = (self.sys.used_memory(), self.sys.total_memory());
         let (swap_used, swap_total) = (self.sys.used_swap(), self.sys.total_swap());
         let mut mem_body = column().spacing(12.0).width(Length::Fill).push(sparkline(Vec::from(self.memory.clone()), 0.0, 100.0).height(70.0).tone(Tone::Good));
@@ -605,20 +606,12 @@ impl Monitor {
         if let Some(p) = self.pressure_now {
             let tone = pressure_tone(p.level);
             mem_body = mem_body
-                .push(
-                    row()
-                        .spacing(8.0)
-                        .align(Align::Center)
-                        .width(Length::Fill)
-                        .push(text("Memory pressure").role(TextRole::Caption).tone(Tone::Muted))
-                        .push(Space::fill_x())
-                        .push(text(p.level.label()).role(TextRole::Caption).tone(tone))
-                        .push(text(format!("{:.0}%", p.percent)).mono().role(TextRole::Caption)),
-                )
+                .push(row().spacing(8.0).align(Align::Center).width(Length::Fill).push(text("Memory pressure").role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(p.level.label()).role(TextRole::Caption).tone(tone)).push(text(format!("{:.0}%", p.percent)).mono().role(TextRole::Caption)))
                 .push(sparkline(Vec::from(self.pressure.clone()), 0.0, 100.0).height(44.0).tone(tone));
         }
         if swap_total > 0 {
-            mem_body = mem_body.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("Swap").role(TextRole::Caption).tone(Tone::Muted).width(60.0)).push(progress_bar(swap_used as f32 / swap_total as f32).height(6.0).tone(Tone::Warn)).push(text(format!("{} of {}", human_bytes_binary(swap_used), human_bytes_binary(swap_total))).mono().role(TextRole::Caption).tone(Tone::Muted)));
+            mem_body =
+                mem_body.push(row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text("Swap").role(TextRole::Caption).tone(Tone::Muted).width(60.0)).push(progress_bar(swap_used as f32 / swap_total as f32).height(6.0).tone(Tone::Warn)).push(text(format!("{} of {}", human_bytes_binary(swap_used), human_bytes_binary(swap_total))).mono().role(TextRole::Caption).tone(Tone::Muted)));
         }
         let mem_panel = panel("Memory", format!("{} of {}", human_bytes_binary(used), human_bytes_binary(total)), mem_body);
         let peak = self.rx.iter().chain(self.tx.iter()).copied().fold(1024.0f32, f32::max) * 1.15;
@@ -646,23 +639,24 @@ impl Monitor {
             }
             let used = total.saturating_sub(d.available_space());
             let frac = used as f32 / total as f32;
-            let tone = if frac > 0.9 { Tone::Bad } else if frac > 0.75 { Tone::Warn } else { Tone::Accent };
+            let tone = if frac > 0.9 {
+                Tone::Bad
+            } else if frac > 0.75 {
+                Tone::Warn
+            } else {
+                Tone::Accent
+            };
             let name = d.mount_point().display().to_string();
             col = col.push(
                 container(
-                    row()
-                        .spacing(16.0)
-                        .align(Align::Center)
-                        .width(Length::Fill)
-                        .push(icon(if d.is_removable() { icons::HARD_DRIVE } else { icons::DATABASE }).size(22.0).tone(Tone::Accent))
-                        .push(
-                            column()
-                                .spacing(8.0)
-                                .width(Length::Fill)
-                                .push(row().width(Length::Fill).push(text(name).role(TextRole::Strong)).push(Space::fill_x()).push(text(format!("{} free of {}", human_size(d.available_space()), human_size(total))).role(TextRole::Caption).tone(Tone::Muted)))
-                                .push(progress_bar(frac).height(8.0).tone(tone))
-                                .push(text(format!("{} · {}", d.name().to_string_lossy(), d.file_system().to_string_lossy())).mono().role(TextRole::Caption).tone(Tone::Faint)),
-                        ),
+                    row().spacing(16.0).align(Align::Center).width(Length::Fill).push(icon(if d.is_removable() { icons::HARD_DRIVE } else { icons::DATABASE }).size(22.0).tone(Tone::Accent)).push(
+                        column()
+                            .spacing(8.0)
+                            .width(Length::Fill)
+                            .push(row().width(Length::Fill).push(text(name).role(TextRole::Strong)).push(Space::fill_x()).push(text(format!("{} free of {}", human_size(d.available_space()), human_size(total))).role(TextRole::Caption).tone(Tone::Muted)))
+                            .push(progress_bar(frac).height(8.0).tone(tone))
+                            .push(text(format!("{} · {}", d.name().to_string_lossy(), d.file_system().to_string_lossy())).mono().role(TextRole::Caption).tone(Tone::Faint)),
+                    ),
                 )
                 .surface(Surface::Well)
                 .padding(16.0)
@@ -688,7 +682,7 @@ fn main() {
 fn snapshots(dir: std::path::PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
-    for (name, page, scheme) in [("monitor-processes", Page::Processes, neo_desktop::SchemePref::Light), ("monitor-resources", Page::Resources, neo_desktop::SchemePref::Dark)] {
+    for (name, page, scheme) in [("monitor-processes", Page::Processes, neo_desktop::SchemePref::Light), ("monitor-resources", Page::Resources, neo_desktop::SchemePref::Dark), ("monitor-network", Page::Network, neo_desktop::SchemePref::Dark)] {
         let mut app = Monitor::new();
         app.desktop.appearance.scheme = scheme;
         app.page = page;
@@ -699,6 +693,13 @@ fn snapshots(dir: std::path::PathBuf) {
         }
         if let Some(first) = app.sorted().first().map(|p| p.pid) {
             app.selected = Some(first);
+        }
+        // The thread that asks which programs use the network is not running here: ask twice, for rates.
+        if page == Page::Network {
+            let mut watcher = net::Watcher::default();
+            watcher.sample();
+            std::thread::sleep(Duration::from_millis(1500));
+            app.net_using = watcher.sample();
         }
         let mut h = Harness::new(app, Size::new(1060.0, 700.0)).expect("GPU");
         let path = dir.join(format!("{name}.png"));

@@ -5,7 +5,7 @@ use std::time::Duration;
 use neo::prelude::*;
 
 use crate::sensors::{Fan, Kind, Reading, Sensor};
-use crate::{panel, Monitor, Msg};
+use crate::{Monitor, Msg, panel};
 
 /// How often the sensors are read while the page is open.
 pub const EVERY: Duration = Duration::from_secs(2);
@@ -67,18 +67,7 @@ fn tile(kind: Kind, reading: &Reading) -> Element<Msg> {
         None if idle > 0 => ("—".into(), Tone::Faint, "Idle".into()),
         None => ("—".into(), Tone::Faint, "No sensor reported".into()),
     };
-    container(
-        column()
-            .spacing(4.0)
-            .width(Length::Fill)
-            .push(text(kind.name()).role(TextRole::Label).tone(Tone::Muted))
-            .push(text(value).mono().role(TextRole::Heading).tone(value_tone).no_wrap())
-            .push(text(caption).role(TextRole::Caption).tone(Tone::Muted)),
-    )
-    .surface(Surface::Well)
-    .padding([16.0, 14.0])
-    .width(Length::Fill)
-    .into()
+    container(column().spacing(4.0).width(Length::Fill).push(text(kind.name()).role(TextRole::Label).tone(Tone::Muted)).push(text(value).mono().role(TextRole::Heading).tone(value_tone).no_wrap()).push(text(caption).role(TextRole::Caption).tone(Tone::Muted))).surface(Surface::Well).padding([16.0, 14.0]).width(Length::Fill).into()
 }
 
 fn fan_row(fan: &Fan) -> Element<Msg> {
@@ -111,14 +100,7 @@ fn sensor_row(s: &Sensor) -> Element<Msg> {
         // Nothing to show until the chip is busy again.
         return row().spacing(12.0).align(Align::Center).width(Length::Fill).push(name).push(text("Idle").role(TextRole::Caption).tone(Tone::Faint).align(Align::End).width(70.0)).into();
     }
-    row()
-        .spacing(12.0)
-        .align(Align::Center)
-        .width(Length::Fill)
-        .push(name)
-        .push(progress_bar((s.celsius / SCALE).clamp(0.0, 1.0)).width(120.0).height(6.0).tone(bar_tone(s.kind, s.celsius)))
-        .push(text(format!("{:.1}°C", s.celsius)).mono().role(TextRole::Caption).tone(tone(s.kind, s.celsius)).align(Align::End).width(70.0))
-        .into()
+    row().spacing(12.0).align(Align::Center).width(Length::Fill).push(name).push(progress_bar((s.celsius / SCALE).clamp(0.0, 1.0)).width(120.0).height(6.0).tone(bar_tone(s.kind, s.celsius))).push(text(format!("{:.1}°C", s.celsius)).mono().role(TextRole::Caption).tone(tone(s.kind, s.celsius)).align(Align::End).width(70.0)).into()
 }
 
 impl Monitor {
@@ -151,12 +133,7 @@ impl Monitor {
 
         let chart = |label: &str, history: &std::collections::VecDeque<f32>, tone: Tone| -> Element<Msg> {
             let now = history.back().map_or(String::new(), |t| format!("{t:.0}°C"));
-            column()
-                .spacing(6.0)
-                .width(Length::Fill)
-                .push(row().width(Length::Fill).push(text(label).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(now).mono().role(TextRole::Caption)))
-                .push(sparkline(Vec::from(history.clone()), 20.0, SCALE).height(64.0).tone(tone))
-                .into()
+            column().spacing(6.0).width(Length::Fill).push(row().width(Length::Fill).push(text(label).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x()).push(text(now).mono().role(TextRole::Caption))).push(sparkline(Vec::from(history.clone()), 20.0, SCALE).height(64.0).tone(tone)).into()
         };
         let mut history = row().spacing(16.0).width(Length::Fill);
         if !self.cpu_heat.is_empty() {

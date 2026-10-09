@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use neo::prelude::*;
 use neo::Proxy;
+use neo::prelude::*;
 use neo_desktop::fs::human_bytes_binary;
 use sysinfo::Pid;
 
@@ -131,18 +131,7 @@ pub fn cpu_time(d: Duration) -> String {
 }
 
 fn tile(label: &str, value: String, caption: String) -> Element<Msg> {
-    container(
-        column()
-            .spacing(4.0)
-            .width(Length::Fill)
-            .push(text(label).role(TextRole::Label).tone(Tone::Muted))
-            .push(text(value).mono().role(TextRole::Heading).no_wrap())
-            .push(text(caption).role(TextRole::Caption).tone(Tone::Muted)),
-    )
-    .surface(Surface::Well)
-    .padding([16.0, 14.0])
-    .width(Length::Fill)
-    .into()
+    container(column().spacing(4.0).width(Length::Fill).push(text(label).role(TextRole::Label).tone(Tone::Muted)).push(text(value).mono().role(TextRole::Heading).no_wrap()).push(text(caption).role(TextRole::Caption).tone(Tone::Muted))).surface(Surface::Well).padding([16.0, 14.0]).width(Length::Fill).into()
 }
 
 fn message(glyph: neo::theme::Icon, title: &str, body: String) -> Element<Msg> {
@@ -155,15 +144,7 @@ impl Monitor {
         let proc = self.procs.iter().find(|p| p.pid == inspect.pid);
         let name = proc.map(|p| p.name.clone()).unwrap_or_else(|| "Process".into());
         let who = proc.map(|p| if p.user.is_empty() { format!("PID {}", p.pid) } else { format!("PID {} · {}", p.pid, p.user) }).unwrap_or_else(|| format!("PID {}", inspect.pid));
-        let toolbar = row()
-            .spacing(10.0)
-            .align(Align::Center)
-            .width(Length::Fill)
-            .padding([12.0, 10.0])
-            .push(icon_button(icons::ARROW_LEFT, 34.0).kind(ButtonKind::Ghost).on_press(Msg::CloseInspect))
-            .push(text(name.clone()).role(TextRole::Title).no_wrap())
-            .push(text(who).role(TextRole::Caption).tone(Tone::Muted))
-            .push(Space::fill_x());
+        let toolbar = row().spacing(10.0).align(Align::Center).width(Length::Fill).padding([12.0, 10.0]).push(icon_button(icons::ARROW_LEFT, 34.0).kind(ButtonKind::Ghost).on_press(Msg::CloseInspect)).push(text(name.clone()).role(TextRole::Title).no_wrap()).push(text(who).role(TextRole::Caption).tone(Tone::Muted)).push(Space::fill_x());
 
         let rows = inspect.sorted();
         let running = rows.iter().filter(|r| r.info.state == ThreadState::Running).count();
@@ -225,13 +206,7 @@ impl Monitor {
                 _ => Tone::Muted,
             };
             let cpu = match r.cpu {
-                Some(c) => row()
-                    .spacing(8.0)
-                    .align(Align::Center)
-                    .width(130.0)
-                    .push(Space::fill_x())
-                    .push(progress_bar((c / 100.0).min(1.0)).width(48.0).height(6.0))
-                    .push(text(format!("{c:.1}%")).mono().role(TextRole::Caption).align(Align::End).width(56.0)),
+                Some(c) => row().spacing(8.0).align(Align::Center).width(130.0).push(Space::fill_x()).push(progress_bar((c / 100.0).min(1.0)).width(48.0).height(6.0)).push(text(format!("{c:.1}%")).mono().role(TextRole::Caption).align(Align::End).width(56.0)),
                 None => row().width(130.0).push(Space::fill_x()).push(text("—").mono().role(TextRole::Caption).tone(Tone::Faint)),
             };
             list = list.push(
