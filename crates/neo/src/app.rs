@@ -80,6 +80,14 @@ pub trait App: 'static {
         false
     }
 
+    /// Whether [`step`](Self::step) goes on being called while the window
+    /// cannot be seen (covered, minimised, hidden), ten times a second and
+    /// with no frame drawn, for as long as something on its page wants
+    /// frames. For an app whose work goes on unseen. Not, by default.
+    fn steps_unseen(&self) -> bool {
+        false
+    }
+
     /// Timers that send messages periodically.
     fn subscriptions(&self) -> Vec<Subscription<Self::Message>> {
         vec![]
@@ -201,6 +209,10 @@ impl<A: App> armature::App for Themed<A> {
 
     fn step(&mut self, now: std::time::Instant, dt: std::time::Duration) -> bool {
         self.0.step(now, dt)
+    }
+
+    fn steps_unseen(&self) -> bool {
+        self.0.steps_unseen()
     }
 
     fn start(&mut self, proxy: Proxy<Self::Message>) {

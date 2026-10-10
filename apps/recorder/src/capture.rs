@@ -19,6 +19,8 @@ use neo::Rect;
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowInfo {
     pub id: u64,
+    /// The process it belongs to, where the system says; 0 where it does not.
+    pub pid: u32,
     pub app: String,
     pub title: String,
     /// Position on the screen in logical pixels.
@@ -614,7 +616,7 @@ fn imp_windows() -> Vec<WindowInfo> {
             continue;
         }
         let (app, title) = unsafe { (string(kCGWindowOwnerName), string(kCGWindowName)) };
-        out.push(WindowInfo { id: id.unwrap_or(0) as u64, app, title, frame });
+        out.push(WindowInfo { id: id.unwrap_or(0) as u64, pid: pid.unwrap_or(0) as u32, app, title, frame });
     }
     out
 }
@@ -641,7 +643,7 @@ fn imp_windows() -> Vec<WindowInfo> {
                 return 1;
             }
             // Window rectangles are physical pixels; `physical` is told a scale of 1 for them.
-            out.push(WindowInfo { id: hwnd as usize as u64, app: String::new(), title: String::from_utf16_lossy(&buf[..n]), frame: Rect::new(r.left as f32, r.top as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32) });
+            out.push(WindowInfo { id: hwnd as usize as u64, pid, app: String::new(), title: String::from_utf16_lossy(&buf[..n]), frame: Rect::new(r.left as f32, r.top as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32) });
         }
         1
     }
@@ -674,7 +676,7 @@ fn imp_windows() -> Vec<WindowInfo> {
             let frame = Rect::new(num()?, num()?, num()?, num()?);
             let _host = it.next()?;
             let title = it.collect::<Vec<_>>().join(" ");
-            (desktop != "-1" && pid != me && frame.w >= 80.0 && frame.h >= 60.0).then_some(WindowInfo { id, app: String::new(), title, frame })
+            (desktop != "-1" && pid != me && frame.w >= 80.0 && frame.h >= 60.0).then_some(WindowInfo { id, pid: pid.parse().unwrap_or(0), app: String::new(), title, frame })
         })
         .collect()
 }

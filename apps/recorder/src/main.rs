@@ -5,12 +5,22 @@
 //!     cargo run -p neo-recorder -- --mode window --window Firefox --record
 //!     cargo run -p neo-recorder -- --snapshot target/snapshots
 //!
-//! `--mode screen|window|area` picks what to record, `--window TEXT` chooses
-//! the first window whose app or title contains TEXT, `--record` starts
+//! `--mode screen|window|area` picks what to record. A window is chosen
+//! with `--window-id N` (its number), `--pid N` (a process's largest
+//! window), `--app NAME` (the app of exactly that name) or `--window TEXT`
+//! (the app called TEXT, else the first whose app or title has TEXT in
+//! it); `--list-windows` prints the windows there are, a line to each:
+//! number, process, app and title, with tabs between. `--record` starts
 //! straight away, `--screenshot` takes a screenshot instead, `--for SECONDS` stops by itself, `--mic` records the
 //! microphone, `--gif` saves a GIF instead of a movie, and `--include-bar`
 //! lets the recording bar appear in the recording. `--hidden` starts in the
 //! tray without showing the window, which is how it starts at login.
+//!
+//! For scripts: `--screenshot` with `--hidden`, or with `--out FILE`, takes
+//! the picture and ends, showing nothing. The file's name is printed; it
+//! ends with 0 if the picture was taken, 2 if there was no such window,
+//! and 1 if it could not be taken. A window is taken whole even when
+//! other windows are over it. The clipboard is left alone.
 //!
 //! The Recorder keeps an icon in the menu bar or system tray, and by default
 //! the installed app starts at login so the shortcut is always ready. A
@@ -1467,6 +1477,36 @@ impl<M> Widget<M> for Viewfinder {
     }
 }
 
+/// How a window is asked for on the command line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Choice<'a> {
+    /// The system's own number for it, as `--list-windows` prints.
+    Id(u64),
+    /// The process it belongs to.
+    Pid(u32),
+    /// Its app's name, exactly, whatever the case.
+    App(&'a str),
+    /// Some of its app's name or of its title.
+    Named(&'a str),
+}
+
+/// The window asked for, or why there is none. A process or an app with
+/// several windows gives its largest, which is its main one. Something
+/// only named gives the app that is called exactly that before one whose
+/// name or title merely has it in it: `mira` is the app mira, not an
+/// editor with a file of mira's open.
+fn choose<'w>(windows: &'w [WindowInfo], choice: Choice) -> Result<&'w WindowInfo, String> {
+    let largest = |of: &dyn Fn(&&WindowInfo) -> bool| windows.iter().filter(of).max_by(|a, b| (a.frame.w * a.frame.h).total_cmp(&(b.frame.w * b.frame.h)));
+    let is = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let has = |a: &str, b: &str| a.to_lowercase().contains(&b.to_lowercase());
+    match choice {
+        Choice::Id(id) => windows.iter().find(|w| w.id == id).ok_or_else(|| format!("no window has the number {id}; --list-windows says which there are")),
+        Choice::Pid(pid) => largest(&|w| w.pid == pid).ok_or_else(|| format!("process {pid} has no window on the screen")),
+        Choice::App(name) => largest(&|w| is(&w.app, name)).ok_or_else(|| format!("no app called {name} has a window on the screen")),
+        Choice::Named(text) => largest(&|w| is(&w.app, text)).or_else(|| largest(&|w| is(&w.title, text))).or_else(|| windows.iter().find(|w| has(&w.app, text))).or_else(|| windows.iter().find(|w| has(&w.title, text))).ok_or_else(|| format!("no window matches {text}")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--snapshot") {
@@ -1485,13 +1525,57 @@ fn main() {
             std::process::exit(2);
         }
     }
-    if let Some(want) = value("--window") {
-        let want = want.to_lowercase();
-        app.mode = Mode::Window;
-        app.selected = app.windows.iter().find(|w| w.app.to_lowercase().contains(&want) || w.title.to_lowercase().contains(&want)).map(|w| w.id);
-        if app.selected.is_none() {
-            eprintln!("neo-recorder: no window matches {want}");
-            std::process::exit(2);
+    // `--list-windows` says what windows there are to choose from, a line
+    // to each: its number, its process, its app and its title, with tabs between.
+    if args.iter().any(|a| a == "--list-windows") {
+        for w in &app.windows {
+            println!("{}\t{}\t{}\t{}", w.id, w.pid, w.app, w.title);
+        }
+        return;
+    }
+    // A window chosen exactly, by its number, its process or its app's name, or loosely by some of its name.
+    let wanted = [("--window-id", 0), ("--pid", 1), ("--app", 2), ("--window", 3)].into_iter().find_map(|(flag, how)| value(flag).map(|v| (how, v.as_str())));
+    let mut chosen = None;
+    if let Some((how, want)) = wanted {
+        let choice = match (how, want.parse::<u64>()) {
+            (0, Ok(id)) => Choice::Id(id),
+            (1, Ok(pid)) => Choice::Pid(pid as u32),
+            (0 | 1, Err(_)) => {
+                eprintln!("neo-recorder: {want} is not a number");
+                std::process::exit(2);
+            }
+            (2, _) => Choice::App(want),
+            _ => Choice::Named(want),
+        };
+        match choose(&app.windows, choice) {
+            Ok(window) => {
+                app.mode = Mode::Window;
+                app.selected = Some(window.id);
+                chosen = Some(window.clone());
+            }
+            Err(why) => {
+                eprintln!("neo-recorder: {why}");
+                std::process::exit(2);
+            }
+        }
+    }
+    // A screenshot asked for with nothing to be shown, or with a file named for it,
+    // is taken and that is all: no window, no waiting about afterwards. The file's
+    // name is printed, and whether it worked is said by how it ends.
+    let out = value("--out").map(PathBuf::from);
+    if args.iter().any(|a| a == "--screenshot") && (out.is_some() || args.iter().any(|a| a == "--hidden")) {
+        let dir = value("--dir").map(PathBuf::from).unwrap_or_else(|| app.shots_dir.clone());
+        let path = out.unwrap_or_else(|| dir.join(format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"))));
+        let target = chosen.map_or(Target::Screen, Target::Window);
+        match capture::screenshot(&target, Options::default(), &path) {
+            Ok(saved) => {
+                println!("{}", saved.path.display());
+                return;
+            }
+            Err(why) => {
+                eprintln!("neo-recorder: {why}");
+                std::process::exit(1);
+            }
         }
     }
     app.auto_record = args.iter().any(|a| a == "--record");
@@ -1553,7 +1637,7 @@ mod tests {
 
     fn recorder() -> Recorder {
         let mut r = Recorder::new(false);
-        r.windows = vec![WindowInfo { id: 7, app: "Files".into(), title: "Home".into(), frame: Rect::new(10.0, 20.0, 800.0, 600.0) }];
+        r.windows = vec![WindowInfo { id: 7, pid: 0, app: "Files".into(), title: "Home".into(), frame: Rect::new(10.0, 20.0, 800.0, 600.0) }];
         r
     }
 
@@ -1814,6 +1898,22 @@ mod tests {
         r.shown = false;
         r.update(Msg::Geometry(WindowGeometry { frame: Rect::new(100.0, 100.0, 400.0, 300.0), screen: Rect::new(0.0, 25.0, 800.0, 500.0), scale: 2.0 }));
         r
+    }
+
+    #[test]
+    fn a_window_is_chosen_exactly_from_the_command_line() {
+        let window = |id, pid, app: &str, title: &str, w| WindowInfo { id, pid, app: app.into(), title: title.into(), frame: Rect::new(0.0, 0.0, w, 400.0) };
+        let windows = [window(11, 500, "Code", "main.rs — mira", 900.0), window(12, 620, "mira", "mira", 800.0), window(13, 620, "mira", "Signals", 300.0), window(14, 700, "Safari", "Mira (given name) - Wikipedia", 1000.0)];
+        let id = |c| choose(&windows, c).map(|w| w.id);
+        assert_eq!(id(Choice::Id(13)), Ok(13));
+        assert_eq!(id(Choice::Pid(620)), Ok(12), "a process's largest window");
+        assert_eq!(id(Choice::App("MIRA")), Ok(12), "the app called that, not one with it in a title");
+        // Only named: the app of exactly that name comes before anything that merely mentions it.
+        assert_eq!(id(Choice::Named("mira")), Ok(12));
+        assert_eq!((id(Choice::Named("signals")), id(Choice::Named("wikipedia")), id(Choice::Named("cod"))), (Ok(13), Ok(14), Ok(11)));
+        for (none, why) in [(Choice::Id(99), "no window has the number 99"), (Choice::Pid(1), "process 1 has no window"), (Choice::App("mir"), "no app called mir"), (Choice::Named("zzz"), "no window matches zzz")] {
+            assert!(choose(&windows, none).unwrap_err().contains(why), "{none:?}");
+        }
     }
 
     #[test]

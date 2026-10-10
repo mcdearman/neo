@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "armature"
 version = "0.1.0"
-source = "git+https://github.com/mcdearman/armature?rev=359d6352b9d097f3b4273db3cdfa602bca48550f#359d6352b9d097f3b4273db3cdfa602bca48550f"
+source = "git+https://github.com/mcdearman/armature?rev=1ccfbad33ccd34f396e942d13b3d77cd4ee696b1#1ccfbad33ccd34f396e942d13b3d77cd4ee696b1"
 dependencies = [
  "arboard",
  "armature-render",
@@ -152,7 +152,7 @@ dependencies = [
 [[package]]
 name = "armature-render"
 version = "0.1.0"
-source = "git+https://github.com/mcdearman/armature?rev=359d6352b9d097f3b4273db3cdfa602bca48550f#359d6352b9d097f3b4273db3cdfa602bca48550f"
+source = "git+https://github.com/mcdearman/armature?rev=1ccfbad33ccd34f396e942d13b3d77cd4ee696b1#1ccfbad33ccd34f396e942d13b3d77cd4ee696b1"
 dependencies = [
  "bytemuck",
  "glyphon",
