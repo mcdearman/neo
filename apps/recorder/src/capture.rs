@@ -240,6 +240,58 @@ pub fn pick(path: &Path, done: impl FnOnce(Option<Result<Saved, String>>) + Send
     Ok(Picker { child })
 }
 
+/// The screen as it stood at one moment: a picture of the whole of it,
+/// kept in a file, with its pixels to show in its place while an area of
+/// it is chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Still {
+    pub file: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    /// Straight-alpha RGBA, top row first.
+    pub rgba: Vec<u8>,
+}
+
+/// Takes a picture of the whole screen now, into `file`, to choose an
+/// area of at leisure: whatever moves on the screen after this is not in
+/// it. Blocks for a moment, so call it off the main thread.
+pub fn still(file: &Path) -> Result<Still, String> {
+    screenshot(&Target::Screen, Options::default(), file)?;
+    let (width, height, rgba) = read_png(file).inspect_err(|_| {
+        let _ = std::fs::remove_file(file);
+    })?;
+    Ok(Still { file: file.to_path_buf(), width: width as u32, height: height as u32, rgba })
+}
+
+/// Saves the part of a still at `x`, `y` that is `w` by `h`, all in the
+/// still's own pixels, as a PNG at `path`. On macOS the system cuts it
+/// out of the file, which keeps the screen's colours as they were taken.
+pub fn save_part(still: &Still, (x, y, w, h): (u32, u32, u32, u32), path: &Path) -> Result<Saved, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    }
+    let (x, y) = (x.min(still.width.saturating_sub(1)), y.min(still.height.saturating_sub(1)));
+    let (w, h) = (w.clamp(1, still.width - x), h.clamp(1, still.height - y));
+    let cut = cfg!(target_os = "macos") && Command::new("/usr/bin/sips").args(["-c", &h.to_string(), &w.to_string(), "--cropOffset", &y.to_string(), &x.to_string()]).arg(&still.file).arg("--out").arg(path).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success());
+    if !cut || std::fs::metadata(path).map_or(true, |m| m.len() == 0) {
+        // By hand, from the pixels.
+        let mut part = Vec::with_capacity((w * h * 4) as usize);
+        for row in y..y + h {
+            let from = ((row * still.width + x) * 4) as usize;
+            part.extend_from_slice(&still.rgba[from..from + (w * 4) as usize]);
+        }
+        let wrong = |e: &dyn std::fmt::Display| format!("Could not save the screenshot: {e}");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| wrong(&e))?), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().and_then(|mut writer| writer.write_image_data(&part)).map_err(|e| wrong(&e))?;
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => Ok(Saved { path: path.to_path_buf(), bytes: m.len(), length: Duration::ZERO }),
+        _ => Err("No screenshot was saved.".into()),
+    }
+}
+
 /// Takes one picture of `target` and saves it as a PNG at `path`. Blocks
 /// for a moment, so call it off the main thread.
 pub fn screenshot(target: &Target, options: Options, path: &Path) -> Result<Saved, String> {
@@ -735,5 +787,30 @@ mod tests {
     fn physical_rects_are_even_and_scaled() {
         assert_eq!(physical(Rect::new(10.4, 20.0, 301.0, 199.0), 2.0), (21, 40, 602, 398));
         assert_eq!(physical(Rect::new(0.0, 0.0, 301.0, 199.0), 1.0), (0, 0, 300, 198));
+    }
+
+    #[test]
+    fn a_part_of_a_still_is_saved_as_it_stood() {
+        let dir = std::env::temp_dir().join(format!("neo-cap-still-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A picture four by three, each pixel saying where it is.
+        let (w, h) = (4u32, 3u32);
+        let rgba: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [x as u8 * 60, y as u8 * 80, 7, 255])).collect();
+        let file = dir.join("still.png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&file).unwrap()), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+        assert_eq!(read_png(&file), Ok((w as usize, h as usize, rgba.clone())));
+        let still = Still { file: file.clone(), width: w, height: h, rgba };
+        // The two by two at its bottom right.
+        let saved = save_part(&still, (2, 1, 2, 2), &dir.join("part.png")).unwrap();
+        assert_eq!(read_png(&saved.path), Ok((2, 2, vec![120, 80, 7, 255, 180, 80, 7, 255, 120, 160, 7, 255, 180, 160, 7, 255])));
+        // Asked for more than there is, it gives what there is.
+        let edge = save_part(&still, (3, 2, 50, 50), &dir.join("edge.png")).unwrap();
+        assert_eq!(read_png(&edge.path).map(|(w, h, _)| (w, h)), Ok((1, 1)));
+        assert!(read_png(&dir.join("not there.png")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

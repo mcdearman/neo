@@ -151,6 +151,12 @@ struct Recorder {
     /// said. It is asked to cover the screen from its corner, but the
     /// system may put it lower, under the menu bar.
     overlay_at: Option<Point>,
+    /// The screen as it stood when a screenshot was asked for, shown in
+    /// its place while an area is dragged out, and what the picture is
+    /// then cut from: nothing that moves afterwards is in it.
+    still: Option<(capture::Still, neo::Image)>,
+    /// That picture has been asked for and has not come back yet.
+    stilling: bool,
     /// The drag so far, from where it began to where the mouse is, within
     /// the overlay.
     drag: Option<(Point, Point)>,
@@ -202,6 +208,8 @@ enum Msg {
     /// It was let go.
     PickDrop,
     PickCancel,
+    /// The picture of the screen as it stood, taken to choose an area of.
+    Still(Result<capture::Still, String>),
     /// The drag-to-select ended: with a picture, an error, or neither.
     Picked(Option<Result<Saved, String>>),
     /// The flash after a screenshot moves on, or is over.
@@ -300,6 +308,8 @@ impl Recorder {
             own_overlay: cfg!(target_os = "macos"),
             overlay: false,
             overlay_at: None,
+            still: None,
+            stilling: false,
             drag: None,
             flash_from: None,
             clipboard: None,
@@ -481,6 +491,15 @@ impl Recorder {
                 Err(_) => return false,
             }
         }
+        // The screen is taken as it stands now, before anything is put over
+        // it: that is what is shown to choose from, and what is cut from.
+        if let Some(proxy) = self.proxy.clone().filter(|_| self.overlay) {
+            self.stilling = true;
+            let file = std::env::temp_dir().join(format!("neo-cap-still-{}-{}.png", std::process::id(), chrono::Local::now().format("%H%M%S%3f")));
+            std::thread::spawn(move || {
+                proxy.send(Msg::Still(capture::still(&file)));
+            });
+        }
         if let Some(keys) = &self.hotkeys {
             let _ = keys.register(Self::more_key());
         }
@@ -490,11 +509,20 @@ impl Recorder {
         true
     }
 
+    /// Lets go of the picture of the screen as it stood, and its file.
+    fn drop_still(&mut self) {
+        if let Some((still, _)) = self.still.take() {
+            let _ = std::fs::remove_file(&still.file);
+        }
+    }
+
     /// Takes the crosshair down if it is up, and gives `S` back to
     /// whatever the user types next.
     fn end_pick(&mut self) {
         self.overlay = false;
         self.drag = None;
+        self.stilling = false;
+        self.drop_still();
         if let Some(picker) = self.picker.take() {
             picker.cancel();
         }
@@ -511,6 +539,8 @@ const DIM: f32 = 0.42;
 /// dragged out left as it is, so what will be in the picture stands out.
 struct PickArea {
     drag: Option<(Point, Point)>,
+    /// The screen as it stood, drawn in the screen's place.
+    still: Option<neo::Image>,
 }
 
 impl PickArea {
@@ -538,6 +568,13 @@ impl Widget<Msg> for PickArea {
 
     fn draw(&self, cx: &mut DrawCx) {
         let b = cx.bounds();
+        // The screen as it was when the screenshot was asked for, under everything:
+        // what moves on the real one meanwhile is neither seen nor taken.
+        if let Some(still) = &self.still {
+            cx.scene.image(still, b);
+            // The dimming goes over the picture, which is drawn above the shapes of its own layer.
+            cx.scene.push_layer();
+        }
         let dim = Color::BLACK.with_alpha(DIM);
         let Some(r) = self.chosen(b) else {
             cx.scene.fill(b, 0.0, dim, None);
@@ -597,7 +634,8 @@ impl App for Recorder {
     fn window_state(&self) -> WindowState {
         let recording = self.busy();
         let framing = self.mode == Mode::Area && self.phase == Phase::Idle;
-        if self.phase == Phase::Picking && self.overlay {
+        // Not until the screen has been taken as it stood: the overlay is not to be in that.
+        if self.phase == Phase::Picking && self.overlay && !self.stilling {
             // Over the whole screen, and out of the picture it is about to take.
             return WindowState { visible: true, always_on_top: true, bare: true, size: Some(Size::new(self.screen.w, self.screen.h)), position: Some(Point::new(self.screen.x, self.screen.y)), hidden_from_capture: true, passive: false };
         }
@@ -914,6 +952,30 @@ impl Recorder {
                     // the screen is counted from where the overlay really is.
                     let origin = self.overlay_at.unwrap_or(Point::new(self.screen.x, self.screen.y));
                     let area = self.drag.map(|(a, b)| Rect::new(a.x.min(b.x) + origin.x, a.y.min(b.y) + origin.y, (a.x - b.x).abs(), (a.y - b.y).abs()));
+                    // Cut from the screen as it stood, if it was taken: nothing is taken again.
+                    if let (Some((still, _)), Some((a, b)), true) = (self.still.take(), self.drag, self.screen.w > 0.0) {
+                        self.end_pick();
+                        if (a.x - b.x).abs() < 4.0 || (a.y - b.y).abs() < 4.0 {
+                            let _ = std::fs::remove_file(&still.file);
+                            self.phase = Phase::Idle;
+                            return;
+                        }
+                        // From the overlay's own measure to the picture's pixels.
+                        let by = still.width as f32 / self.screen.w;
+                        let part = (((a.x.min(b.x)).max(0.0) * by).round() as u32, ((a.y.min(b.y)).max(0.0) * by).round() as u32, ((a.x - b.x).abs() * by).round() as u32, ((a.y - b.y).abs() * by).round() as u32);
+                        let path = self.shots_dir.join(format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S")));
+                        self.phase = Phase::Saving;
+                        let cut = move || {
+                            let saved = capture::save_part(&still, part, &path);
+                            let _ = std::fs::remove_file(&still.file);
+                            saved
+                        };
+                        match self.proxy.clone() {
+                            Some(proxy) => drop(std::thread::spawn(move || proxy.send(Msg::Finished(cut())))),
+                            None => self.apply(Msg::Finished(cut())),
+                        }
+                        return;
+                    }
                     self.end_pick();
                     match area {
                         // The overlay goes, and then the picture is taken.
@@ -921,6 +983,21 @@ impl Recorder {
                         // A click without a drag picks nothing.
                         _ => self.phase = Phase::Idle,
                     }
+                }
+            }
+            Msg::Still(result) => {
+                self.stilling = false;
+                match result {
+                    // Still choosing: shown in the screen's place from now on.
+                    Ok(still) if self.phase == Phase::Picking && self.overlay => {
+                        let image = neo::Image::frame(still.width, still.height, still.rgba.clone());
+                        self.drop_still();
+                        self.still = Some((still, image));
+                    }
+                    // Too late to be of use: the choosing is over.
+                    Ok(still) => drop(std::fs::remove_file(&still.file)),
+                    // It could not be taken: the area is chosen over the screen as it moves, as before.
+                    Err(_) => {}
                 }
             }
             Msg::PickCancel => {
@@ -1030,7 +1107,7 @@ impl Recorder {
             return self.flash();
         }
         if self.phase == Phase::Picking && self.overlay {
-            return Element::new(PickArea { drag: self.drag });
+            return Element::new(PickArea { drag: self.drag, still: self.still.as_ref().map(|(_, image)| image.clone()) });
         }
         if self.window_state().bare {
             return self.frame_view();
@@ -1726,6 +1803,69 @@ mod tests {
         r.shown = false;
         r.update(Msg::Geometry(WindowGeometry { frame: Rect::new(100.0, 100.0, 400.0, 300.0), screen: Rect::new(0.0, 25.0, 800.0, 500.0), scale: 2.0 }));
         r
+    }
+
+    #[test]
+    fn the_screen_is_taken_as_it_stood_and_the_picture_is_cut_from_that() {
+        let dir = std::env::temp_dir().join(format!("neo-cap-frozen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The screen as it stood: 1600 by 1000 pixels, two to a point, each saying where it is.
+        let (w, h) = (1600u32, 1000u32);
+        let rgba: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x / 8) as u8, (y / 8) as u8, 9, 255])).collect();
+        let file = dir.join("still.png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&file).unwrap()), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+        let still = capture::Still { file: file.clone(), width: w, height: h, rgba };
+
+        let mut r = overlaying();
+        r.shots_dir = dir.join("shots");
+        r.copy_shots = false;
+        r.update(Msg::ScreenshotHotkey);
+        // While the screen is being taken, nothing of NeoCap's is over it to be taken too.
+        r.stilling = true;
+        assert!(!r.window_state().visible);
+        r.update(Msg::Still(Ok(still.clone())));
+        assert!(r.window_state().visible && r.still.is_some() && !r.stilling, "then it is shown in the screen's place");
+        // An area dragged out is cut from that picture: nothing is taken again.
+        r.update(Msg::PickDrag(Point::new(100.0, 50.0), Point::new(300.0, 200.0)));
+        r.update(Msg::PickDrop);
+        let (Phase::Flash(_) | Phase::Done(_)) = r.phase.clone() else { panic!("saved at once, not waiting to shoot: {:?}", r.phase) };
+        let saved: Vec<_> = std::fs::read_dir(dir.join("shots")).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(saved.len(), 1);
+        let (pw, ph, pixels) = capture::read_png(&saved[0]).unwrap();
+        assert_eq!((pw, ph), (400, 300), "200 by 150 points, at two pixels to a point");
+        assert_eq!((&pixels[..3], &pixels[pixels.len() - 4..pixels.len() - 1]), (&[25u8, 12, 9][..], &[74u8, 49, 9][..]), "from 200, 100 in the picture to 599, 399");
+        assert!(!file.exists() && r.still.is_none(), "and the picture of the whole screen is let go");
+
+        // Backed out of, it is let go too; and one that arrives after the choosing is over is not kept.
+        for late in [false, true] {
+            let again = dir.join(format!("again-{late}.png"));
+            std::fs::copy(&saved[0], &again).unwrap();
+            let still = capture::Still { file: again.clone(), ..still.clone() };
+            let mut r = overlaying();
+            r.update(Msg::ScreenshotHotkey);
+            if late {
+                r.update(Msg::PickCancel);
+                r.update(Msg::Still(Ok(still)));
+            } else {
+                r.update(Msg::Still(Ok(still)));
+                r.update(Msg::PickCancel);
+            }
+            assert!(!again.exists() && r.still.is_none() && r.phase == Phase::Idle, "late: {late}");
+        }
+        // If the screen could not be taken, the area is chosen over it as it moves, as it used to be.
+        let mut r = overlaying();
+        r.update(Msg::ScreenshotHotkey);
+        r.stilling = true;
+        r.update(Msg::Still(Err("no permission".into())));
+        assert!(r.window_state().visible && r.still.is_none());
+        r.update(Msg::PickDrag(Point::new(100.0, 50.0), Point::new(300.0, 200.0)));
+        r.update(Msg::PickDrop);
+        assert!(matches!(r.phase, Phase::Shooting(_)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
