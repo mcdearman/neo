@@ -213,6 +213,23 @@ impl Dock {
 /// how far a tab is dragged before it is being moved and not clicked.
 const STRIP: f32 = 30.0;
 const GAP: f32 = 5.0;
+/// The same, flat: a lower strip, and a hairline between groups.
+const FLAT_STRIP: f32 = 25.0;
+const FLAT_GAP: f32 = 1.0;
+
+/// How a dock's tabs and the divisions between its groups are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabStyle {
+    /// Each group a card with a strip of tabs set into it, the one in
+    /// front a raised pill, and room between one group and the next.
+    #[default]
+    Raised,
+    /// Lines and no surfaces: tabs are plain rectangles side by side with
+    /// a line between them and a line under the strip, the one in front
+    /// marked along its top and open to its panel below; groups meet at a
+    /// hairline. For an app of many panels, where edges should be quiet.
+    Flat,
+}
 const TAB_X: f32 = 12.0;
 const SLACK: f32 = 6.0;
 
@@ -255,6 +272,7 @@ pub struct DockView<M> {
     on_change: Box<dyn Fn(Dock) -> M>,
     groups: Vec<Group>,
     bars: Vec<Bar>,
+    style: TabStyle,
 }
 
 /// Panels arranged as `layout` says, filling what room there is. `title`
@@ -263,10 +281,24 @@ pub struct DockView<M> {
 /// is chosen, a bar is dragged or a tab is dragged to another place, for
 /// the app to keep and show next.
 pub fn dock<M>(layout: &Dock, title: impl Fn(&str) -> String, mut content: impl FnMut(&str) -> Element<M>, on_change: impl Fn(Dock) -> M + 'static) -> DockView<M> {
-    DockView { titles: layout.panels().into_iter().map(|p| (p.to_owned(), title(p))).collect(), children: layout.shown().into_iter().map(&mut content).collect(), layout: layout.clone(), on_change: Box::new(on_change), groups: vec![], bars: vec![] }
+    DockView { titles: layout.panels().into_iter().map(|p| (p.to_owned(), title(p))).collect(), children: layout.shown().into_iter().map(&mut content).collect(), layout: layout.clone(), on_change: Box::new(on_change), groups: vec![], bars: vec![], style: TabStyle::Raised }
 }
 
 impl<M> DockView<M> {
+    /// How the tabs are drawn: see [`TabStyle`].
+    pub fn tabs(mut self, style: TabStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    fn strip(&self) -> f32 {
+        if self.style == TabStyle::Flat { FLAT_STRIP } else { STRIP }
+    }
+
+    fn gap(&self) -> f32 {
+        if self.style == TabStyle::Flat { FLAT_GAP } else { GAP }
+    }
+
     /// Lays the arrangement out in `rect`, noting each group and bar.
     fn arrange(&mut self, cx: &mut Cx, node: &Dock, rect: Rect, path: &mut Vec<bool>) {
         match node {
@@ -276,12 +308,12 @@ impl<M> DockView<M> {
                 // Tabs as wide as their names, made narrower together if there is not the room.
                 let wanted: f32 = titles.iter().map(|t| t.size().w + TAB_X * 2.0).sum();
                 let squeeze = (rect.w / wanted.max(1.0)).min(1.0);
-                let mut x = rect.x;
+                let (mut x, strip) = (rect.x, self.strip());
                 let tabs = titles
                     .iter()
                     .map(|t| {
                         let w = ((t.size().w + TAB_X * 2.0) * squeeze).floor();
-                        let r = Rect::new(x, rect.y, w, STRIP);
+                        let r = Rect::new(x, rect.y, w, strip);
                         x += w;
                         r
                     })
@@ -289,12 +321,13 @@ impl<M> DockView<M> {
                 self.groups.push(Group { panels: panels.clone(), active: (*active).min(panels.len().saturating_sub(1)), rect, tabs, titles });
             }
             Dock::Split { across, share, first, second } => {
+                let gap = self.gap();
                 let whole = if *across { rect.w } else { rect.h };
-                let a = ((whole - GAP) * share).round().max(0.0);
+                let a = ((whole - gap) * share).round().max(0.0);
                 let (one, bar, two) = if *across {
-                    (Rect::new(rect.x, rect.y, a, rect.h), Rect::new(rect.x + a, rect.y, GAP, rect.h), Rect::new(rect.x + a + GAP, rect.y, (rect.w - a - GAP).max(0.0), rect.h))
+                    (Rect::new(rect.x, rect.y, a, rect.h), Rect::new(rect.x + a, rect.y, gap, rect.h), Rect::new(rect.x + a + gap, rect.y, (rect.w - a - gap).max(0.0), rect.h))
                 } else {
-                    (Rect::new(rect.x, rect.y, rect.w, a), Rect::new(rect.x, rect.y + a, rect.w, GAP), Rect::new(rect.x, rect.y + a + GAP, rect.w, (rect.h - a - GAP).max(0.0)))
+                    (Rect::new(rect.x, rect.y, rect.w, a), Rect::new(rect.x, rect.y + a, rect.w, gap), Rect::new(rect.x, rect.y + a + gap, rect.w, (rect.h - a - gap).max(0.0)))
                 };
                 self.bars.push(Bar { path: path.clone(), rect: bar, across: *across, span: if *across { (rect.x, rect.w) } else { (rect.y, rect.h) } });
                 path.push(false);
@@ -312,7 +345,7 @@ impl<M> DockView<M> {
         let r = g.rect.translate(origin);
         // On the tabs themselves, or in the middle: among them. Near an edge: to that side.
         let (fx, fy) = ((p.x - r.x) / r.w.max(1.0), (p.y - r.y) / r.h.max(1.0));
-        let side = if p.y < r.y + STRIP {
+        let side = if p.y < r.y + self.strip() {
             Side::Middle
         } else if fx < 0.25 {
             Side::Left
@@ -359,10 +392,11 @@ impl<M: 'static> Widget<M> for DockView<M> {
         let layout = self.layout.clone();
         self.arrange(cx, &layout, Rect::new(0.0, 0.0, size.w, size.h), &mut vec![]);
         // Each panel in front has its group, less the strip of tabs.
+        let strip = self.strip();
         for (child, g) in self.children.iter_mut().zip(&self.groups) {
-            let room = Size::new(g.rect.w, (g.rect.h - STRIP).max(0.0));
+            let room = Size::new(g.rect.w, (g.rect.h - strip).max(0.0));
             child.layout(cx, Limits::tight(room));
-            child.set_position(Point::new(g.rect.x, g.rect.y + STRIP));
+            child.set_position(Point::new(g.rect.x, g.rect.y + strip));
         }
         size
     }
@@ -377,26 +411,48 @@ impl<M: 'static> Widget<M> for DockView<M> {
         };
         for (g, child) in self.groups.iter().zip(&self.children) {
             let r = g.rect.translate(origin);
-            cx.scene.paint(r, theme.small_radius(), &theme.paint(Surface::Card));
-            cx.scene.paint(Rect::new(r.x, r.y, r.w, STRIP), theme.small_radius(), &theme.paint(Surface::Inset));
+            let flat = self.style == TabStyle::Flat;
+            if !flat {
+                cx.scene.paint(r, theme.small_radius(), &theme.paint(Surface::Card));
+                cx.scene.paint(Rect::new(r.x, r.y, r.w, self.strip()), theme.small_radius(), &theme.paint(Surface::Inset));
+            }
             for (i, (tab, title)) in g.tabs.iter().zip(&g.titles).enumerate() {
                 let tab = tab.translate(origin);
                 let front = i == g.active;
-                if front {
-                    cx.scene.paint(tab.inset(2.0), theme.small_radius(), &theme.paint(Surface::Raised));
+                match (flat, front) {
+                    (false, true) => cx.scene.paint(tab.inset(2.0), theme.small_radius(), &theme.paint(Surface::Raised)),
+                    // Marked along its top, and with no line under it: it is one with its panel.
+                    (true, true) => cx.scene.fill(Rect::new(tab.x, tab.y, tab.w, 2.0), 0.0, p.accent, None),
+                    (true, false) => cx.scene.fill(Rect::new(tab.x, tab.bottom() - 1.0, tab.w, 1.0), 0.0, p.line, None),
+                    (false, false) => {}
+                }
+                if flat {
+                    // A line parting it from the tab after it, or from the rest of the strip.
+                    cx.scene.fill(Rect::new(tab.right() - 1.0, tab.y, 1.0, tab.h), 0.0, p.line, None);
                 }
                 let s = title.size();
                 cx.scene.push_clip(tab.inset(4.0));
                 cx.scene.text(title, Point::new(tab.x + TAB_X.min((tab.w - s.w).max(8.0) / 2.0), tab.y + ((tab.h - s.h) * 0.5).round()), if front { p.text } else { p.muted });
                 cx.scene.pop_clip();
             }
-            cx.scene.push_clip(Rect::new(r.x, r.y + STRIP, r.w, (r.h - STRIP).max(0.0)));
+            if flat {
+                // Under the rest of the strip, past the last tab.
+                let past = g.tabs.last().map_or(r.x, |t| t.translate(origin).right());
+                cx.scene.fill(Rect::new(past, r.y + self.strip() - 1.0, (r.right() - past).max(0.0), 1.0), 0.0, p.line, None);
+            }
+            cx.scene.push_clip(Rect::new(r.x, r.y + self.strip(), r.w, (r.h - self.strip()).max(0.0)));
             child.draw(cx);
             cx.scene.pop_clip();
         }
         for bar in &self.bars {
-            if held_bar.as_ref() == Some(&bar.path) || hovered_bar.as_ref() == Some(&bar.path) {
-                cx.scene.fill(bar.rect.translate(origin).inset(1.0), 2.0, p.accent.with_alpha(0.55), None);
+            let active = held_bar.as_ref() == Some(&bar.path) || hovered_bar.as_ref() == Some(&bar.path);
+            let r = bar.rect.translate(origin);
+            match (self.style, active) {
+                (TabStyle::Raised, true) => cx.scene.fill(r.inset(1.0), 2.0, p.accent.with_alpha(0.55), None),
+                (TabStyle::Raised, false) => {}
+                // Always there as a hairline; thicker and in the accent while it is to hand.
+                (TabStyle::Flat, true) => cx.scene.fill(r.inset(-1.0), 0.0, p.accent, None),
+                (TabStyle::Flat, false) => cx.scene.fill(r, 0.0, p.line, None),
             }
         }
         // Where a tab being dragged would land, over everything.
@@ -406,7 +462,8 @@ impl<M: 'static> Widget<M> for DockView<M> {
             let same = g.panels.iter().any(|x| x == panel);
             if !(same && (side == Side::Middle || g.panels.len() == 1)) {
                 let body = g.rect.translate(origin);
-                cx.scene.fill(landing(body, side).inset(3.0), theme.small_radius(), p.accent.with_alpha(0.22), Some((2.0, p.accent)));
+                let (inset, radius) = if self.style == TabStyle::Flat { (0.0, 0.0) } else { (3.0, theme.small_radius()) };
+                cx.scene.fill(landing(body, side).inset(inset), radius, p.accent.with_alpha(0.22), Some((2.0, p.accent)));
             }
         }
     }
@@ -414,7 +471,8 @@ impl<M: 'static> Widget<M> for DockView<M> {
     fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
         let origin = cx.bounds().origin();
         let tab_at = |p: Point| self.groups.iter().find_map(|g| g.tabs.iter().position(|t| t.translate(origin).contains(p)).map(|i| g.panels[i].clone()));
-        let bar_at = |p: Point| self.bars.iter().find(|b| b.rect.translate(origin).inset(-2.0).contains(p));
+        let reach = if self.style == TabStyle::Flat { -4.0 } else { -2.0 };
+        let bar_at = |p: Point| self.bars.iter().find(|b| b.rect.translate(origin).inset(reach).contains(p));
         match event {
             Event::PointerPressed { pos, button: PointerButton::Primary } => {
                 if let Some(bar) = bar_at(*pos) {
@@ -432,7 +490,7 @@ impl<M: 'static> Widget<M> for DockView<M> {
                 if let Some(bar) = held.as_ref().and_then(|path| self.bars.iter().find(|b| b.path == *path)) {
                     cx.set_cursor(if bar.across { CursorIcon::Resize(ResizeEdge::East) } else { CursorIcon::Resize(ResizeEdge::South) });
                     let along = if bar.across { pos.x - origin.x } else { pos.y - origin.y };
-                    let share = (along - bar.span.0 - GAP / 2.0) / (bar.span.1 - GAP).max(1.0);
+                    let share = (along - bar.span.0 - self.gap() / 2.0) / (bar.span.1 - self.gap()).max(1.0);
                     cx.emit((self.on_change)(self.layout.clone().with_share(&bar.path, share)));
                     return Status::Captured;
                 }

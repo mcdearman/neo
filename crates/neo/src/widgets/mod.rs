@@ -30,7 +30,7 @@ pub use color::{color_field, hex, hues, parse_hex, shades, ColorField, Hsv, Plan
 pub use armature::document::{Action, BlockSelection, ClipboardNeed, Document, ExtraSelection, Keymap, Mode as VimMode, ModeStatus, Motion, Pos, Scroll, VimRequest, VimStatus, VimView, INDENT};
 pub use highlight::{Kind as SyntaxKind, Language};
 pub use data::{gauge, progress_bar, sparkline, Gauge, ProgressBar, Sparkline};
-pub use dock::{dock, Dock, DockView, Side};
+pub use dock::{dock, Dock, DockView, Side, TabStyle};
 pub use drop::{drop_area, DropArea};
 pub use tree::{tree, Place, Tree, TreeEdit, TreeNode};
 pub use transcript::{conversation, conversation_linked, prompt, transcript, Asking, Entry, Prompt, Said, Speaker, ToolRow, ToolState};

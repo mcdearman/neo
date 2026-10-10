@@ -16,6 +16,7 @@ enum Msg {
 struct Editor {
     layout: Dock,
     pressed: Vec<String>,
+    style: TabStyle,
 }
 
 impl App for Editor {
@@ -35,7 +36,7 @@ impl App for Editor {
                 let panel = panel.to_owned();
                 move || Msg::Pressed(panel.clone())
             })
-            .into(), Msg::Arranged).into()
+            .into(), Msg::Arranged).tabs(self.style).into()
     }
 
     // No title bar of Neo's own: the dock has the whole window, from its corner.
@@ -46,7 +47,7 @@ impl App for Editor {
 
 fn editor() -> Harness<Editor> {
     let layout = Dock::beside(Dock::tabs(["scene", "assets"]), 0.25, Dock::above(Dock::tabs(["view"]), 0.7, Dock::tabs(["console", "log"])));
-    let mut h = Harness::new(Editor { layout, pressed: vec![] }, Size::new(800.0, 600.0)).expect("a GPU adapter is required for these tests");
+    let mut h = Harness::new(Editor { layout, pressed: vec![], style: TabStyle::Raised }, Size::new(800.0, 600.0)).expect("a GPU adapter is required for these tests");
     h.render(1.0);
     h
 }
@@ -141,12 +142,40 @@ fn a_tab_is_dragged_to_another_group_or_to_one_side_of_it() {
     assert_eq!(h.app().layout, before);
 }
 
+#[test]
+fn drawn_flat_the_same_things_are_done_to_tabs_that_are_lines_and_not_pills() {
+    let mut h = editor();
+    let raised = h.render(1.0);
+    h.app_mut().style = TabStyle::Flat;
+    let flat = h.render(1.0);
+    assert!(raised != flat);
+    // Groups meet at a hairline now, with no room between: the first group is a point or two wider,
+    // and its panel starts higher, under a lower strip.
+    h.click(Point::new(207.0, 300.0));
+    h.click(Point::new(100.0, 27.0));
+    assert_eq!(h.app().pressed, ["view", "scene"], "where the room between groups was is the next group now, and just under the lower strip is the panel");
+    // A tab is chosen, the hairline dragged, and a tab moved, as before.
+    let assets = tab(&mut h, "assets", 0.0, 12.0);
+    assert!(h.app().layout.encode().starts_with("row(0.25, tabs(scene, *assets)"));
+    press(&mut h, Point::new(200.0, 300.0));
+    release(&mut h, Point::new(320.0, 300.0));
+    let Dock::Split { share, .. } = h.app().layout.clone() else { panic!("a split") };
+    assert!((share - 0.4).abs() < 0.01, "the hairline is grabbed from a little to either side: {share}");
+    press(&mut h, assets);
+    release(&mut h, Point::new(500.0, 520.0));
+    assert!(h.app().layout.encode().ends_with("tabs(*console, log, *assets)))") || h.app().layout.encode().contains("log, *assets"), "{}", h.app().layout.encode());
+}
+
 /// A picture of it, to look at by hand:
 /// `NEO_DOCK_PNG=/tmp/dock.png cargo test -p neo --test dock a_picture -- --ignored`.
 #[test]
 #[ignore]
 fn a_picture() {
     let mut h = editor();
+    if std::env::var("NEO_DOCK_FLAT").is_ok() {
+        h.app_mut().style = TabStyle::Flat;
+        h.render(1.0);
+    }
     // With a tab picked up, to show where it would land.
     let log = tab(&mut h, "log", 204.0, 437.0);
     press(&mut h, log);
