@@ -31,7 +31,9 @@ use neo_apollo_core::warden::{self, Warning};
 use neo_desktop::ui::{nav_item, notice, section, setting, split};
 use neo_desktop::{Desktop, DesktopMsg};
 
+mod agents;
 mod cloud;
+mod flow_view;
 use cloud::{Cloud, Graph, Hub};
 mod tray;
 use tray::{Tray, TrayAction, TrayState};
@@ -88,6 +90,8 @@ enum Page {
     Sources,
     /// What Apollo is doing: how the reading is going, and what it has taken in.
     Activity,
+    /// Workflows: work shared out between agents, drawn, kept and run.
+    Agents,
 }
 
 /// Whether the model is there to be used.
@@ -269,6 +273,8 @@ struct Apollo {
     /// Why the memory cannot be used with the model now chosen, if it was
     /// made with another.
     stale: Option<String>,
+    /// The workflows, and the one that is open.
+    agents: agents::Agents,
     asking_reset: bool,
     /// Says whether it is. Tests say so themselves.
     short_of_memory: fn() -> bool,
@@ -278,6 +284,8 @@ struct Apollo {
 #[derive(Clone, Debug)]
 enum Msg {
     Page(Page),
+    /// Something done on the Agents page.
+    Agents(agents::AgentMsg),
     Desktop(DesktopMsg),
     Poll,
 
@@ -506,6 +514,7 @@ impl Apollo {
         app.drafts_away = app.away();
         app.remote_draft = app.settings.remote.clone();
         app.settings_file = Some(Settings::file());
+        app.agents = agents::Agents::new(Some(neo_apollo_core::flow::Workflow::folder()));
         app.settings_stamp = neo_desktop::config::modified(&Settings::file());
         app.server = Some(server);
         app.short_of_memory = neo_apollo_core::pressure::short_of_memory;
@@ -581,6 +590,7 @@ impl Apollo {
             asked_after: vec![],
             watcher: None,
             stale: None,
+            agents: agents::Agents::new(None),
             asking_reset: false,
             short_of_memory: || false,
             trouble: None,
@@ -1249,6 +1259,7 @@ impl App for Apollo {
             Page::Memory => "Memory · Apollo".into(),
             Page::Sources => "Sources · Apollo".into(),
             Page::Activity => "Activity · Apollo".into(),
+            Page::Agents => "Agents · Apollo".into(),
         }
     }
 
@@ -1293,7 +1304,7 @@ impl App for Apollo {
                 .push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading))
                 .separator()
                 .push(MenuEntry::new("Quit Apollo", Msg::Quit)),
-            Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))).push(MenuEntry::new("Activity", Msg::Page(Page::Activity)).shortcut(Shortcut::command("4"))),
+            Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))).push(MenuEntry::new("Activity", Msg::Page(Page::Activity)).shortcut(Shortcut::command("4"))).push(MenuEntry::new("Agents", Msg::Page(Page::Agents)).shortcut(Shortcut::command("5"))),
             Menu::new("Memory")
                 .push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking))
                 .push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some()))
@@ -1412,6 +1423,21 @@ impl Apollo {
             Msg::Poll => {
                 self.desktop.poll();
                 self.follow_settings();
+            }
+            Msg::Agents(m) => {
+                // A run to start is started here, where the model and the memory are.
+                if let Some(run) = self.agents.update(m) {
+                    self.last_used = std::time::Instant::now();
+                    let (model, memory) = (self.model.clone(), self.memory().filter(|_| self.store.is_some()));
+                    self.work(move |send| {
+                        let store = memory.and_then(|(db, key)| Store::open_for(&db, &key, &*model).ok());
+                        let result = neo_apollo_core::flow::run(&run.flow, &run.question, &*model, store.as_ref(), &mut |step| {
+                            send(Msg::Agents(agents::AgentMsg::Step(step)));
+                            !run.stop.load(Ordering::Relaxed)
+                        });
+                        send(Msg::Agents(agents::AgentMsg::Finished(result)));
+                    });
+                }
             }
 
             Msg::Ready(ready, dims) => {
@@ -1803,6 +1829,12 @@ impl Apollo {
             Page::Memory => self.memory_page(),
             Page::Sources => self.sources_page(),
             Page::Activity => self.activity_page(),
+            Page::Agents => {
+                // The models there are to answer with, here or on the other computer.
+                let mut models: Vec<String> = self.models_for(0, false).into_iter().chain(self.models_for(0, true)).map(str::to_owned).collect();
+                models.dedup();
+                self.agents.view(&models, self.ready == Engine::Ready).map(Msg::Agents)
+            }
         };
         let page = split(self.sidebar(), main);
         // The menu of models hangs over everything, from the control that opened it.
@@ -1881,6 +1913,7 @@ impl Apollo {
             .push(nav_item(icons::MESSAGE_CIRCLE, "Ask", self.page == Page::Ask, Msg::Page(Page::Ask)))
             .push(nav_item(if self.store.is_some() { icons::BRAIN } else { icons::LOCK }, "Memory", self.page == Page::Memory, Msg::Page(Page::Memory)))
             .push(nav_item(icons::FOLDER_SEARCH, "Sources", self.page == Page::Sources, Msg::Page(Page::Sources)))
+            .push(nav_item(icons::WORKFLOW, "Agents", self.page == Page::Agents, Msg::Page(Page::Agents)))
             .push(Space::new(0.0, Length::Fill))
             .push(status)
             .into()
@@ -2439,7 +2472,7 @@ fn snapshots(dir: PathBuf) {
     use neo::testing::Harness;
     std::fs::create_dir_all(&dir).expect("create snapshot dir");
     type Shot<'a> = (&'a str, neo_desktop::SchemePref, &'a dyn Fn(&mut Apollo));
-    let shots: [Shot; 7] = [
+    let shots: [Shot; 8] = [
         ("apollo-ask", neo_desktop::SchemePref::Light, &|a| {
             a.update(Msg::Unlock);
             a.update(Msg::Suggest("Which photos show a dog on the beach?".into()));
@@ -2457,6 +2490,15 @@ fn snapshots(dir: PathBuf) {
             a.update(Msg::Word("beach".into()));
         }),
         ("apollo-sources", neo_desktop::SchemePref::Light, &|a| a.update(Msg::Page(Page::Sources))),
+        ("apollo-agents", neo_desktop::SchemePref::Dark, &|a| {
+            use agents::AgentMsg;
+            a.ready = Engine::Ready;
+            a.update(Msg::Page(Page::Agents));
+            a.update(Msg::Agents(AgentMsg::Question("What should I pack for a week of hiking?".into())));
+            a.update(Msg::Agents(AgentMsg::Run));
+            a.update(Msg::Agents(AgentMsg::Graph(flow_view::FlowEvent::Chose(Some(3)))));
+            a.update(Msg::Agents(AgentMsg::Model("qwen3:8b".into())));
+        }),
         ("apollo-activity", neo_desktop::SchemePref::Dark, &|a| {
             a.update(Msg::Unlock);
             a.update(Msg::Page(Page::Activity));
@@ -3312,5 +3354,84 @@ mod tests {
         assert_eq!(snippet("abcdefghij", 6), "abcde…");
         assert_eq!(short_path(&neo_desktop::fs::home_dir().join("Pictures/a.png")), "~/Pictures/a.png");
         assert_eq!(short_path(Path::new("/Volumes/Disk/a")), "/Volumes/Disk/a");
+    }
+
+    #[test]
+    fn a_workflow_is_drawn_changed_kept_and_run() {
+        use agents::AgentMsg;
+        use flow_view::{FlowEvent, Stage};
+        use neo_apollo_core::flow::{NodeKind, Workflow};
+        let (mut a, scratch) = app("agents");
+        a.ready = Engine::Ready;
+        a.update(Msg::Page(Page::Agents));
+        // It opens on a workflow to begin from: a question, workers, a summing-up, an answer.
+        assert_eq!((a.agents.open.nodes.len(), a.agents.open.edges.len(), a.agents.kept.len(), a.agents.changed), (4, 4, 0, false));
+        // A node is chosen, given a model of its own and new instructions, and another is added and joined in.
+        let say = |a: &mut Apollo, m: AgentMsg| a.update(Msg::Agents(m));
+        say(&mut a, AgentMsg::Graph(FlowEvent::Chose(Some(3))));
+        say(&mut a, AgentMsg::ChooseModel(Rect::new(400.0, 400.0, 160.0, 30.0)));
+        say(&mut a, AgentMsg::Model("large".into()));
+        say(&mut a, AgentMsg::Instructions(Action::SelectAll));
+        say(&mut a, AgentMsg::Instructions(Action::Insert("Sum it up in one line.".into())));
+        say(&mut a, AgentMsg::Title("Summary".into()));
+        say(&mut a, AgentMsg::Add(NodeKind::Memory));
+        let memory = a.agents.chosen.expect("the new node is the one chosen");
+        say(&mut a, AgentMsg::Graph(FlowEvent::Joined(1, memory)));
+        say(&mut a, AgentMsg::Graph(FlowEvent::Joined(memory, 3)));
+        say(&mut a, AgentMsg::Graph(FlowEvent::Moved(memory, Point::new(260.0, 200.0))));
+        let node = a.agents.open.node(3).unwrap().clone();
+        assert_eq!((node.model.as_str(), node.prompt.as_str(), node.title.as_str(), a.agents.open.leading_to(3), a.agents.changed), ("large", "Sum it up in one line.", "Summary", vec![2, 1, memory], true));
+        // A join that cannot be is refused, and says why.
+        say(&mut a, AgentMsg::Graph(FlowEvent::Joined(3, 2)));
+        assert!(a.agents.trouble.as_deref().is_some_and(|t| t.contains("ring")) && a.agents.open.edges.len() == 6);
+        // Kept under a name, it is in the list; under a new name, it is there once.
+        a.agents.folder = Some(scratch.0.join("workflows"));
+        say(&mut a, AgentMsg::Name("Research".into()));
+        say(&mut a, AgentMsg::Save);
+        say(&mut a, AgentMsg::Name("Look things up".into()));
+        say(&mut a, AgentMsg::Save);
+        let kept = Workflow::saved_in(&scratch.0.join("workflows"));
+        assert_eq!((kept.len(), kept[0].name.as_str(), kept[0] == a.agents.open, a.agents.changed), (1, "Look things up", true, false));
+
+        // Run on a question: each node does its part, on the model it names, and the answer comes out.
+        say(&mut a, AgentMsg::Run);
+        assert!(!a.agents.running, "with nothing asked, nothing runs");
+        say(&mut a, AgentMsg::Question("Which photos show a dog on the beach?".into()));
+        say(&mut a, AgentMsg::Run);
+        assert!(!a.agents.running && a.agents.trouble.is_none(), "{:?}", a.agents.trouble);
+        let answer = a.agents.answer.clone().expect("an answer");
+        assert!(answer.starts_with("[large] "), "{answer}");
+        assert!(a.agents.made.values().all(|m| m.stage == Stage::Done) && a.agents.made.len() == 5);
+        assert!(!a.agents.made[&2].pieces.is_empty(), "the workers' node shared the work out");
+        assert!(a.agents.made[&memory].text.contains("locked"), "the memory has not been unlocked: {}", a.agents.made[&memory].text);
+        // With the memory unlocked, the memory node finds what bears on the question.
+        a.unlock();
+        say(&mut a, AgentMsg::Run);
+        assert!(a.agents.made[&memory].text.starts_with("1. "), "{}", a.agents.made[&memory].text);
+
+        // The page draws: with a node chosen and its work shown, with the list of models open, and running.
+        let mut h = Harness::new(a, WINDOW).unwrap();
+        h.render(1.0);
+        h.app_mut().update(Msg::Agents(AgentMsg::Graph(FlowEvent::Chose(Some(2)))));
+        h.app_mut().update(Msg::Agents(AgentMsg::ChooseModel(Rect::new(400.0, 400.0, 160.0, 30.0))));
+        h.render(1.0);
+        h.key(Key::Escape, Modifiers::default());
+        h.app_mut().agents.running = true;
+        h.render(1.0);
+        let mut a = std::mem::replace(h.app_mut(), sample("agents-spare", false).0);
+        a.agents.running = false;
+        // A node taken out takes its joins and its work with it; what is left cannot run, and says so.
+        say(&mut a, AgentMsg::Graph(FlowEvent::Chose(Some(4))));
+        say(&mut a, AgentMsg::Remove);
+        say(&mut a, AgentMsg::Run);
+        assert!(a.agents.trouble.as_deref().is_some_and(|t| t.contains("add an Answer")), "{:?}", a.agents.trouble);
+        // Another is begun, the kept one opened again as it was kept, and then deleted.
+        say(&mut a, AgentMsg::New);
+        assert_eq!((a.agents.open.name.as_str(), a.agents.open.nodes.len(), a.agents.changed), ("New workflow", 4, true));
+        say(&mut a, AgentMsg::Open("Look things up".into()));
+        assert_eq!((a.agents.open.nodes.len(), a.agents.changed), (5, false));
+        say(&mut a, AgentMsg::Delete);
+        assert!(Workflow::saved_in(&scratch.0.join("workflows")).is_empty() && a.agents.kept.is_empty());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("neo-apollo-app-agents-spare-{}", std::process::id())));
     }
 }

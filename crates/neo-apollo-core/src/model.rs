@@ -75,6 +75,14 @@ pub trait Model: Send + Sync {
     /// Answers a conversation. `piece` is given the answer as it comes;
     /// returning false from it stops the answer there.
     fn chat(&self, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String>;
+
+    /// As [`chat`](Self::chat), answered by the model of this name if one
+    /// is given, and not the one Apollo answers with: for a step of a
+    /// workflow that has a model of its own. A model that is only itself
+    /// answers as itself.
+    fn chat_as(&self, _model: Option<&str>, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+        self.chat(turns, piece)
+    }
 }
 
 /// Models served by Ollama: on this computer, and, for any of the three
@@ -421,6 +429,16 @@ impl Model for Ollama {
     }
 
     fn chat(&self, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+        self.chat_as(None, turns, piece)
+    }
+
+    fn chat_as(&self, model: Option<&str>, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+        // Another model than the usual one is let go as soon as it has
+        // answered: it is wanted for one step, and its room is wanted after.
+        let (model, keep) = match model.filter(|m| *m != self.chat_model) {
+            Some(other) => (other, "0s"),
+            None => (self.chat_model.as_str(), self.keep(KEEP_ANSWERING)),
+        };
         let messages: Vec<Value> = turns
             .iter()
             .map(|t| {
@@ -432,7 +450,7 @@ impl Model for Ollama {
                 json!({ "role": role, "content": t.text })
             })
             .collect();
-        let mut res = self.post(self.at(ANSWER), "/api/chat", &json!({ "model": self.chat_model, "stream": true, "keep_alive": self.keep(KEEP_ANSWERING), "messages": messages }), Some(Duration::from_secs(600)))?;
+        let mut res = self.post(self.at(ANSWER), "/api/chat", &json!({ "model": model, "stream": true, "keep_alive": keep, "messages": messages }), Some(Duration::from_secs(600)))?;
         let mut said = String::new();
         for line in BufReader::new(res.body_mut().as_reader()).lines() {
             let line = line.map_err(|e| format!("The answer stopped: {e}"))?;
@@ -512,6 +530,26 @@ pub mod fake {
             let asked = put.split("\nQuestion: ").nth(1).map_or(put, |rest| rest.lines().next().unwrap_or_default()).lines().next().unwrap_or_default();
             let knows = put.lines().filter(|l| l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))).count();
             let answer = format!("You asked: {asked} I looked at {knows} memories.");
+            let mut said = String::new();
+            for word in answer.split_inclusive(' ') {
+                said.push_str(word);
+                if !piece(word) {
+                    break;
+                }
+            }
+            Ok(said)
+        }
+
+        /// As another model it says which it is, so that a test can tell
+        /// who answered; asked to split a task, it gives two pieces.
+        fn chat_as(&self, model: Option<&str>, turns: &[Turn], piece: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+            let split = turns.iter().any(|t| t.role == Role::System && t.text.starts_with("Split the task"));
+            let answer = if split {
+                "1. Find out the first thing asked\n- Find out the second thing asked\nnothing".to_owned()
+            } else {
+                let said = self.chat(turns, &mut |_| true)?;
+                model.map_or(said.clone(), |m| format!("[{m}] {said}"))
+            };
             let mut said = String::new();
             for word in answer.split_inclusive(' ') {
                 said.push_str(word);

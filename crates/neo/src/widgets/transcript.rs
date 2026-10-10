@@ -427,7 +427,8 @@ impl<M: Clone + 'static> Widget<M> for Prompt<M> {
                 };
                 let action = match &k.key {
                     // Enter sends what is written; with Shift or Alt it is a new line.
-                    Key::Enter if !m.shift && !m.alt => {
+                    // (With nowhere to send it, it is only somewhere to write, and Enter is a new line.)
+                    Key::Enter if !m.shift && !m.alt && self.on_submit.is_some() => {
                         if let (Some(send), false) = (&self.on_submit, self.empty()) {
                             cx.emit(send.clone());
                         }
