@@ -539,8 +539,10 @@ const DIM: f32 = 0.42;
 /// dragged out left as it is, so what will be in the picture stands out.
 struct PickArea {
     drag: Option<(Point, Point)>,
-    /// The screen as it stood, drawn in the screen's place.
-    still: Option<neo::Image>,
+    /// The display as it stood, and where it lies against the overlay's
+    /// own corner: drawn there, so that each thing in it is exactly over
+    /// the thing itself.
+    still: Option<(neo::Image, Rect)>,
 }
 
 impl PickArea {
@@ -570,8 +572,10 @@ impl Widget<Msg> for PickArea {
         let b = cx.bounds();
         // The screen as it was when the screenshot was asked for, under everything:
         // what moves on the real one meanwhile is neither seen nor taken.
-        if let Some(still) = &self.still {
-            cx.scene.image(still, b);
+        if let Some((still, place)) = &self.still {
+            cx.scene.push_clip(b);
+            cx.scene.image(still, Rect::new(b.x + place.x, b.y + place.y, place.w, place.h));
+            cx.scene.pop_clip();
             // The dimming goes over the picture, which is drawn above the shapes of its own layer.
             cx.scene.push_layer();
         }
@@ -960,9 +964,10 @@ impl Recorder {
                             self.phase = Phase::Idle;
                             return;
                         }
-                        // From the overlay's own measure to the picture's pixels.
-                        let by = still.width as f32 / self.screen.w;
-                        let part = (((a.x.min(b.x)).max(0.0) * by).round() as u32, ((a.y.min(b.y)).max(0.0) * by).round() as u32, ((a.x - b.x).abs() * by).round() as u32, ((a.y - b.y).abs() * by).round() as u32);
+                        // From the overlay's own measure to the display's, which the still
+                        // is of from its very corner, and then to the still's pixels.
+                        let by = self.scale.max(1.0);
+                        let part = (((a.x.min(b.x) + origin.x).max(0.0) * by).round() as u32, ((a.y.min(b.y) + origin.y).max(0.0) * by).round() as u32, ((a.x - b.x).abs() * by).round() as u32, ((a.y - b.y).abs() * by).round() as u32);
                         let path = self.shots_dir.join(format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S")));
                         self.phase = Phase::Saving;
                         let cut = move || {
@@ -1107,7 +1112,13 @@ impl Recorder {
             return self.flash();
         }
         if self.phase == Phase::Picking && self.overlay {
-            return Element::new(PickArea { drag: self.drag, still: self.still.as_ref().map(|(_, image)| image.clone()) });
+            // The still is of the whole display, menu bar and all; the overlay is
+            // only the part of it below the menu bar, so the still is drawn from
+            // where the display begins, not from where the overlay does.
+            let origin = self.overlay_at.unwrap_or(Point::new(self.screen.x, self.screen.y));
+            let scale = self.scale.max(1.0);
+            let still = self.still.as_ref().map(|(still, image)| (image.clone(), Rect::new(-origin.x, -origin.y, still.width as f32 / scale, still.height as f32 / scale)));
+            return Element::new(PickArea { drag: self.drag, still });
         }
         if self.window_state().bare {
             return self.frame_view();
@@ -1810,8 +1821,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("neo-cap-frozen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // The screen as it stood: 1600 by 1000 pixels, two to a point, each saying where it is.
-        let (w, h) = (1600u32, 1000u32);
+        // The display as it stood: 800 by 525 points with its menu bar, two pixels to a point,
+        // each pixel saying where it is.
+        let (w, h) = (1600u32, 1050u32);
         let rgba: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x / 8) as u8, (y / 8) as u8, 9, 255])).collect();
         let file = dir.join("still.png");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&file).unwrap()), w, h);
@@ -1819,6 +1831,7 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
         let still = capture::Still { file: file.clone(), width: w, height: h, rgba };
+        std::fs::copy(&file, dir.join("still-again.png")).unwrap();
 
         let mut r = overlaying();
         r.shots_dir = dir.join("shots");
@@ -1829,6 +1842,24 @@ mod tests {
         assert!(!r.window_state().visible);
         r.update(Msg::Still(Ok(still.clone())));
         assert!(r.window_state().visible && r.still.is_some() && !r.stilling, "then it is shown in the screen's place");
+        // Each thing in the still is drawn exactly over the thing itself: the overlay begins under
+        // the menu bar, so its top row is the still's 25th point down, not its first.
+        r.update(Msg::PickDrag(Point::new(40.0, 10.0), Point::new(300.0, 200.0)));
+        let mut h = neo::testing::Harness::new(r, Size::new(800.0, 500.0)).expect("a GPU adapter is required for these tests");
+        let px = h.render(1.0);
+        let at = |x: usize, y: usize| [px[(y * 800 + x) * 4], px[(y * 800 + x) * 4 + 1], px[(y * 800 + x) * 4 + 2]];
+        let near = |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(g, w)| (*g as i32 - w as i32).abs() <= 2);
+        assert!(near(at(100, 20), [25, 11, 9]), "inside the area, undimmed: the still at 100, 45 points: {:?}", at(100, 20));
+        assert!(near(at(200, 100), [50, 31, 9]), "{:?}", at(200, 100));
+        let mut r = std::mem::replace(h.app_mut(), recorder());
+        drop(h);
+        // (Off the harness again, with nothing to report back to: what follows happens in place.)
+        r.proxy = None;
+        r.update(Msg::PickCancel);
+        assert!(!file.exists());
+        std::fs::copy(dir.join("still-again.png"), &file).unwrap();
+        r.update(Msg::ScreenshotHotkey);
+        r.update(Msg::Still(Ok(still.clone())));
         // An area dragged out is cut from that picture: nothing is taken again.
         r.update(Msg::PickDrag(Point::new(100.0, 50.0), Point::new(300.0, 200.0)));
         r.update(Msg::PickDrop);
@@ -1837,7 +1868,9 @@ mod tests {
         assert_eq!(saved.len(), 1);
         let (pw, ph, pixels) = capture::read_png(&saved[0]).unwrap();
         assert_eq!((pw, ph), (400, 300), "200 by 150 points, at two pixels to a point");
-        assert_eq!((&pixels[..3], &pixels[pixels.len() - 4..pixels.len() - 1]), (&[25u8, 12, 9][..], &[74u8, 49, 9][..]), "from 200, 100 in the picture to 599, 399");
+        // The overlay begins 25 points down, under the menu bar, and the still does not:
+        // what was dragged over is 25 points further down the still than down the overlay.
+        assert_eq!((&pixels[..3], &pixels[pixels.len() - 4..pixels.len() - 1]), (&[25u8, 18, 9][..], &[74u8, 56, 9][..]), "from 200, 150 in the picture to 599, 449");
         assert!(!file.exists() && r.still.is_none(), "and the picture of the whole screen is let go");
 
         // Backed out of, it is let go too; and one that arrives after the choosing is over is not kept.
