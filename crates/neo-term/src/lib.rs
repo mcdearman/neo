@@ -162,6 +162,13 @@ impl Shell {
         self.spawn();
     }
 
+    /// Runs `program` in place of whatever is running here: `None` is the
+    /// user's own shell.
+    pub fn run(&mut self, program: Option<Program>) {
+        self.program = program;
+        self.spawn();
+    }
+
     pub fn running(&self) -> bool {
         self.session.is_some() && self.exited.is_none()
     }

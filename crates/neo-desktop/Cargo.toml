@@ -9,3 +9,7 @@ license.workspace = true
 neo.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 toml_edit = "0.22"
+
+# For reading the icons of files and apps.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

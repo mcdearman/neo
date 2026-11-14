@@ -117,7 +117,7 @@ pub fn is_enabled(e: &Entry) -> bool {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("reg").args(["query", RUN_KEY, "/v", e.name]).output();
+        let out = crate::command("reg").args(["query", RUN_KEY, "/v", e.name]).output();
         out.is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&command_line(e)))
     }
 }
@@ -134,7 +134,7 @@ pub fn enable(e: &Entry) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("reg").args(["add", RUN_KEY, "/v", e.name, "/t", "REG_SZ", "/d", &command_line(e), "/f"]).output()?.status;
+        let status = crate::command("reg").args(["add", RUN_KEY, "/v", e.name, "/t", "REG_SZ", "/d", &command_line(e), "/f"]).output()?.status;
         if status.success() { Ok(()) } else { Err(std::io::Error::other("could not write the startup registry value")) }
     }
 }
@@ -151,7 +151,7 @@ pub fn disable(e: &Entry) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         // Deleting a value that is not there fails, which is fine.
-        let _ = std::process::Command::new("reg").args(["delete", RUN_KEY, "/v", e.name, "/f"]).output()?;
+        let _ = crate::command("reg").args(["delete", RUN_KEY, "/v", e.name, "/f"]).output()?;
         Ok(())
     }
 }

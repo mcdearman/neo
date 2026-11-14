@@ -211,7 +211,12 @@ pub fn friendly_time(t: SystemTime) -> String {
 pub fn tool(program: &str) -> PathBuf {
     let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
-    on_path.into_iter().chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"].map(PathBuf::from)).map(|dir| dir.join(&name)).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(program))
+    // On Windows, what the installer unpacked beside the apps, a folder to
+    // each, and where winget puts the programs it installs.
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|_| cfg!(windows));
+    let ours = local.iter().flat_map(|l| std::fs::read_dir(l.join(r"Programs\Neo\tools")).into_iter().flatten().flatten().map(|e| e.path()));
+    let winget = local.iter().map(|l| l.join(r"Microsoft\WinGet\Links"));
+    on_path.into_iter().chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"].map(PathBuf::from)).chain(ours).chain(winget).map(|dir| dir.join(&name)).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(program))
 }
 
 /// A time in full, for where the exact moment matters: "8 Oct 2026, 09:41:07".
@@ -243,13 +248,13 @@ pub fn file_icon(path: &Path, is_dir: bool) -> Icon {
 /// Opens a file or folder with the desktop's default application.
 pub fn open(path: &Path) -> std::io::Result<()> {
     let mut cmd = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
+        crate::command("open")
     } else if cfg!(windows) {
-        let mut c = std::process::Command::new("cmd");
+        let mut c = crate::command("cmd");
         c.args(["/C", "start", ""]);
         c
     } else {
-        std::process::Command::new("xdg-open")
+        crate::command("xdg-open")
     };
     cmd.arg(path).spawn().map(|_| ())
 }
@@ -296,12 +301,12 @@ pub fn neo_app(program: &str, bundle: &str) -> Option<PathBuf> {
 /// Starts another Neo app with these arguments. Returns false if that
 /// app is not installed.
 pub fn open_with(program: &str, bundle: &str, args: &[&str]) -> bool {
-    neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).args(args).stdin(std::process::Stdio::null()).spawn().is_ok())
+    neo_app_candidates(program, bundle).into_iter().any(|app| crate::command(app).args(args).stdin(std::process::Stdio::null()).spawn().is_ok())
 }
 
 /// Opens `path` in another Neo app. Returns false if that app is not installed.
 pub fn open_in(program: &str, bundle: &str, path: &Path) -> bool {
-    neo_app_candidates(program, bundle).into_iter().any(|app| std::process::Command::new(app).arg(path).spawn().is_ok())
+    neo_app_candidates(program, bundle).into_iter().any(|app| crate::command(app).arg(path).spawn().is_ok())
 }
 
 /// Opens a file the way Files does: pictures in Photos, videos in
@@ -325,10 +330,42 @@ pub fn open_file(path: &Path) -> std::io::Result<()> {
 ///
 /// Follows the freedesktop.org Trash specification on Linux and uses
 /// `~/.Trash` on macOS. Items on another file system than the home folder
-/// are refused rather than copied.
+/// are refused rather than copied. On Windows it goes to the Recycle Bin of
+/// its own drive, by the system's own means; what is too large for the
+/// Recycle Bin is not deleted without the system asking first. Returns
+/// where it went, or on Windows where it was.
 pub fn move_to_trash(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
     let path = std::path::absolute(path)?;
     let name = path.file_name().ok_or_else(|| std::io::Error::other("cannot trash a root folder"))?.to_os_string();
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW};
+        let _ = &name;
+        if path.symlink_metadata().is_err() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "it is not there"));
+        }
+        // A list of paths, each ended by a nul and the list by another.
+        let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+        let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+        op.wFunc = FO_DELETE;
+        op.pFrom = from.as_ptr();
+        // To the Recycle Bin, without asking, quietly; but if it cannot go
+        // there (too large, or a drive without one) the system asks before
+        // anything is destroyed for good.
+        op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING) as _;
+        // SAFETY: `from` outlives the call and is ended as the call wants.
+        let failed = unsafe { SHFileOperationW(&mut op) };
+        return if failed != 0 {
+            Err(std::io::Error::other(format!("the system would not move it to the Recycle Bin (code {failed:#x})")))
+        } else if op.fAnyOperationsAborted != 0 {
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "it was not deleted"))
+        } else {
+            Ok(path)
+        };
+    }
+    #[allow(unreachable_code)]
     let (files, info) = if cfg!(target_os = "macos") {
         (home_dir().join(".Trash"), None)
     } else if cfg!(unix) {
@@ -384,6 +421,26 @@ fn percent_encode_path(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// By hand, on Windows: a file and a folder made for it go to the
+    /// Recycle Bin, where they are left to be looked at, named
+    /// neo-trash-probe-<n>.
+    /// `cargo test -p neo-desktop to_the_recycle_bin -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn things_go_to_the_recycle_bin() {
+        let dir = std::env::temp_dir().join(format!("neo-trash-probe-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("inside")).unwrap();
+        std::fs::write(dir.join("inside/a.txt"), "a").unwrap();
+        let file = std::env::temp_dir().join(format!("neo-trash-probe-{}.txt", std::process::id()));
+        std::fs::write(&file, "b").unwrap();
+        super::move_to_trash(&file).unwrap();
+        super::move_to_trash(&dir).unwrap();
+        assert!(!file.exists() && !dir.exists());
+        assert!(super::move_to_trash(&file).is_err(), "what is not there is said not to be");
+        println!("moved {} and {}", file.display(), dir.display());
+    }
+
     use super::*;
 
     #[test]

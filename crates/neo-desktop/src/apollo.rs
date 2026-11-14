@@ -56,7 +56,7 @@ const SHOW: &str = "\u{1}show";
 pub fn show() -> bool {
     let shown = send_to(&port_file(), SHOW);
     if shown && cfg!(target_os = "macos") {
-        let _ = std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn();
+        let _ = crate::command("open").args(["-b", "org.neo.Apollo"]).spawn();
     }
     shown
 }
@@ -78,7 +78,7 @@ pub fn ask(question: &str) -> std::io::Result<()> {
     if send_to(&port_file(), question) {
         // It has the question; all that is left is to bring it forward.
         if cfg!(target_os = "macos") {
-            std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn()?;
+            crate::command("open").args(["-b", "org.neo.Apollo"]).spawn()?;
         }
         return Ok(());
     }
@@ -91,7 +91,7 @@ pub fn ask(question: &str) -> std::io::Result<()> {
 pub fn ask_about(question: &str, facts: &str) -> std::io::Result<()> {
     if crate::notify::send_to(&port_file(), &Notification::new(question, facts)) {
         if cfg!(target_os = "macos") {
-            std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn()?;
+            crate::command("open").args(["-b", "org.neo.Apollo"]).spawn()?;
         }
         return Ok(());
     }

@@ -12,7 +12,6 @@
 //! the desktop's own settings, and are set through it.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use crate::config::File;
 
@@ -63,7 +62,7 @@ impl Scrolling {
 pub fn has_trackpad() -> bool {
     if cfg!(target_os = "macos") {
         // Its own, or one beside it: both are multitouch devices that are not a mouse.
-        let said = |class: &str| Command::new("/usr/sbin/ioreg").args(["-r", "-c", class, "-d", "1"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let said = |class: &str| crate::command("/usr/sbin/ioreg").args(["-r", "-c", class, "-d", "1"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         trackpad_in(&said("AppleMultitouchDevice")) || trackpad_in(&said("BNBTrackpadDevice"))
     } else {
         std::fs::read_to_string("/proc/bus/input/devices").is_ok_and(|d| d.lines().any(|l| l.starts_with("N: Name=") && (l.contains("Touchpad") || l.contains("TouchPad") || l.contains("Trackpad"))))
@@ -80,7 +79,7 @@ fn trackpad_in(ioreg: &str) -> bool {
 /// one setting stands for the trackpad and the mouse both. It does unless
 /// it has been turned off.
 pub fn system_reversed() -> bool {
-    Command::new("/usr/bin/defaults").args(["read", "-g", "com.apple.swipescrolldirection"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim() != "0").unwrap_or(true)
+    crate::command("/usr/bin/defaults").args(["read", "-g", "com.apple.swipescrolldirection"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim() != "0").unwrap_or(true)
 }
 
 /// Sets the desktop's own settings to these, where it has them: GNOME's,
@@ -88,7 +87,7 @@ pub fn system_reversed() -> bool {
 pub fn apply(s: Scrolling) {
     if cfg!(all(unix, not(target_os = "macos"))) {
         for (device, reversed) in [("touchpad", s.trackpad_reversed), ("mouse", s.mouse_reversed)] {
-            let _ = Command::new("gsettings").args(["set", &format!("org.gnome.desktop.peripherals.{device}"), "natural-scroll", if reversed { "true" } else { "false" }]).output();
+            let _ = crate::command("gsettings").args(["set", &format!("org.gnome.desktop.peripherals.{device}"), "natural-scroll", if reversed { "true" } else { "false" }]).output();
         }
     }
 }

@@ -21,7 +21,13 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(io(dir.display()))?;
     }
     // Replace rather than overwrite in place, so a running copy keeps working.
-    let _ = std::fs::remove_file(to);
+    // Windows will not remove a program that is running, but lets it be
+    // renamed: it is moved aside, and cleared away by a later install.
+    let aside = to.with_extension("old");
+    let _ = std::fs::remove_file(&aside);
+    if std::fs::remove_file(to).is_err() {
+        let _ = std::fs::rename(to, &aside);
+    }
     std::fs::copy(from, to).map_err(io(format!("copy {} to {}", from.display(), to.display())))?;
     Ok(())
 }
