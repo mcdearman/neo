@@ -12,10 +12,12 @@
 // Release builds on Windows open no console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod shells;
+
 use std::path::PathBuf;
 
 use neo::prelude::*;
-use neo::{Proxy, Size};
+use neo::{Image, Proxy, Size};
 use neo_desktop::fs::home_dir;
 use neo_desktop::Desktop;
 use neo_term::{Program, Shell, TermMsg};
@@ -23,20 +25,37 @@ use neo_term::{Program, Shell, TermMsg};
 struct Terminal {
     desktop: Desktop,
     shell: Shell,
+    /// The shells this computer has, each with its icon where it has one,
+    /// once they have been looked for.
+    shells: Vec<(shells::Kind, Option<Image>)>,
+    /// What the one running is called.
+    running: String,
+    /// Whether a choice of shell is written down: not when one is given to run.
+    keeps: bool,
 }
 
 #[derive(Clone)]
 enum Msg {
     /// Something that happened in the terminal.
     Term(TermMsg),
+    /// The shells found on this computer.
+    Shells(Vec<(shells::Kind, Option<Image>)>),
+    /// Run this one of them in place of what is running.
+    Run(usize),
     Poll,
     /// The Settings entry and panel every Neo app has.
     Desktop(neo_desktop::DesktopMsg),
 }
 
 impl Terminal {
+    /// A terminal in `cwd`, running `program` or else the shell chosen
+    /// last, or else the user's own.
     fn new(cwd: PathBuf, program: Option<Program>) -> Self {
-        Self { desktop: Desktop::load(), shell: Shell::new(cwd, program) }
+        let keeps = program.is_none() && !cfg!(test);
+        let chosen = if keeps { shells::chosen(&neo_desktop::config::File::app("neo-terminal")) } else { None };
+        let running = chosen.as_ref().map_or_else(shells::default_name, |k| k.name.clone());
+        let program = program.or_else(|| chosen.map(|k| Program::new(k.program, k.args)));
+        Self { desktop: Desktop::load(), shell: Shell::new(cwd, program), shells: vec![], running, keeps }
     }
 }
 
@@ -60,6 +79,11 @@ impl App for Terminal {
     }
 
     fn start(&mut self, proxy: Proxy<Msg>) {
+        // Looking for shells can take a moment; the terminal does not wait for it.
+        let found = proxy.clone();
+        std::thread::spawn(move || {
+            found.send(Msg::Shells(shells::found().into_iter().map(|kind| (shells::icon(&kind), kind)).map(|(icon, kind)| (kind, icon)).collect()));
+        });
         self.shell.start(move |m| {
             proxy.send(Msg::Term(m));
         });
@@ -72,6 +96,17 @@ impl App for Terminal {
     fn update(&mut self, m: Msg) {
         match m {
             Msg::Term(m) => self.shell.update(m),
+            Msg::Shells(found) => self.shells = found,
+            Msg::Run(i) => {
+                if let Some((kind, _)) = self.shells.get(i).cloned() {
+                    self.shell.run(Some(Program::new(kind.program.clone(), kind.args.clone())));
+                    if self.keeps {
+                        let _ = shells::keep(&kind);
+                    }
+                    self.running = kind.name;
+                }
+                self.shell.focus();
+            }
             Msg::Desktop(m) => {
                 self.desktop.update(m);
             }
@@ -79,6 +114,24 @@ impl App for Terminal {
                 self.desktop.poll();
             }
         }
+    }
+
+    /// Beside File, the shell that is running: its menu lists the others.
+    /// The system's menu bar on macOS calls it Shell, as every app's menu
+    /// there keeps its name.
+    fn menus(&self) -> Vec<Menu<Msg>> {
+        let mut shells = Menu::new(if cfg!(target_os = "macos") { "Shell".to_owned() } else { self.running.clone() });
+        if self.shells.is_empty() {
+            shells = shells.push(MenuEntry::disabled("Looking for shells…"));
+        }
+        for (i, (kind, picture)) in self.shells.iter().enumerate() {
+            let entry = MenuEntry::new(kind.name.clone(), Msg::Run(i));
+            shells = shells.push(match picture {
+                Some(picture) => entry.icon(picture.clone()),
+                None => entry,
+            });
+        }
+        vec![Menu::new("File").push(MenuEntry::new("New Session", Msg::Term(TermMsg::Restart))), shells]
     }
 
     fn view(&self) -> Element<Msg> {
@@ -129,5 +182,30 @@ sleep 5"#;
         let path = dir.join(format!("{name}.png"));
         h.save_png(&path, 1.0).expect("write png");
         println!("wrote {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neo::testing::Harness;
+
+    #[test]
+    fn the_shells_are_in_a_menu_beside_file_and_choosing_one_runs_it() {
+        let shell = if cfg!(windows) { Program::new("cmd.exe".into(), vec![]) } else { Program::new("/bin/sh".into(), vec![]) };
+        let mut h = Harness::new(Terminal::new(home_dir(), Some(shell)), Size::new(900.0, 580.0)).expect("GPU");
+        let found: Vec<(shells::Kind, Option<Image>)> = shells::found().into_iter().map(|kind| (shells::icon(&kind), kind)).map(|(icon, kind)| (kind, icon)).collect();
+        assert!(!found.is_empty());
+        if cfg!(windows) {
+            assert!(found.iter().all(|(_, icon)| icon.is_some()), "every shell on Windows has an icon of its own");
+        }
+        h.app_mut().update(Msg::Shells(found.clone()));
+        let menus = h.app().menus();
+        assert_eq!((menus[0].title.as_str(), menus[1].entries.len()), ("File", found.len()), "one entry to a shell, after File");
+        assert_eq!(menus[1].entries.iter().map(|e| e.icon.is_some()).collect::<Vec<_>>(), found.iter().map(|(_, icon)| icon.is_some()).collect::<Vec<_>>());
+        // Choosing one names the menu after it. Nothing is written down: this terminal was given what to run.
+        let last = found.len() - 1;
+        h.app_mut().update(Msg::Run(last));
+        assert_eq!(h.app().running, found[last].0.name);
     }
 }
