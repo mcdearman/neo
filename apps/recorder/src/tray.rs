@@ -13,6 +13,8 @@ pub enum TrayAction {
     /// Start recording, or stop the recording in progress.
     ToggleRecording,
     ToggleAutostart,
+    /// Save what the background recording holds.
+    SaveReplay,
     Quit,
 }
 
@@ -21,6 +23,16 @@ pub enum TrayAction {
 pub struct TrayState {
     pub recording: bool,
     pub autostart: bool,
+    /// How many minutes are kept ready in the background; none if 0.
+    pub replay: u32,
+}
+
+fn replay_label(minutes: u32) -> String {
+    match minutes {
+        0 => "Save the Last Minutes".into(),
+        1 => "Save the Last Minute".into(),
+        n => format!("Save the Last {n} Minutes"),
+    }
 }
 
 fn toggle_label(recording: bool) -> &'static str {
@@ -38,6 +50,7 @@ mod imp {
     pub struct Tray {
         icon: TrayIcon,
         toggle: MenuItem,
+        replay: MenuItem,
         autostart: CheckMenuItem,
     }
 
@@ -64,11 +77,12 @@ mod imp {
             let show = MenuItem::new("Show Recorder", true, None);
             let shot = MenuItem::new("Take Screenshot…", true, None);
             let toggle = MenuItem::new(toggle_label(state.recording), true, None);
+            let replay = MenuItem::new(replay_label(state.replay), state.replay > 0, None);
             let autostart = CheckMenuItem::new("Launch at Startup", true, state.autostart, None);
             let quit = MenuItem::new("Quit NeoCap", true, None);
             let menu = Menu::new();
-            menu.append_items(&[&show, &shot, &toggle, &PredefinedMenuItem::separator(), &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
-            let (show_id, shot_id, toggle_id, autostart_id, quit_id) = (show.id().clone(), shot.id().clone(), toggle.id().clone(), autostart.id().clone(), quit.id().clone());
+            menu.append_items(&[&show, &shot, &toggle, &replay, &PredefinedMenuItem::separator(), &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
+            let (show_id, shot_id, toggle_id, autostart_id, quit_id, replay_id) = (show.id().clone(), shot.id().clone(), toggle.id().clone(), autostart.id().clone(), quit.id().clone(), replay.id().clone());
             // What was chosen, by the entry's ID.
             let chosen = move |id: &tray_icon::menu::MenuId| {
                 let action = if *id == show_id {
@@ -77,6 +91,8 @@ mod imp {
                     TrayAction::Screenshot
                 } else if *id == toggle_id {
                     TrayAction::ToggleRecording
+                } else if *id == replay_id {
+                    TrayAction::SaveReplay
                 } else if *id == autostart_id {
                     TrayAction::ToggleAutostart
                 } else if *id == quit_id {
@@ -100,11 +116,13 @@ mod imp {
             #[cfg(not(target_os = "macos"))]
             let icon = icon.with_icon(icon_for(state.recording)?);
             let icon = icon.build().map_err(|e| e.to_string())?;
-            Ok(Self { icon, toggle, autostart })
+            Ok(Self { icon, toggle, replay, autostart })
         }
 
         pub fn update(&self, state: TrayState) {
             self.toggle.set_text(toggle_label(state.recording));
+            self.replay.set_text(replay_label(state.replay));
+            self.replay.set_enabled(state.replay > 0);
             // Clicking a check item flips it, so set it to the real state.
             self.autostart.set_checked(state.autostart);
             if let Ok(icon) = icon_for(state.recording) {
@@ -154,6 +172,7 @@ mod imp {
                 item("Show Recorder", TrayAction::Show),
                 item("Take Screenshot…", TrayAction::Screenshot),
                 item(toggle_label(self.state.recording), TrayAction::ToggleRecording),
+                StandardItem { label: replay_label(self.state.replay), enabled: self.state.replay > 0, activate: Box::new(|t: &mut Self| (t.send)(TrayAction::SaveReplay)), ..Default::default() }.into(),
                 ksni::MenuItem::Separator,
                 CheckmarkItem { label: "Launch at Startup".into(), checked: self.state.autostart, activate: Box::new(|t: &mut Self| (t.send)(TrayAction::ToggleAutostart)), ..Default::default() }.into(),
                 ksni::MenuItem::Separator,

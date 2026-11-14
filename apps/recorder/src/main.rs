@@ -42,6 +42,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod capture;
+mod identify;
+mod sound;
 mod media;
 mod tray;
 
@@ -59,6 +61,13 @@ use neo_desktop::Desktop;
 use capture::{Options, Saved, Session, Target, WindowInfo};
 use tray::{Tray, TrayAction, TrayState};
 
+/// Where the NeoCap that is running notes the port it hears on, and what
+/// asks it to show its window.
+fn inbox_file() -> PathBuf {
+    neo_desktop::config_dir().join("neo-cap.port")
+}
+const SHOW: &str = "\u{1}show";
+
 const POPUP: Size = Size { w: 460.0, h: 700.0 };
 /// The bar shown while recording.
 const BAR: Size = Size { w: 300.0, h: 60.0 };
@@ -72,6 +81,8 @@ const GRAB: f32 = 16.0;
 const NARROW: f32 = 640.0;
 const SHOT_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧S" } else { "Ctrl+Shift+S" };
 const SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" };
+/// Saves what the background recording holds.
+const REPLAY_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌥⌘S" } else { "Ctrl+Alt+S" };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -115,6 +126,9 @@ struct Recorder {
     /// Whether the window is wanted on screen when nothing is being recorded.
     shown: bool,
     windows: Vec<WindowInfo>,
+    /// The icons of the apps whose windows are listed, by process, each
+    /// read the first time it is shown. None for one that has none.
+    window_icons: std::cell::RefCell<std::collections::HashMap<u32, Option<neo::Image>>>,
     selected: Option<u64>,
     show_clicks: bool,
     microphone: bool,
@@ -134,11 +148,30 @@ struct Recorder {
     /// Kept alive so the shortcut stays registered.
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey_error: Option<String>,
+    /// Another program holds the key that saves the background recording.
+    replay_key_taken: bool,
     tray: Option<Tray>,
     tray_state: TrayState,
     /// Start at login. Saved in `recorder.conf`.
     autostart: bool,
     autostart_error: Option<String>,
+    /// The screen recorded in the background, its last minutes kept; how
+    /// many minutes are asked for (none if 0); and why it is not going,
+    /// or what became of the last saving, to say under the option.
+    replay: Option<capture::Replay>,
+    replay_minutes: u32,
+    replay_note: Option<String>,
+    /// Which display the background recording is of: one of them by its
+    /// number counted from 1, every one of them if -1, and if 0, never
+    /// chosen, the one NeoCap is on. And the displays there are.
+    replay_on: i32,
+    displays: Vec<(u32, (i32, i32, i32, i32))>,
+    /// Record what the computer is playing.
+    system_sound: bool,
+    /// The sounds the background recording keeps, chosen apart from a
+    /// recording's: a game's sound, say, always, and the microphone never.
+    replay_system_sound: bool,
+    replay_microphone: bool,
     /// A problem to report once the recording made so far has been saved.
     status_after_stop: Option<String>,
     /// Off for screenshots and tests, which must not grab a system-wide shortcut.
@@ -172,6 +205,11 @@ struct Recorder {
     drag: Option<(Point, Point)>,
     /// When the flash after a screenshot began.
     flash_from: Option<Instant>,
+    /// When the flash was asked for, and whether its window has since been
+    /// put over the whole screen: the fade is not begun before that, or
+    /// where a window is slow to come up it is over before it is seen.
+    flash_asked: Option<Instant>,
+    flash_up: bool,
     /// Kept alive after a screenshot is copied: on Linux the picture stays
     /// on the clipboard only while its owner is running.
     clipboard: Option<arboard::Clipboard>,
@@ -226,6 +264,19 @@ enum Msg {
     FlashTick,
     Tray(TrayAction),
     Autostart(bool),
+    /// How many minutes to keep ready in the background; none stops it.
+    ReplayMinutes(u32),
+    /// Which display to keep: its number from 1, or -1 for all of them.
+    ReplayOn(i32),
+    SystemSound(bool),
+    /// Whether the background recording keeps what the computer plays, and the microphone.
+    ReplaySystemSound(bool),
+    ReplayMicrophone(bool),
+    /// Save what the background recording holds.
+    SaveReplay,
+    ReplaySaved(Result<Saved, String>),
+    /// See that the background recording is still going.
+    ReplayCheck,
     /// Whether this app's window is glass when the desktop's windows are.
     Glass(bool),
     Hide,
@@ -260,6 +311,54 @@ mod settings {
         })
     }
 
+    /// How many minutes the background recording keeps; none if never chosen.
+    pub fn replay() -> u32 {
+        File::app("neo-recorder").number(&["background-recording-minutes"]).map_or(0, |n| n.clamp(0.0, 60.0) as u32)
+    }
+
+    /// Which display the background recording is of: see `Recorder::replay_on`.
+    pub fn replay_on() -> i32 {
+        File::app("neo-recorder").number(&["background-recording-display"]).map_or(0, |n| n.clamp(-1.0, 16.0) as i32)
+    }
+
+    pub fn save_replay_on(display: i32) {
+        let mut file = File::app("neo-recorder");
+        file.set(&["background-recording-display"], display as f64);
+        let _ = file.save();
+    }
+
+    /// Whether what the computer is playing is recorded.
+    pub fn system_sound() -> bool {
+        File::app("neo-recorder").flag(&["record-computer-sound"]).unwrap_or(false)
+    }
+
+    pub fn save_system_sound(on: bool) {
+        let mut file = File::app("neo-recorder");
+        file.set(&["record-computer-sound"], on);
+        let _ = file.save();
+    }
+
+    /// What the background recording keeps of the computer's sound and the
+    /// microphone. What the computer plays unless told otherwise, being what
+    /// is wanted of a game; the microphone only if asked for.
+    pub fn replay_sounds() -> (bool, bool) {
+        let file = File::app("neo-recorder");
+        (file.flag(&["background-recording-computer-sound"]).unwrap_or(true), file.flag(&["background-recording-microphone"]).unwrap_or(false))
+    }
+
+    pub fn save_replay_sounds(computer: bool, microphone: bool) {
+        let mut file = File::app("neo-recorder");
+        file.set(&["background-recording-computer-sound"], computer);
+        file.set(&["background-recording-microphone"], microphone);
+        let _ = file.save();
+    }
+
+    pub fn save_replay(minutes: u32) {
+        let mut file = File::app("neo-recorder");
+        file.set(&["background-recording-minutes"], minutes as f64);
+        let _ = file.save();
+    }
+
     pub fn save(launch_at_startup: bool) {
         let mut file = File::app("neo-recorder");
         file.set(KEY, launch_at_startup);
@@ -291,6 +390,7 @@ impl Recorder {
             phase: Phase::Idle,
             shown: true,
             windows: capture::windows(),
+            window_icons: Default::default(),
             selected: None,
             show_clicks: false,
             microphone: false,
@@ -305,23 +405,34 @@ impl Recorder {
             proxy: None,
             hotkeys: None,
             hotkey_error: None,
+            replay_key_taken: false,
             tray: None,
             tray_state: TrayState::default(),
             autostart: false,
             autostart_error: None,
+            replay: None,
+            replay_minutes: 0,
+            replay_note: None,
+            replay_on: 0,
+            displays: vec![],
+            system_sound: false,
+            replay_system_sound: false,
+            replay_microphone: false,
             status_after_stop: None,
             register_hotkey,
             auto_record: false,
             auto_shot: false,
             shot_in_flight: false,
             picker: None,
-            own_overlay: cfg!(target_os = "macos"),
+            own_overlay: cfg!(any(target_os = "macos", windows)),
             overlay: false,
             overlay_at: None,
             still: None,
             stilling: false,
             drag: None,
             flash_from: None,
+            flash_asked: None,
+            flash_up: false,
             clipboard: None,
             copied: None,
             copy_shots: register_hotkey,
@@ -368,7 +479,7 @@ impl Recorder {
     /// macOS needs.
     fn add_tray(&mut self) {
         let Some(proxy) = self.proxy.clone() else { return };
-        self.tray_state = TrayState { recording: self.busy(), autostart: self.autostart };
+        self.tray_state = TrayState { recording: self.busy(), autostart: self.autostart, replay: if self.replay.is_some() { self.replay_minutes } else { 0 } };
         // No tray is not fatal: the window and shortcut still work.
         match Tray::new(self.tray_state, move |action| {
             proxy.send(Msg::Tray(action));
@@ -427,6 +538,11 @@ impl Recorder {
 
 /// How long the screen flashes after a screenshot.
 const FLASH: Duration = Duration::from_millis(260);
+/// How long the flash is held at its brightest once its window is over
+/// the screen, before it fades. On Windows a window is some 150 ms from
+/// being put up to its first frame being seen (measured: the flash was
+/// first seen at a quarter of its strength); the fade waits that out.
+const FLASH_HOLD: Duration = Duration::from_millis(if cfg!(windows) { 180 } else { 0 });
 
 impl Recorder {
     /// Whether to flash: not with motion reduced, and not before the
@@ -506,8 +622,9 @@ impl Recorder {
         if let Some(proxy) = self.proxy.clone().filter(|_| self.overlay) {
             self.stilling = true;
             let file = std::env::temp_dir().join(format!("neo-cap-still-{}-{}.png", std::process::id(), chrono::Local::now().format("%H%M%S%3f")));
+            let (screen, scale) = (self.screen, self.scale);
             std::thread::spawn(move || {
-                proxy.send(Msg::Still(capture::still(&file)));
+                proxy.send(Msg::Still(capture::still(&file, screen, scale)));
             });
         }
         if let Some(keys) = &self.hotkeys {
@@ -517,6 +634,32 @@ impl Recorder {
         self.shown = false;
         self.phase = Phase::Picking;
         true
+    }
+
+
+    /// Begins the background recording, or begins it again; or ends it,
+    /// with no minutes asked for. Only the app that sits in the tray
+    /// keeps one, not a copy started to take one picture.
+    fn keep_replay(&mut self) {
+        self.replay = None;
+        self.replay_note = None;
+        if self.replay_minutes == 0 || !self.register_hotkey || !capture::can_replay() {
+            return;
+        }
+        let by = self.scale.max(1.0);
+        let on = (self.screen != Rect::ZERO).then(|| (((self.screen.x + self.screen.w / 2.0) * by) as i32, ((self.screen.y + self.screen.h / 2.0) * by) as i32));
+        self.displays = capture::displays();
+        // The one chosen, if it is still there; all of them; or the one NeoCap is on.
+        let which: Vec<u32> = match self.replay_on {
+            -1 => self.displays.iter().map(|d| d.0).collect(),
+            n if n > 0 && self.displays.iter().any(|d| d.0 == n as u32 - 1) => vec![n as u32 - 1],
+            _ => vec![],
+        };
+        let options = Options { microphone: self.replay_microphone, system_sound: self.replay_system_sound, scale: self.scale, ..Default::default() };
+        match capture::Replay::start(self.replay_minutes, &which, on, options) {
+            Ok(replay) => self.replay = Some(replay),
+            Err(e) => self.replay_note = Some(e),
+        }
     }
 
     /// Lets go of the picture of the screen as it stood, and its file.
@@ -696,17 +839,35 @@ impl App for Recorder {
         if !self.register_hotkey {
             return;
         }
+        // Where another copy, opened while this one runs, asks it to show itself.
+        if let Ok(inbox) = neo_desktop::notify::Inbox::open_at(inbox_file()) {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                while let Ok(note) = inbox.recv() {
+                    if note.title == SHOW {
+                        proxy.send(Msg::Tray(TrayAction::Show));
+                    }
+                }
+            });
+        }
+        // Which encoder this computer has is found out now, behind the
+        // window, so that the first recording does not wait to learn it.
+        capture::warm();
         let primary = if cfg!(target_os = "macos") { HotMods::SUPER } else { HotMods::CONTROL };
         let hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyR);
         let shot_hotkey = HotKey::new(Some(primary | HotMods::SHIFT), Code::KeyS);
         let shot_id = shot_hotkey.id();
         let more_id = Self::more_key().id();
+        let replay_hotkey = HotKey::new(Some(primary | HotMods::ALT), Code::KeyS);
+        let replay_id = replay_hotkey.id();
         match GlobalHotKeyManager::new().and_then(|m| m.register_all(&[hotkey, shot_hotkey]).map(|_| m)) {
             Ok(manager) => {
                 GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
                     if e.state() == HotKeyState::Pressed {
                         proxy.send(if e.id() == more_id {
                             Msg::PickMore
+                        } else if e.id() == replay_id {
+                            Msg::SaveReplay
                         } else if e.id() == shot_id {
                             Msg::ScreenshotHotkey
                         } else {
@@ -714,6 +875,13 @@ impl App for Recorder {
                         });
                     }
                 }));
+                // On its own, so that if something else has it the others are still had;
+                // and said, since otherwise the key would seem to do nothing.
+                self.replay_key_taken = manager.register(replay_hotkey).is_err();
+                if self.replay_key_taken && self.replay_minutes > 0 {
+                    let why = format!("Another program has {REPLAY_SHORTCUT}, so it cannot save the background recording. Save now in NeoCap's window still does.");
+                    neo_desktop::notify::Notification::new("NeoCap's key is taken", why).send();
+                }
                 self.hotkeys = Some(manager);
             }
             Err(e) => self.hotkey_error = Some(e.to_string()),
@@ -735,6 +903,10 @@ impl App for Recorder {
             }
             _ => {}
         }
+        // The background recording is looked in on now and then.
+        if self.replay_minutes > 0 && self.register_hotkey {
+            subs.push(Subscription::every(Duration::from_secs(5), Msg::ReplayCheck));
+        }
         subs
     }
 
@@ -752,7 +924,7 @@ impl App for Recorder {
     fn update(&mut self, m: Msg) {
         self.apply(m);
         // Keep the tray's icon and menu in step with what just happened.
-        let state = TrayState { recording: self.busy(), autostart: self.autostart };
+        let state = TrayState { recording: self.busy(), autostart: self.autostart, replay: if self.replay.is_some() { self.replay_minutes } else { 0 } };
         if state != self.tray_state {
             self.tray_state = state;
             if let Some(tray) = &self.tray {
@@ -796,6 +968,7 @@ impl Recorder {
                     Phase::Starting(_) | Phase::Shooting(_) | Phase::Picking | Phase::Flash(_) | Phase::Saving => {}
                 },
                 TrayAction::ToggleAutostart => self.apply(Msg::Autostart(!self.autostart)),
+                TrayAction::SaveReplay => self.apply(Msg::SaveReplay),
                 TrayAction::Quit => self.apply(Msg::Quit),
             },
             Msg::Autostart(on) => {
@@ -803,6 +976,74 @@ impl Recorder {
                 settings::save(on);
                 self.apply_autostart();
             }
+            Msg::ReplayMinutes(minutes) => {
+                self.replay_minutes = minutes;
+                settings::save_replay(minutes);
+                self.keep_replay();
+            }
+            Msg::ReplayCheck => {
+                // Begun once the app is up; and begun again if it has ended,
+                // as it does when the screen is locked or a display is unplugged.
+                if self.replay.as_mut().is_none_or(|r| !r.running() || r.minutes() != self.replay_minutes) {
+                    self.keep_replay();
+                }
+            }
+            Msg::ReplayOn(display) => {
+                self.replay_on = display;
+                settings::save_replay_on(display);
+                self.keep_replay();
+                // Each display chosen says which it is: its number, on it, for a moment.
+                let by = self.scale.max(1.0);
+                let chosen: Vec<(u32, Rect)> = self.displays.iter().filter(|d| display == -1 || d.0 as i32 + 1 == display).map(|d| (d.0 + 1, Rect::new(d.1.0 as f32 / by, d.1.1 as f32 / by, d.1.2 as f32 / by, d.1.3 as f32 / by))).collect();
+                if !cfg!(test) {
+                    identify::show(&chosen);
+                }
+            }
+            Msg::SystemSound(on) => {
+                self.system_sound = on;
+                settings::save_system_sound(on);
+            }
+            Msg::SaveReplay => {
+                let Some(replay) = &self.replay else {
+                    // Asked for by a key, with the window out of sight: said where it will be seen.
+                    let why = "Background recording is off, so there is nothing to save. It is turned on in NeoCap's window.";
+                    self.replay_note = Some(why.into());
+                    if !cfg!(test) {
+                        neo_desktop::notify::Notification::new("Nothing to save", why).send();
+                    }
+                    return;
+                };
+                let kept = replay.pieces();
+                let several = kept.len() > 1;
+                let when = chrono::Local::now().format("%Y-%m-%d at %H.%M.%S").to_string();
+                self.replay_note = Some("Saving…".into());
+                // Each display's as a movie of its own.
+                for (display, pieces, about, sounds) in kept {
+                    let name = if several { format!("Neo Replay {when}, display {}.mp4", display + 1) } else { format!("Neo Replay {when}.mp4") };
+                    let path = self.dir.join(name);
+                    let save = move || capture::save_replay(&pieces, about, &sounds, &path);
+                    match self.proxy.clone() {
+                        Some(proxy) => drop(std::thread::spawn(move || proxy.send(Msg::ReplaySaved(save())))),
+                        None => self.apply(Msg::ReplaySaved(save())),
+                    }
+                }
+            }
+            Msg::ReplaySaved(saved) => match saved {
+                Ok(saved) => {
+                    let name = saved.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.replay_note = Some(format!("Saved the last {} as {name}.", clock(saved.length)));
+                    // Said by NeoShell, as a recording is; whatever else NeoCap is doing goes on.
+                    if !cfg!(test) {
+                        neo_desktop::notify::Notification::new("Replay saved", name).reveal(&saved.path).open(&saved.path).send();
+                    }
+                }
+                Err(e) => {
+                    if !cfg!(test) {
+                        neo_desktop::notify::Notification::new("The replay could not be saved", e.clone()).send();
+                    }
+                    self.replay_note = Some(e);
+                }
+            },
             Msg::Mode(mode) => {
                 self.mode = mode;
                 if mode == Mode::Window {
@@ -816,6 +1057,20 @@ impl Recorder {
             }
             Msg::ShowClicks(on) => self.show_clicks = on,
             Msg::Microphone(on) => self.microphone = on,
+            Msg::ReplaySystemSound(on) | Msg::ReplayMicrophone(on) => {
+                if matches!(m, Msg::ReplaySystemSound(_)) {
+                    self.replay_system_sound = on;
+                } else {
+                    self.replay_microphone = on;
+                }
+                if !cfg!(test) {
+                    settings::save_replay_sounds(self.replay_system_sound, self.replay_microphone);
+                }
+                // Begun again, with or without it.
+                if self.replay.is_some() {
+                    self.keep_replay();
+                }
+            }
             Msg::Gif(on) => self.gif = on,
             Msg::Record => match self.target() {
                 Ok(target) => {
@@ -860,7 +1115,10 @@ impl Recorder {
                 let Phase::Starting(target) = &self.phase else { return };
                 let name = format!("Neo Recording {}.{}", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S"), capture::EXTENSION);
                 // A GIF has no sound, so there is no point recording any.
-                let options = Options { show_clicks: self.show_clicks, microphone: self.microphone && !self.gif, scale: self.scale };
+                // The display NeoCap is on is the one recorded, where there are several.
+                let by = self.scale.max(1.0);
+                let on = (self.screen != Rect::ZERO).then(|| (((self.screen.x + self.screen.w / 2.0) * by) as i32, ((self.screen.y + self.screen.h / 2.0) * by) as i32));
+                let options = Options { show_clicks: self.show_clicks, microphone: self.microphone && !self.gif, system_sound: self.system_sound && !self.gif, scale: self.scale, on };
                 match Session::start(target.clone(), options, self.dir.join(name)) {
                     Ok(session) => {
                         self.session = Some(session);
@@ -898,6 +1156,7 @@ impl Recorder {
                         if self.flashes() {
                             // The fade is timed from the first frame, below.
                             self.flash_from = None;
+                            (self.flash_asked, self.flash_up) = (Some(Instant::now()), false);
                             self.shown = false;
                             self.phase = Phase::Flash(saved);
                         } else {
@@ -977,6 +1236,8 @@ impl Recorder {
                         // From the overlay's own measure to the display's, which the still
                         // is of from its very corner, and then to the still's pixels.
                         let by = self.scale.max(1.0);
+                        // (Which is not always where the desktop begins: see `Still::corner`.)
+                        let origin = Point::new(origin.x - still.corner.0, origin.y - still.corner.1);
                         let part = (((a.x.min(b.x) + origin.x).max(0.0) * by).round() as u32, ((a.y.min(b.y) + origin.y).max(0.0) * by).round() as u32, ((a.x - b.x).abs() * by).round() as u32, ((a.y - b.y).abs() * by).round() as u32);
                         let path = self.shots_dir.join(format!("Neo Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S")));
                         self.phase = Phase::Saving;
@@ -1048,8 +1309,16 @@ impl Recorder {
             Msg::FlashTick => {
                 match self.flash_from {
                     // The window is up and drawing: the fade starts now, so
-                    // the time it took to appear is not taken out of it.
-                    None => self.flash_from = Some(Instant::now()),
+                    // the time it took to appear is not taken out of it: from
+                    // when it was put over the screen, and held a moment where
+                    // the first frame is slow to be seen (see `FLASH_HOLD`).
+                    // Not waited for for ever, in case it is never told of.
+                    None => {
+                        let waited = self.flash_asked.map_or(Duration::MAX, |since| since.elapsed());
+                        if self.proxy.is_none() || waited >= if self.flash_up { FLASH_HOLD } else { Duration::from_millis(600) } {
+                            self.flash_from = Some(Instant::now());
+                        }
+                    }
                     Some(from) if from.elapsed() >= FLASH => {
                         if let Phase::Flash(saved) = std::mem::replace(&mut self.phase, Phase::Idle) {
                             self.flash_from = None;
@@ -1075,6 +1344,11 @@ impl Recorder {
                 }
                 self.screen = g.screen;
                 self.scale = g.scale;
+                // The flash's window has been put over the screen.
+                if matches!(self.phase, Phase::Flash(_)) && !self.flash_up && g.frame.w >= g.screen.w - 2.0 && g.frame.h >= g.screen.h - 2.0 {
+                    // Counted from now.
+                    (self.flash_up, self.flash_asked) = (true, Some(Instant::now()));
+                }
                 // The recording bar's own frame is not the area to record.
                 // Where the selection overlay has been put, which is not
                 // always where it was asked to go.
@@ -1127,7 +1401,7 @@ impl Recorder {
             // where the display begins, not from where the overlay does.
             let origin = self.overlay_at.unwrap_or(Point::new(self.screen.x, self.screen.y));
             let scale = self.scale.max(1.0);
-            let still = self.still.as_ref().map(|(still, image)| (image.clone(), Rect::new(-origin.x, -origin.y, still.width as f32 / scale, still.height as f32 / scale)));
+            let still = self.still.as_ref().map(|(still, image)| (image.clone(), Rect::new(still.corner.0 - origin.x, still.corner.1 - origin.y, still.width as f32 / scale, still.height as f32 / scale)));
             return Element::new(PickArea { drag: self.drag, still });
         }
         if self.window_state().bare {
@@ -1179,6 +1453,16 @@ fn mode_switch(mode: Mode) -> Element<Msg> {
 
 impl Recorder {
     fn shortcut_hint(&self) -> String {
+        let hint = self.shortcut_hint_alone();
+        // And what does the recording, where there is a choice of it.
+        match capture::how_recorded() {
+            Some(how) if hint.is_empty() => how,
+            Some(how) => format!("{hint} {how}"),
+            None => hint,
+        }
+    }
+
+    fn shortcut_hint_alone(&self) -> String {
         match &self.hotkey_error {
             None if self.hotkeys.is_some() && capture::can_pick() => format!("{SHORTCUT} records the screen. {SHOT_SHORTCUT} takes a screenshot: drag out an area, or press S for this window."),
             None if self.hotkeys.is_some() => format!("{SHORTCUT} records the screen; {SHOT_SHORTCUT} takes a screenshot."),
@@ -1209,7 +1493,10 @@ impl Recorder {
                     .width(Length::Fill),
             );
         }
-        col = col.push(container(mode_switch(self.mode)).width(Length::Fill).align_x(Align::Center)).push(container(detail).surface(Surface::Well).width(Length::Fill).height(Length::Fill));
+        // The list of windows takes what room there is; the screen's picture
+        // only what it needs, and the options scroll below whichever it is.
+        let room = if self.mode == Mode::Window { Length::Fill } else { Length::Fixed(150.0) };
+        col = col.push(container(mode_switch(self.mode)).width(Length::Fill).align_x(Align::Center)).push(container(detail).surface(Surface::Well).width(Length::Fill).height(room));
         let option = |title: &str, note: String, on: bool, f: fn(bool) -> Msg| -> Element<Msg> {
             let mut label = column().spacing(1.0).width(Length::Fill).push(text(title));
             if !note.is_empty() {
@@ -1222,7 +1509,51 @@ impl Recorder {
             let note = if self.gif { "GIFs have no sound." } else { "Sound from the default input." };
             options = options.push(option("Record microphone", note.into(), self.microphone && !self.gif, Msg::Microphone));
         }
+        if capture::SYSTEM_SOUND {
+            let note = if self.gif { "GIFs have no sound." } else { "Whatever is playing: a game, a video, a call." };
+            options = options.push(option("Record computer sound", note.into(), self.system_sound && !self.gif, Msg::SystemSound));
+        }
         options = options.push(option("Launch at startup", format!("Starts in the tray, so {SHORTCUT} is always ready."), self.autostart, Msg::Autostart));
+        if capture::can_replay() {
+            let minutes = |n: u32| if n == 1 { "minute".to_owned() } else { format!("{n} minutes") };
+            let note = match (&self.replay_note, self.replay_minutes) {
+                (Some(note), _) => note.clone(),
+                (None, 0) => "Records the screen all the time and keeps only the last few minutes, to save when something has just happened.".into(),
+                (None, n) if self.replay.is_some() && self.replay_key_taken => format!("The last {} is kept ready. Another program has {REPLAY_SHORTCUT}, so Save now saves it.", minutes(n)),
+                (None, n) if self.replay.is_some() => format!("The last {} is kept ready. {REPLAY_SHORTCUT} saves it.", minutes(n)),
+                (None, _) => "Starting…".into(),
+            };
+            let chosen = capture::REPLAY_MINUTES.iter().position(|m| *m == self.replay_minutes).map_or(0, |i| i + 1);
+            let choose = segmented(["Off", "1 min", "5", "10", "20"], Some(chosen), |i| Msg::ReplayMinutes(if i == 0 { 0 } else { capture::REPLAY_MINUTES[(i - 1).min(3)] }));
+            let mut line = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(choose).push(Space::fill_x());
+            if self.replay.is_some() {
+                line = line.push(Button::new(text("Save now").role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([10.0, 5.0]).on_press(Msg::SaveReplay));
+            }
+            let mut kept = column().spacing(6.0).width(Length::Fill).push(column().spacing(1.0).width(Length::Fill).push(text("Background recording")).push(text(note).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))).push(line);
+            // Which display, where there is more than one: one of them, or each as a movie of its own.
+            if self.replay_minutes > 0 && self.displays.len() > 1 {
+                let many = self.displays.len();
+                let names: Vec<String> = (1..=many).map(|n| format!("Display {n}")).chain(std::iter::once(if many == 2 { "Both".to_owned() } else { "All".to_owned() })).collect();
+                // Never chosen: the one being kept, which is the one NeoCap is on.
+                let chosen = match self.replay_on {
+                    -1 => Some(many),
+                    n if n > 0 => Some((n as usize - 1).min(many - 1)),
+                    _ => None,
+                };
+                kept = kept.push(segmented(names, chosen, move |i| Msg::ReplayOn(if i >= many { -1 } else { i as i32 + 1 })));
+            }
+            // Its own sounds, apart from a recording's.
+            if self.replay_minutes > 0 {
+                let sound = |label: &str, on: bool, f: fn(bool) -> Msg| row().spacing(12.0).align(Align::Center).width(Length::Fill).push(text(label).role(TextRole::Caption).width(Length::Fill)).push(toggle(on, f));
+                if capture::SYSTEM_SOUND {
+                    kept = kept.push(sound("Keeps computer sound", self.replay_system_sound, Msg::ReplaySystemSound));
+                }
+                if capture::MICROPHONE {
+                    kept = kept.push(sound("Keeps the microphone", self.replay_microphone, Msg::ReplayMicrophone));
+                }
+            }
+            options = options.push(kept);
+        }
         options = options.push(option("Save as GIF", format!("{} frames a second, up to {} pixels wide.", media::GIF_FPS, media::GIF_MAX_WIDTH), self.gif, Msg::Gif));
         // The Recorder has no menu bar to put a Settings entry in, so its
         // glass switch lives with its other options.
@@ -1231,7 +1562,8 @@ impl Recorder {
         if cfg!(target_os = "macos") {
             options = options.push(option("Show mouse clicks", String::new(), self.show_clicks, Msg::ShowClicks));
         }
-        col = col.push(options);
+        // Room on the right for the scroll bar, clear of the switches.
+        col = col.push(scrollable(options.padding([0.0, 14.0, 0.0, 0.0])).height(Length::Fill));
         let ready = self.mode != Mode::Window || self.selected.is_some_and(|id| self.windows.iter().any(|w| w.id == id));
         col.push(
             row()
@@ -1266,7 +1598,10 @@ impl Recorder {
                 .spacing(10.0)
                 .align(Align::Center)
                 .width(Length::Fill)
-                .push(icon(icons::APP_WINDOW).size(17.0).tone(Tone::Muted))
+                .push(match self.window_icons.borrow_mut().entry(w.pid).or_insert_with(|| capture::program_of(w.pid).and_then(|program| neo_desktop::icons::of_file(&program, 40))) {
+                    Some(image) => Element::from(picture(image).width(20.0).height(20.0)),
+                    None => icon(icons::APP_WINDOW).size(17.0).tone(Tone::Muted).into(),
+                })
                 .push(label)
                 .push(text(format!("{} × {}", w.frame.w.round(), w.frame.h.round())).mono().role(TextRole::Caption).tone(Tone::Faint));
             list = list.push(Button::new(content).kind(ButtonKind::Ghost).selected(self.selected == Some(w.id)).padding([10.0, 7.0]).width(Length::Fill).align_x(Align::Start).on_press(Msg::Select(w.id)));
@@ -1514,7 +1849,23 @@ fn main() {
         return;
     }
     let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1));
+    // A copy started only to show a display its number: see `identify`.
+    if let (Some(number), Some(place)) = (value("--identify").and_then(|n| n.parse().ok()), value("--place").and_then(|p| identify::place(p))) {
+        if let Err(e) = neo::run(identify::Identify::new(number, place)) {
+            eprintln!("neo-recorder: {e}");
+        }
+        return;
+    }
+    // One NeoCap keeps the tray, the keys and the background recording.
+    // Opened again, that one shows its window; asked for something by a
+    // script, a copy does it beside that one, without them.
+    let running = neo_desktop::notify::answers(&inbox_file());
+    let scripted = args.iter().any(|a| a.starts_with("--") && a != "--hidden");
+    if running && !scripted && (args.iter().any(|a| a == "--hidden") || neo_desktop::notify::send_to(&inbox_file(), &neo_desktop::notify::Notification::new(SHOW, ""))) {
+        return;
+    }
     let mut app = Recorder::new(true);
+    app.register_hotkey = !running;
     match value("--mode").map(String::as_str) {
         None => {}
         Some("screen") => app.mode = Mode::Screen,
@@ -1585,6 +1936,11 @@ fn main() {
     // up by itself; a development build changes it only when asked, so it
     // never replaces the installed app's startup item with its own path.
     app.autostart = settings::load().unwrap_or_else(settings::installed);
+    app.replay_minutes = settings::replay();
+    app.replay_on = settings::replay_on();
+    app.system_sound = settings::system_sound();
+    (app.replay_system_sound, app.replay_microphone) = settings::replay_sounds();
+    app.displays = capture::displays();
     if settings::installed() {
         app.apply_autostart();
     }
@@ -1621,6 +1977,12 @@ fn snapshots(dir: PathBuf) {
         app.mode = mode;
         app.frame = Rect::new(200.0, 160.0, size.w, size.h);
         app.selected = app.windows.first().map(|w| w.id);
+        if name == "recorder-screen" {
+            // With the background recording on, and its own sounds.
+            (app.replay_minutes, app.replay_system_sound) = (5, true);
+            // Two displays, to choose between: the most there is to fit.
+            app.displays = vec![(0, (0, 0, 2560, 1440)), (1, (2560, 0, 2560, 1440))];
+        }
         if name == "recorder-done" {
             app.phase = Phase::Done(Saved { path: recordings_dir().join(format!("Neo Recording 2026-10-04 at 14.32.05.{}", capture::EXTENSION)), bytes: 4_812_000, length: Duration::from_secs(83) });
         }
@@ -1643,6 +2005,19 @@ mod tests {
 
     fn geometry(frame: Rect) -> WindowGeometry {
         WindowGeometry { frame, screen: Rect::new(0.0, 0.0, 1512.0, 982.0), scale: 2.0 }
+    }
+
+    #[test]
+    fn the_background_recording_has_sounds_of_its_own() {
+        let mut r = recorder();
+        r.replay_system_sound = true;
+        r.update(Msg::Microphone(true));
+        assert!(r.microphone && !r.replay_microphone, "a recording's microphone is not the background recording's");
+        r.update(Msg::ReplayMicrophone(true));
+        r.update(Msg::ReplaySystemSound(false));
+        assert!(r.replay_microphone && !r.replay_system_sound);
+        r.update(Msg::Microphone(false));
+        assert!(!r.microphone && r.replay_microphone && !r.system_sound, "and the other way about");
     }
 
     #[test]
@@ -1930,7 +2305,7 @@ mod tests {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
-        let still = capture::Still { file: file.clone(), width: w, height: h, rgba };
+        let still = capture::Still { file: file.clone(), width: w, height: h, rgba, corner: (0.0, 0.0) };
         std::fs::copy(&file, dir.join("still-again.png")).unwrap();
 
         let mut r = overlaying();
@@ -2118,5 +2493,25 @@ mod tests {
     fn formats_elapsed_time() {
         assert_eq!(clock(Duration::from_secs(83)), "1:23");
         assert_eq!(clock(Duration::from_secs(3725)), "1:02:05");
+    }
+}
+
+#[cfg(test)]
+mod listing {
+    use super::*;
+
+    /// Once the app is up it has windows of its own that belong to other
+    /// threads, and asking those for their titles used to wait for ever:
+    /// choosing Window froze the app on Windows.
+    #[test]
+    fn the_windows_are_listed_again_once_the_app_is_up() {
+        let mut h = neo::testing::Harness::new(Recorder::new(false), Size::new(460.0, 700.0)).unwrap();
+        let _ = h.render(1.0);
+        h.app_mut().update(Msg::Mode(Mode::Window));
+        assert_eq!(h.app().mode, Mode::Window);
+        let _ = h.render(1.0);
+        h.app_mut().update(Msg::Refresh);
+        // This app's own windows are never among them.
+        assert!(h.app().windows.iter().all(|w| w.pid != std::process::id()));
     }
 }

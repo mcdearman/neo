@@ -124,9 +124,9 @@ mod mac {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// (On every system: the pieces of a background recording are joined by it.)
 fn ffmpeg(args: &[&std::ffi::OsStr]) -> Result<(), String> {
-    let out = std::process::Command::new("ffmpeg").args(["-y", "-loglevel", "error"]).args(args).output().map_err(|e| {
+    let out = neo_desktop::command("ffmpeg").args(["-y", "-loglevel", "error"]).args(args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound { "This needs ffmpeg, which is not installed.".to_string() } else { format!("Could not run ffmpeg: {e}") }
     })?;
     if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
@@ -140,14 +140,26 @@ pub fn concat(parts: &[PathBuf], out: &Path) -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // The concat demuxer reads a list file of `file '<path>'` lines.
-        let list = out.with_extension("parts.txt");
-        let body: String = parts.iter().map(|p| format!("file '{}'\n", p.to_string_lossy().replace('\'', "'\\''"))).collect();
-        std::fs::write(&list, body).map_err(|e| e.to_string())?;
-        let result = ffmpeg(&["-f".as_ref(), "concat".as_ref(), "-safe".as_ref(), "0".as_ref(), "-i".as_ref(), list.as_os_str(), "-c".as_ref(), "copy".as_ref(), out.as_os_str()]);
-        let _ = std::fs::remove_file(list);
-        result
+        join(parts, &[], out)
     }
+}
+
+/// Joins `parts` end to end into `out` without re-encoding, by ffmpeg on
+/// every system: for the pieces of a background recording, which ffmpeg
+/// wrote and the system's own tools may not read.
+/// Every track is kept, and `tracks` says more of them, such as their names.
+pub fn join(parts: &[PathBuf], tracks: &[String], out: &Path) -> Result<(), String> {
+    // The concat demuxer reads a list file of `file '<path>'` lines.
+    let list = out.with_extension("parts.txt");
+    let body: String = parts.iter().map(|p| format!("file '{}'\n", p.to_string_lossy().replace('\'', "'\\''"))).collect();
+    std::fs::write(&list, body).map_err(|e| e.to_string())?;
+    let mut args: Vec<&std::ffi::OsStr> = ["-f", "concat", "-safe", "0", "-i"].map(AsRef::as_ref).to_vec();
+    args.extend([list.as_os_str(), "-map".as_ref(), "0".as_ref(), "-c".as_ref(), "copy".as_ref()]);
+    args.extend(tracks.iter().map(std::ffi::OsStr::new));
+    args.push(out.as_os_str());
+    let result = ffmpeg(&args);
+    let _ = std::fs::remove_file(list);
+    result
 }
 
 /// Converts `movie` to an animated GIF at `out`.
