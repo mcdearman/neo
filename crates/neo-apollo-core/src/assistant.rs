@@ -572,7 +572,8 @@ mod tests {
         let locked = ask(None, &model, &[], "Where is my dog?", &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
         assert!(locked.recalled.is_empty() && locked.text.ends_with("0 memories."));
         assert!(briefing(None).contains("locked") && briefing(Some((&Stats::default(), &Aware::default()))).contains("Your memory is empty so far"));
-        std::fs::remove_dir_all(dir).unwrap();
+        // Windows will not remove a folder with an open file in it; the next run clears it away.
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -642,7 +643,8 @@ mod tests {
         // And a file says which folder it is in.
         let bill = recall(&s, &model, "the invoice from the supplier").unwrap();
         assert!(put("where is the invoice?", &bill, None).contains("A document called \"today.md\", in the folder ~/Documents/vaultobs/Daily, from "));
-        std::fs::remove_dir_all(dir).unwrap();
+        // Windows will not remove a folder with an open file in it; the next run clears it away.
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -669,7 +671,8 @@ mod tests {
         let none = ask(Some(&mut s), &model, &[], "photos from yesterday", &Aware::default(), &mut |_, _| true, &mut |_| true).unwrap();
         assert!(none.listed.is_empty() && none.recalled.is_empty());
         assert_eq!(put("photos from yesterday", &[], Some((&wanted("photos from yesterday", Local::now()), &[], 0))), "photos from yesterday\n\n(There are no photos from yesterday in your memory. Say so in one sentence, and do not offer other files in their place.)");
-        std::fs::remove_dir_all(dir).unwrap();
+        // Windows will not remove a folder with an open file in it; the next run clears it away.
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -721,7 +724,8 @@ mod tests {
         ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware::default(), &mut |_, _| panic!("none may be looked at"), &mut |_| true).unwrap();
         ask(Some(&mut s), &model, &[], "What photos do I have?", &Aware { reading: None, look: 5, given: None }, &mut |_, _| false, &mut |_| true).unwrap();
         assert_eq!(s.stats().unwrap().light, before);
-        std::fs::remove_dir_all(dir).unwrap();
+        // Windows will not remove a folder with an open file in it; the next run clears it away.
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -742,7 +746,8 @@ mod tests {
         let talk = &s.recent(5, Some(Kind::Conversation)).unwrap().into_iter().find(|m| m.title.starts_with("How much")).unwrap();
         assert_eq!((talk.title.as_str(), talk.text.as_str()), ("How much was the invoice from the supplier?", "Asked: How much was the invoice from the supplier?\nAnswered: It was 40 pounds."));
         assert_eq!(headline(&"long ".repeat(40)).chars().count(), 80);
-        std::fs::remove_dir_all(dir).unwrap();
+        // Windows will not remove a folder with an open file in it; the next run clears it away.
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

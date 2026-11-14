@@ -27,7 +27,9 @@ pub mod key;
 pub mod model;
 pub mod pressure;
 pub mod settings;
+pub mod sight;
 pub mod store;
+pub mod survey;
 pub mod warden;
 pub mod words;
 

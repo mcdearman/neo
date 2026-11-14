@@ -8,11 +8,14 @@ license.workspace = true
 [dependencies]
 neo.workspace = true
 neo-desktop.workspace = true
+neo-index.workspace = true
 neo-apollo-core = { path = "../../crates/neo-apollo-core" }
 rfd = "0.17.2"
 # Hears from the system which files have changed, so that only they are read.
 notify = "8"
 png = "0.18"
+# For a picture pasted into the search.
+arboard = { version = "3.6", default-features = false, features = ["image-data", "wayland-data-control"] }
 
 # The menu bar and system tray icon. Linux uses the StatusNotifierItem
 # protocol over D-Bus instead, which needs no GTK.
@@ -24,3 +27,4 @@ ksni = { version = "0.3", default-features = false, features = ["blocking", "asy
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+

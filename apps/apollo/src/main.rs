@@ -12,6 +12,9 @@
 //!     cargo run -p neo-apollo -- --ask "…"      ask it, in the Apollo that is running or a new one
 //!     cargo run -p neo-apollo -- --snapshot target/snapshots
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -128,6 +131,249 @@ struct Shown {
     heading: String,
     /// Each with how near it is to what was asked, if something was.
     items: Vec<(Memory, Option<f32>)>,
+    /// There are more past these: another page to turn to.
+    more: bool,
+}
+
+/// How many to ask the memory for, for the `page`th page of a list: all
+/// the pages before it, it, and one more, which says whether there is
+/// another page after.
+fn up_to(page: usize) -> usize {
+    (page + 1) * LISTED + 1
+}
+
+/// The `page`th page of what was found when [`up_to`] that many were
+/// asked for, and whether there is a page after it.
+fn page_of<T>(mut found: Vec<T>, page: usize) -> (Vec<T>, bool) {
+    let more = found.len() > (page + 1) * LISTED;
+    found.truncate((page + 1) * LISTED);
+    let from = (page * LISTED).min(found.len());
+    (found.split_off(from), more)
+}
+
+/// What the Memory page is to show, for asking it of the memory.
+#[derive(Clone, Debug)]
+struct Wanted {
+    kind: Option<Kind>,
+    trail: Vec<String>,
+    asked: Option<(String, Vec<f32>)>,
+    /// The list and the graph are wanted, and not the cloud and the counts alone.
+    list: bool,
+    /// Which page of the list, the first being nothing.
+    page: usize,
+    /// What was asked is a picture: what is like it is looked for among
+    /// photos and videos, and nothing else.
+    seen: bool,
+    /// What sight made of that picture: the whole of it, and its faces.
+    sight: Option<Sighted>,
+}
+
+/// What sight made of a picture: the whole of it, and each face in it.
+type Sighted = (Vec<f32>, Vec<Vec<f32>>);
+
+/// What was found for the Memory page. Where the cloud has to be counted
+/// afresh this comes twice: the list at once, and the cloud when it is done.
+#[derive(Clone, Debug)]
+struct Filled {
+    kind: Option<Kind>,
+    list: Option<(Vec<Hub>, Shown)>,
+    cloud: Option<(Stats, Vec<Word>)>,
+    trouble: Option<String>,
+}
+
+/// Something asked of the thread that looks things up behind the window.
+enum Ask {
+    /// What has been typed into the search: its count, the words, the kind.
+    /// And which page of what is found.
+    Typed(u64, String, Option<Kind>, usize),
+    /// The Memory page, and which filling of it this is.
+    Fill(u64, Wanted),
+}
+
+/// The most files taken as looking like a pasted picture.
+const LOOKS_ALIKE: usize = 400;
+
+/// How long a cloud that has been counted is shown before it is counted again.
+const CLOUD_KEPT: Duration = Duration::from_secs(20);
+
+/// The words folded into `word` in a cloud.
+fn folded(cloud: &[Word], word: &str) -> Vec<String> {
+    cloud.iter().find(|w| w.word == word).map(|w| w.also.clone()).unwrap_or_default()
+}
+
+/// The memories to list for whatever is being looked at.
+fn listed(store: &Store, wanted: &Wanted, cloud: &[Word]) -> Result<Shown, String> {
+    if let Some(word) = wanted.trail.last() {
+        // What is about the word, and the words folded into it, and
+        // then what is near it in meaning without saying so.
+        let mut items: Vec<(Memory, Option<f32>)> = vec![];
+        for w in std::iter::once(word).chain(&folded(cloud, word)) {
+            for m in store.about(w, up_to(wanted.page), wanted.kind)? {
+                if !items.iter().any(|(have, _)| have.id == m.id) {
+                    items.push((m, None));
+                }
+            }
+        }
+        if let Some(vector) = store.word_vector(word)? {
+            for hit in store.search(&vector, up_to(wanted.page), wanted.kind)? {
+                if hit.distance < assistant::NEAR && !items.iter().any(|(have, _)| have.id == hit.memory.id) {
+                    items.push((hit.memory, Some(hit.distance)));
+                }
+            }
+        }
+        let (items, more) = page_of(items, wanted.page);
+        return Ok(Shown { heading: format!("About “{word}”"), items, more });
+    }
+    if wanted.seen && (wanted.sight.is_some() || wanted.asked.is_some()) {
+        // Photos and videos, and of those the kind chosen if one is.
+        let kinds: Vec<Kind> = [Kind::Photo, Kind::Video].into_iter().filter(|k| wanted.kind.is_none_or(|chosen| chosen == *k)).collect();
+        let mut items: Vec<(Memory, Option<f32>)> = vec![];
+        // First what looks like it: the same scene, or the same face.
+        if let Some((scene, faces)) = &wanted.sight {
+            for found in store.search_sights(Some(scene), faces, LOOKS_ALIKE)? {
+                if let Some(memory) = store.memory_of(&found.source)?
+                    && kinds.contains(&memory.kind)
+                {
+                    items.push((memory, Some(1.0 - found.score())));
+                }
+            }
+        }
+        // Then what was said of others in words like those said of it.
+        if let Some((question, vector)) = &wanted.asked {
+            let terms = neo_apollo_core::words::terms(question);
+            let mut hits = vec![];
+            for kind in &kinds {
+                hits.extend(store.search_for(vector, &terms, up_to(wanted.page), Some(*kind))?);
+            }
+            hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+            for hit in hits {
+                if !items.iter().any(|(have, _)| have.id == hit.memory.id) {
+                    items.push((hit.memory, Some(hit.distance)));
+                }
+            }
+        }
+        let (items, more) = page_of(items, wanted.page);
+        // A few of the model's words for it and no more: all of them, as a
+        // heading, took up half the window.
+        let heading = wanted.asked.as_ref().map_or("Like the picture".to_owned(), |(question, _)| format!("Like the picture: {}", snippet(question, 44)));
+        return Ok(Shown { heading, items, more });
+    }
+    if let Some((question, vector)) = &wanted.asked {
+        let (items, more) = page_of(store.search_for(vector, &neo_apollo_core::words::terms(question), up_to(wanted.page), wanted.kind)?.into_iter().map(|h| (h.memory, Some(h.distance))).collect(), wanted.page);
+        return Ok(Shown { heading: format!("Nearest to “{question}”"), items, more });
+    }
+    let (items, more) = page_of(store.recent(up_to(wanted.page), wanted.kind)?.into_iter().map(|m| (m, None)).collect(), wanted.page);
+    Ok(Shown { heading: "Newest".into(), items, more })
+}
+
+/// The last few picked words, each with the words that go with it.
+fn hubs(store: &Store, wanted: &Wanted, cloud: &[Word]) -> Result<Vec<Hub>, String> {
+    let shown = &wanted.trail[wanted.trail.len().saturating_sub(HUBS)..];
+    // Fewer round each when there are more of them to fit.
+    let each = ROUND_EACH - (shown.len().saturating_sub(1)) * 2;
+    shown
+        .iter()
+        .map(|word| {
+            let related = store.related(word, &folded(cloud, word), each, wanted.kind)?;
+            let most = related.iter().map(|r| r.shared).max().unwrap_or(0).max(1) as f32;
+            // One that only means something near counts for less than any that shares a memory.
+            Ok(Hub { word: word.clone(), related: related.into_iter().map(|r| (r.word, if r.shared > 0 { 0.25 + 0.75 * r.shared as f32 / most } else { 0.1 })).collect() })
+        })
+        .collect()
+}
+
+/// Looks things up in the memory for the window, on a thread of its own
+/// and with a hold on the memory of its own, for as long as the memory is
+/// unlocked: the window asks and goes on, and is told what was found. It
+/// never waits on the memory itself, however large that has grown.
+fn look_things_up(db: PathBuf, key: [u8; 32], dims: usize, model: Arc<dyn Model>, typed: Arc<std::sync::atomic::AtomicU64>, proxy: Proxy<Msg>, asks: std::sync::mpsc::Receiver<Ask>) {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    let Ok(store) = Store::open(&db, &key, dims) else { return };
+    // The clouds counted lately, each with its kind, when, and the counts.
+    let mut clouds: Vec<(Option<Kind>, std::time::Instant, Stats, Vec<Word>)> = vec![];
+    while let Ok(first) = asks.recv() {
+        // Whatever has been asked since is taken too, and only the last
+        // of each sort answered. What is typed waits for the typing to pause.
+        let (mut search, mut fill) = (None, None);
+        let mut next = Some(first);
+        loop {
+            match next.take() {
+                Some(Ask::Typed(typing, question, kind, page)) => search = Some((typing, question, kind, page)),
+                Some(Ask::Fill(filling, wanted)) => fill = Some((filling, wanted)),
+                None => {}
+            }
+            let more = if search.is_some() {
+                asks.recv_timeout(Duration::from_millis(60))
+            } else {
+                asks.try_recv().map_err(|e| match e {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
+            };
+            match more {
+                Ok(ask) => next = Some(ask),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        // The list first, with the cloud as it was last counted: that is quick.
+        let mut to_count = None;
+        if let Some((filling, wanted)) = fill {
+            let kept = clouds.iter().find(|c| c.0 == wanted.kind);
+            let cloud: &[Word] = kept.map_or(&[], |c| &c.3);
+            let list = if wanted.list { Some(hubs(&store, &wanted, cloud).and_then(|graph| Ok((graph, listed(&store, &wanted, cloud)?)))) } else { None };
+            let (list, trouble) = match list {
+                Some(Ok(list)) => (Some(list), None),
+                Some(Err(e)) => (None, Some(e)),
+                None => (None, None),
+            };
+            if kept.is_none_or(|c| c.1.elapsed() >= CLOUD_KEPT) {
+                to_count = Some((filling, wanted.clone(), kept.is_some()));
+            }
+            if list.is_some() || trouble.is_some() || kept.is_some() {
+                proxy.send(Msg::Filled(filling, Box::new(Filled { kind: wanted.kind, list, cloud: kept.map(|c| (c.2.clone(), c.3.clone())), trouble })));
+            }
+        }
+        if let Some((typing, question, kind, page)) = search {
+            let still = || typed.load(Ordering::Relaxed) == typing;
+            let terms = neo_apollo_core::words::terms(&question);
+            // First what says the words, which needs no model.
+            if let Ok(found) = store.saying(&terms, up_to(page), kind)
+                && !found.is_empty()
+                && still()
+            {
+                let (found, more) = page_of(found, page);
+                proxy.send(Msg::FoundSaying(typing, question.clone(), found, more));
+            }
+            // Then what is near in meaning; reading stands aside while it is asked.
+            let _first = index::asking();
+            let found = model.embed(std::slice::from_ref(&question), true).and_then(|mut v| v.pop().ok_or_else(|| "no embedding".to_owned())).and_then(|vector| {
+                let hits = page_of(store.search_for(&vector, &terms, up_to(page), kind)?, page);
+                Ok((vector, hits))
+            });
+            if still() {
+                match found {
+                    Ok((vector, hits)) => proxy.send(Msg::Found(typing, question, vector, Ok(hits))),
+                    Err(e) => proxy.send(Msg::Found(typing, question, vec![], Err(e))),
+                };
+            }
+        }
+        // And the cloud and the counts, which take the longest, last.
+        if let Some((filling, wanted, had)) = to_count {
+            let counted = store.stats().and_then(|stats| Ok((stats, store.cloud(CLOUD_WORDS, wanted.kind)?)));
+            let filled = match counted {
+                Ok((stats, cloud)) => {
+                    // With no cloud before, what is folded into a picked word was not known.
+                    let list = if !had && wanted.list && !wanted.trail.is_empty() { hubs(&store, &wanted, &cloud).and_then(|graph| Ok((graph, listed(&store, &wanted, &cloud)?))).ok() } else { None };
+                    clouds.retain(|c| c.0 != wanted.kind);
+                    clouds.push((wanted.kind, std::time::Instant::now(), stats.clone(), cloud.clone()));
+                    Filled { kind: wanted.kind, list, cloud: Some((stats, cloud)), trouble: None }
+                }
+                Err(e) => Filled { kind: wanted.kind, list: None, cloud: None, trouble: Some(e) },
+            };
+            proxy.send(Msg::Filled(filling, Box::new(filled)));
+        }
+    }
 }
 
 /// Something done with a file.
@@ -189,6 +435,26 @@ struct Apollo {
     /// The last search, kept so that choosing a kind need not ask the model again.
     asked: Option<(String, Vec<f32>)>,
     searching: bool,
+    /// Counts what is typed into the search, so that an answer to what
+    /// was typed a moment ago is dropped when more has been typed since.
+    typed: Arc<std::sync::atomic::AtomicU64>,
+    /// Where what is typed is sent to be looked for: a thread that keeps
+    /// a hold on the memory of its own for as long as it is unlocked.
+    searcher: Option<std::sync::mpsc::Sender<Ask>>,
+    /// Counts the fillings of the Memory page asked for, so that one
+    /// overtaken by another, or by something typed, is not shown.
+    filling: u64,
+    /// Which page of the list is showing, the first being nothing; and a
+    /// count of the pages turned, to go to the top of each new one.
+    list_page: usize,
+    turned: u64,
+    /// What is being looked for is a picture that was pasted.
+    by_picture: bool,
+    /// A small copy of it, shown in the search for as long as it is what
+    /// is looked for. Kept in memory only, as the list's pictures are.
+    pasted: Option<Image>,
+    /// What sight made of it, to hold against what it has kept.
+    sighted: Option<Sighted>,
     kind: Option<Kind>,
     /// The words picked, in the order they were: the last is the one whose
     /// memories are listed, and together they are the graph.
@@ -278,6 +544,8 @@ struct Apollo {
     asking_reset: bool,
     /// Says whether it is. Tests say so themselves.
     short_of_memory: fn() -> bool,
+    /// When the Memory page was last filled in while reading went on.
+    last_shown: std::time::Instant,
     trouble: Option<String>,
 }
 
@@ -315,6 +583,26 @@ enum Msg {
     Query(String),
     Search,
     Asked(String, Result<Vec<f32>, String>),
+    /// What was found for what was typed: which typing it answers, the
+    /// question and its embedding, and the memories nearest it.
+    Found(u64, String, Vec<f32>, Result<(Vec<Hit>, bool), String>),
+    /// Another page of the list under the cloud.
+    ListPage(usize),
+    /// Look for what is like the picture on the clipboard.
+    PastePicture,
+    /// The same, from the paste shortcut: with no picture there, nothing is said.
+    PasteKey,
+    /// A small copy of that picture, to show in the search while it is looked for.
+    Pasted(Option<(u32, u32, Vec<u8>)>),
+    /// What the model made of that picture, in a few words, and its embedding.
+    Seen(Result<(String, Vec<f32>), String>),
+    /// What sight made of it, which comes first: the whole picture and its faces.
+    Sighted(Sighted),
+    /// And, ahead of that, the memories that say the words typed: found
+    /// without asking a model, so they are there almost as the key is let go.
+    FoundSaying(u64, String, Vec<Memory>, bool),
+    /// What the Memory page shows, found behind the window: which filling, and what.
+    Filled(u64, Box<Filled>),
     Kind(Option<Kind>),
     Word(String),
     Clear,
@@ -395,12 +683,18 @@ enum Msg {
 fn listen(roots: &[PathBuf], heard: impl Fn(Vec<PathBuf>) -> bool + Send + 'static) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher;
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+    let under: Vec<PathBuf> = roots.to_vec();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         // Being opened or read is not a change.
         if let Ok(event) = event
             && !event.kind.is_access()
         {
-            for path in event.paths {
+            // With a whole drive listened to, this is every file any
+            // program writes, Apollo's own memory among them: only what
+            // could be something Apollo reads goes further.
+            // Judged from the folder that is read down, as reading does:
+            // a folder chosen to be read is read wherever it lies.
+            for path in event.paths.into_iter().filter(|p| under.iter().any(|root| p.strip_prefix(root).is_ok_and(index::could_matter))) {
                 let _ = tx.send(path);
             }
         }
@@ -412,14 +706,17 @@ fn listen(roots: &[PathBuf], heard: impl Fn(Vec<PathBuf>) -> bool + Send + 'stat
     // The thread ends when the watcher is dropped, which closes the channel.
     std::thread::spawn(move || {
         while let Ok(first) = rx.recv() {
-            let (mut changed, began) = (vec![first], std::time::Instant::now());
+            // Each path once, however often it is named: looked up, not
+            // looked for through all that came before it.
+            let (mut changed, began) = (std::collections::HashSet::from([first]), std::time::Instant::now());
             while began.elapsed() < CHANGES_AT_MOST {
                 match rx.recv_timeout(CHANGES_QUIET) {
-                    Ok(path) if !changed.contains(&path) => changed.push(path),
-                    Ok(_) => {}
+                    Ok(path) => drop(changed.insert(path)),
                     Err(_) => break,
                 }
             }
+            let mut changed: Vec<PathBuf> = changed.into_iter().collect();
+            changed.sort();
             if !heard(changed) {
                 break;
             }
@@ -505,6 +802,9 @@ impl Apollo {
     /// Apollo as it runs: the model on this computer, the database in
     /// Neo's settings folder, and the system's own check of who is asking.
     fn new() -> Self {
+        // What is on the disks is found in the indexes NeoShell keeps of them.
+        index::use_indexes(neo_index::store::folder());
+        neo_apollo_core::sight::use_models(neo_apollo_core::sight::models_dir());
         let settings = Settings::load();
         let server = Arc::new(Ollama::from_settings(&settings));
         let mut app = Self::with(server.clone(), neo_apollo_core::dir().join("memory.db"), None, Arc::new(key::authenticate));
@@ -550,6 +850,14 @@ impl Apollo {
             query: String::new(),
             asked: None,
             searching: false,
+            typed: Arc::default(),
+            searcher: None,
+            filling: 0,
+            list_page: 0,
+            turned: 0,
+            by_picture: false,
+            pasted: None,
+            sighted: None,
             kind: None,
             trail: vec![],
             graph: Rc::default(),
@@ -593,6 +901,7 @@ impl Apollo {
             agents: agents::Agents::new(None),
             asking_reset: false,
             short_of_memory: || false,
+            last_shown: std::time::Instant::now() - Duration::from_secs(60),
             trouble: None,
         }
     }
@@ -869,7 +1178,7 @@ impl Apollo {
     fn come_forward(&mut self) {
         self.in_sight = true;
         if cfg!(target_os = "macos") && !cfg!(test) {
-            let _ = std::process::Command::new("open").args(["-b", "org.neo.Apollo"]).spawn();
+            let _ = neo_desktop::command("open").args(["-b", "org.neo.Apollo"]).spawn();
         }
     }
 
@@ -975,12 +1284,16 @@ impl Apollo {
 
     fn lock(&mut self) {
         self.store = None;
+        // The thread that looks things up lets go of the memory too.
+        self.searcher = None;
         (self.shown, self.cloud, self.graph, self.stats, self.asked) = (Shown::default(), Rc::default(), Rc::default(), Stats::default(), None);
         self.trail.clear();
         (self.history, self.at) = (vec![vec![]], 0);
         self.thumbs.clear();
         self.asked_after.clear();
         self.query.clear();
+        self.list_page = 0;
+        (self.by_picture, self.pasted, self.sighted) = (false, None, None);
     }
 
     /// Moves to a trail of picked words, noting it as a step that can be
@@ -998,70 +1311,60 @@ impl Apollo {
         self.trail = trail;
     }
 
-    /// The words folded into `word` in the cloud.
-    fn also(&self, word: &str) -> Vec<String> {
-        self.cloud.iter().find(|w| w.word == word).map(|w| w.also.clone()).unwrap_or_default()
-    }
-
-    /// The memories to list for whatever is being looked at.
-    fn listed(&self, store: &Store) -> Result<Shown, String> {
-        if let Some(word) = self.trail.last() {
-            // What is about the word, and the words folded into it, and
-            // then what is near it in meaning without saying so.
-            let mut items: Vec<(Memory, Option<f32>)> = vec![];
-            for w in std::iter::once(word).chain(&self.also(word)) {
-                for m in store.about(w, LISTED)? {
-                    if self.kind.is_none_or(|k| k == m.kind) && !items.iter().any(|(have, _)| have.id == m.id) {
-                        items.push((m, None));
-                    }
-                }
-            }
-            if let Some(vector) = store.word_vector(word)? {
-                for hit in store.search(&vector, LISTED, self.kind)? {
-                    if hit.distance < assistant::NEAR && !items.iter().any(|(have, _)| have.id == hit.memory.id) {
-                        items.push((hit.memory, Some(hit.distance)));
-                    }
-                }
-            }
-            items.truncate(LISTED);
-            return Ok(Shown { heading: format!("About “{word}”"), items });
+    /// Hands something to the thread that looks things up, starting it
+    /// if it is not there. False if there is none to hand it to.
+    fn ask(&mut self, ask: Ask) -> bool {
+        if self.searcher.is_none() {
+            let (Some(key), Some(proxy)) = (self.key, self.proxy.clone()) else { return false };
+            // Before the model has been asked, the database says what it was made for.
+            let dims = if self.ready == Engine::Ready && self.dims > 0 { Some(self.dims) } else { Store::made_for(&self.db, &key) };
+            let Some(dims) = dims else { return false };
+            let (db, model, typed) = (self.db.clone(), self.model.clone(), self.typed.clone());
+            let (to, asks) = std::sync::mpsc::channel::<Ask>();
+            std::thread::spawn(move || look_things_up(db, key, dims, model, typed, proxy, asks));
+            self.searcher = Some(to);
         }
-        if let Some((question, vector)) = &self.asked {
-            let items = store.search_for(vector, &neo_apollo_core::words::terms(question), LISTED, self.kind)?.into_iter().map(|h| (h.memory, Some(h.distance))).collect();
-            return Ok(Shown { heading: format!("Nearest to “{question}”"), items });
+        match &self.searcher {
+            Some(to) if to.send(ask).is_ok() => true,
+            _ => {
+                self.searcher = None;
+                false
+            }
         }
-        Ok(Shown { heading: "Newest".into(), items: store.recent(LISTED, self.kind)?.into_iter().map(|m| (m, None)).collect() })
-    }
-
-    /// The last few picked words, each with the words that go with it.
-    fn hubs(&self, store: &Store) -> Result<Vec<Hub>, String> {
-        let shown = &self.trail[self.trail.len().saturating_sub(HUBS)..];
-        // Fewer round each when there are more of them to fit.
-        let each = ROUND_EACH - (shown.len().saturating_sub(1)) * 2;
-        shown
-            .iter()
-            .map(|word| {
-                let related = store.related(word, &self.also(word), each, self.kind)?;
-                let most = related.iter().map(|r| r.shared).max().unwrap_or(0).max(1) as f32;
-                // One that only means something near counts for less than any that shares a memory.
-                Ok(Hub { word: word.clone(), related: related.into_iter().map(|r| (r.word, if r.shared > 0 { 0.25 + 0.75 * r.shared as f32 / most } else { 0.1 })).collect() })
-            })
-            .collect()
     }
 
     /// Fills the Memory page from the database: the counts, the cloud,
-    /// the graph of picked words, and the list.
+    /// the graph of picked words, and the list. Where there is an app
+    /// running it is asked for behind the window and shown when it comes;
+    /// a test has it at once.
     fn show(&mut self) {
+        if self.store.is_none() {
+            return;
+        }
+        let wanted = Wanted { kind: self.kind, trail: self.trail.clone(), asked: self.asked.clone(), list: true, page: self.list_page, seen: self.by_picture, sight: self.sighted.clone().filter(|_| self.by_picture) };
+        if self.proxy.is_some() {
+            self.filling += 1;
+            // While something is typed the list is the search's own.
+            let wanted = Wanted { list: self.query.trim().is_empty(), ..wanted.clone() };
+            // And an answer to what was typed before is not to take the place of the list.
+            if wanted.list {
+                self.typed.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.ask(Ask::Fill(self.filling, wanted)) {
+                return;
+            }
+        }
         let Some(store) = self.store.take() else { return };
-        let filled = (|| -> Result<(), String> {
-            self.stats = store.stats()?;
-            self.cloud = Rc::new(store.cloud(CLOUD_WORDS, self.kind)?);
-            self.graph = Rc::new(self.hubs(&store)?);
-            self.shown = self.listed(&store)?;
-            Ok(())
+        let filled = (|| -> Result<_, String> {
+            let stats = store.stats()?;
+            let cloud = store.cloud(CLOUD_WORDS, wanted.kind)?;
+            let graph = hubs(&store, &wanted, &cloud)?;
+            let shown = listed(&store, &wanted, &cloud)?;
+            Ok((stats, cloud, graph, shown))
         })();
-        if let Err(e) = filled {
-            self.trouble = Some(e);
+        match filled {
+            Ok((stats, cloud, graph, shown)) => (self.stats, self.cloud, self.graph, self.shown) = (stats, Rc::new(cloud), Rc::new(graph), shown),
+            Err(e) => self.trouble = Some(e),
         }
         self.store = Some(store);
         self.picture_the_list();
@@ -1099,6 +1402,102 @@ impl Apollo {
                 let pixels = index::thumbnail(&path, THUMB_SIDE);
                 send(Msg::Thumb(path, pixels));
             }
+        });
+    }
+
+    /// Looks for what has been typed so far, behind the window: after a
+    /// pause short enough not to be felt and long enough that a word
+    /// being typed is not looked for a letter at a time, and with a hold
+    /// on the memory of its own, so that the window is never kept waiting.
+    fn search_as_typed(&mut self) {
+        let typing = self.typed.fetch_add(1, Ordering::Relaxed) + 1;
+        let question = self.query.trim().to_owned();
+        if question.is_empty() {
+            // Nothing typed: the newest, which is quick to ask for.
+            self.asked = None;
+            if let Some(store) = &self.store
+                && let Ok(newest) = store.recent(up_to(self.list_page), self.kind)
+            {
+                let (items, more) = page_of(newest.into_iter().map(|m| (m, None)).collect(), self.list_page);
+                self.shown = Shown { heading: "Newest".into(), items, more };
+                self.picture_the_list();
+            }
+            return;
+        }
+        if self.store.is_none() {
+            return;
+        }
+        self.last_used = std::time::Instant::now();
+        // Handed to the thread that looks things up, which has the memory
+        // open for itself: the window is never kept waiting.
+        if self.memory().is_some() {
+            self.ask(Ask::Typed(typing, question, self.kind, self.list_page));
+        }
+    }
+
+    /// Looks for the photos and videos that are like the picture on the
+    /// clipboard: one copied from a page or another app, or a picture file
+    /// copied in Files. The model says what it shows, as it does of every
+    /// photo it reads, and what was said of the others is searched for
+    /// what is nearest that; so it finds what shows the same sort of
+    /// place, people and things, by how they were described. It does not
+    /// know a face: two pictures of one person are alike to it only as far
+    /// as the two descriptions are.
+    ///
+    /// `quietly` is for the paste shortcut pressed with nothing to type on
+    /// the clipboard: if there is no picture there either, nothing is said.
+    fn search_by_picture(&mut self, quietly: bool) {
+        if self.store.is_none() || self.searching {
+            return;
+        }
+        // Read here, which is quick; made sense of on another thread, which is not.
+        let picture = arboard::Clipboard::new().map_err(|e| e.to_string()).and_then(|mut clipboard| match clipboard.get_image() {
+            Ok(picture) => Ok(Ok((picture.width as u32, picture.height as u32, picture.bytes.into_owned()))),
+            Err(_) => clipboard.get().file_list().ok().and_then(|files| files.into_iter().find(|f| f.is_file())).map(Err::<(u32, u32, Vec<u8>), PathBuf>).ok_or_else(|| "There is no picture on the clipboard. Copy one, or a picture's file, and try again.".to_owned()),
+        });
+        let picture = match picture {
+            Ok(picture) => picture,
+            Err(e) => {
+                if !quietly {
+                    self.trouble = Some(e);
+                }
+                return;
+            }
+        };
+        (self.searching, self.trouble, self.page) = (true, None, Page::Memory);
+        // The picture takes the place of whatever was typed or pasted before.
+        (self.pasted, self.by_picture, self.sighted, self.asked) = (None, true, None, None);
+        self.query.clear();
+        self.last_used = std::time::Instant::now();
+        let model = self.model.clone();
+        self.work(move |send| {
+            // Shown in the search at once, before the model has said anything of it.
+            send(Msg::Pasted(match &picture {
+                Ok((width, height, rgba)) => index::small(*width, *height, rgba, THUMB_SIDE),
+                Err(file) => index::thumbnail(file, THUMB_SIDE),
+            }));
+            // By how it looks first, which is quick: the scene, and the faces.
+            let looked = match &picture {
+                Ok((width, height, rgba)) => neo_apollo_core::sight::pixels(*width, *height, rgba).ok_or_else(|| "The picture is not whole.".to_owned()),
+                Err(file) => neo_apollo_core::sight::picture(file),
+            };
+            if let Ok(sighted) = looked.and_then(|picture| neo_apollo_core::sight::seen_in(&picture)) {
+                send(Msg::Sighted(sighted));
+            }
+            let seen = (|| -> Result<(String, Vec<f32>), String> {
+                let jpeg = match picture {
+                    Ok((width, height, rgba)) => index::shown(width, height, rgba)?,
+                    Err(file) => index::shown_from(&file)?,
+                };
+                // Reading stands aside while the picture is looked at.
+                let _first = index::asking();
+                let seen = model.describe(&jpeg)?;
+                // Held against what was said of other pictures as one of them, not as a question.
+                let vector = model.embed(std::slice::from_ref(&seen.text), false)?.pop().ok_or("no embedding")?;
+                let said = if seen.words.is_empty() { snippet(&seen.text, 70) } else { seen.words.join(", ") };
+                Ok((said, vector))
+            })();
+            send(Msg::Seen(seen));
         });
     }
 
@@ -1182,9 +1581,18 @@ impl Apollo {
         self.stop_reading = Arc::default();
         self.progress = Progress::default();
         let (model, roots, stop, short, ahead) = (self.model.clone(), self.settings.roots(), self.stop_reading.clone(), self.short_of_memory, self.settings.look_ahead);
+        // (A test is told of every file, and counts them.)
+        let live = self.proxy.is_some();
         self.work(move |send| {
+            // Said to the window a few times a second, not once a file:
+            // files go by at a hundred a second, and a window told of each
+            // one does nothing else. The first and the last are always said.
+            let mut said = std::time::Instant::now() - Duration::from_secs(1);
             let mut report = |p: &Progress| {
-                send(Msg::Progress(p.clone()));
+                if !live || p.now.is_none() || said.elapsed() >= Duration::from_millis(250) {
+                    said = std::time::Instant::now();
+                    send(Msg::Progress(p.clone()));
+                }
                 // Between files is where it can stop without losing anything.
                 if short() {
                     send(Msg::Held);
@@ -1241,6 +1649,7 @@ impl Apollo {
             Engine::Missing(_) => "The model needs downloading".into(),
             Engine::Pulling { .. } => "Downloading the model…".into(),
             Engine::Ready if self.reading && self.progress.listening => format!("Listening to the rest of {}", count(self.progress.total.saturating_sub(self.progress.done).max(1) as u32, "recording", "recordings")),
+            Engine::Ready if self.reading && self.progress.sighting && self.progress.total > 0 => format!("Telling pictures apart: {} of {}", (self.progress.done + 1).min(self.progress.total), self.progress.total),
             Engine::Ready if self.reading && self.progress.total > 0 => format!("{} {} of {}", if self.progress.looking { "Looking at" } else { "Listing" }, (self.progress.done + 1).min(self.progress.total), self.progress.total),
             Engine::Ready if self.reading => "Looking through folders…".into(),
             Engine::Ready if self.stale.is_some() => "Memory is another model's".into(),
@@ -1275,10 +1684,19 @@ impl App for Apollo {
         WindowState { visible: self.in_sight, ..WindowState::default() }
     }
 
-    /// Set to stay ready, closing the window only puts it out of sight:
-    /// Apollo goes on answering the search bar, and Quit ends it.
+    /// Closing the window only puts it out of sight: Apollo goes on
+    /// reading and answering the search bar, as something that is always
+    /// there. What ends it is Quit in its tray icon's menu; only where
+    /// there is no tray icon to ask does closing the window end it, if it
+    /// is not set to stay ready, since nothing else then could.
+    /// The paste shortcut with a picture on the clipboard, in Memory: it
+    /// is what is looked for.
+    fn on_paste_without_text(&self) -> Option<Self::Message> {
+        (self.page == Page::Memory && self.store.is_some()).then_some(Msg::PasteKey)
+    }
+
     fn on_close(&self) -> Option<Msg> {
-        self.settings.background.then_some(Msg::Hide)
+        (self.tray.is_some() || self.settings.background).then_some(Msg::Hide)
     }
 
     /// Its icon in the Dock, clicked while it waits out of sight, brings the window back.
@@ -1303,11 +1721,16 @@ impl App for Apollo {
                 .push(MenuEntry::new("Add Folder…", Msg::AddFolder))
                 .push(MenuEntry::new("Read Folders Now", Msg::Read).shortcut(Shortcut::command("r")).enabled(ready && !self.reading))
                 .separator()
-                .push(MenuEntry::new("Quit Apollo", Msg::Quit)),
+                // Apollo is ended from its tray icon, where it lives; the
+                // window's own menu only puts the window away. Without a
+                // tray icon there is nowhere else to end it from.
+                .push(if self.tray.is_some() { MenuEntry::new("Close Window", Msg::Hide).shortcut(Shortcut::command("w")) } else { MenuEntry::new("Quit Apollo", Msg::Quit) }),
             Menu::new("View").push(MenuEntry::new("Ask", Msg::Page(Page::Ask)).shortcut(Shortcut::command("1"))).push(MenuEntry::new("Memory", Msg::Page(Page::Memory)).shortcut(Shortcut::command("2"))).push(MenuEntry::new("Sources", Msg::Page(Page::Sources)).shortcut(Shortcut::command("3"))).push(MenuEntry::new("Activity", Msg::Page(Page::Activity)).shortcut(Shortcut::command("4"))).push(MenuEntry::new("Agents", Msg::Page(Page::Agents)).shortcut(Shortcut::command("5"))),
             Menu::new("Memory")
                 .push(MenuEntry::new("Unlock…", Msg::Unlock).enabled(self.store.is_none() && !self.unlocking))
                 .push(MenuEntry::new("Lock", Msg::Lock).shortcut(Shortcut::command("l")).enabled(self.store.is_some()))
+                .separator()
+                .push(MenuEntry::new("Search with the Picture on the Clipboard", Msg::PastePicture).shortcut(Shortcut::command("v").shift()).enabled(self.store.is_some() && !self.searching))
                 .separator()
                 .push(MenuEntry::new("Back", Msg::Back).shortcut(Shortcut::command("[")).enabled(self.at > 0))
                 .push(MenuEntry::new("Forward", Msg::Forward).shortcut(Shortcut::command("]")).enabled(self.at + 1 < self.history.len())),
@@ -1330,6 +1753,11 @@ impl App for Apollo {
         if self.proxy.is_some() {
             self.keep_watch();
             keep_at_startup(self.settings.background);
+            // Set to stay unlocked until it quits, it asks who is there once,
+            // now, and not again each time something is asked of it.
+            if self.settings.stay_unlocked == 0 {
+                self.unlock();
+            }
         }
         // Questions from the search bar, and from an Apollo started with one
         // while this is running.
@@ -1416,7 +1844,13 @@ impl Apollo {
 
     fn apply(&mut self, m: Msg) {
         match m {
-            Msg::Page(page) => self.page = page,
+            Msg::Page(page) => {
+                // Memory chosen from within Memory goes back to the cloud.
+                if page == Page::Memory && self.page == page && self.store.is_some() && (!self.trail.is_empty() || self.asked.is_some() || !self.query.is_empty()) {
+                    self.update(Msg::Clear);
+                }
+                self.page = page;
+            }
             Msg::Desktop(m) => {
                 self.desktop.update(m);
             }
@@ -1547,12 +1981,124 @@ impl Apollo {
                 self.ask_what_waits();
             }
             Msg::Lock => self.lock(),
-            Msg::Query(text) => self.query = text,
-            Msg::Search => self.search(),
+            Msg::ListPage(page) => {
+                if page != self.list_page {
+                    self.list_page = page;
+                    self.turned += 1;
+                    self.last_used = std::time::Instant::now();
+                    // What is typed is looked for again, that much further on;
+                    // anything else is the page being filled again.
+                    if self.proxy.is_some() && !self.query.trim().is_empty() {
+                        self.filling += 1;
+                        self.search_as_typed();
+                    } else {
+                        self.show();
+                    }
+                }
+            }
+            Msg::Query(text) => {
+                self.list_page = 0;
+                // Something typed is looked for in the picture's place.
+                if !text.trim().is_empty() {
+                    (self.by_picture, self.pasted, self.sighted) = (false, None, None);
+                }
+                self.query = text;
+                // Looked for as it is typed, where there is an app running
+                // to do it behind the window; a test asks when it means to.
+                if self.proxy.is_some() {
+                    // A filling of the page still on its way is not to take the place of this.
+                    self.filling += 1;
+                    self.search_as_typed();
+                }
+            }
+            Msg::Filled(filling, filled) => {
+                if self.store.is_some() {
+                    let filled = *filled;
+                    if let Some(e) = filled.trouble {
+                        self.trouble = Some(e);
+                    }
+                    if filled.kind == self.kind
+                        && let Some((stats, cloud)) = filled.cloud
+                    {
+                        (self.stats, self.cloud) = (stats, Rc::new(cloud));
+                    }
+                    if filling == self.filling
+                        && let Some((graph, shown)) = filled.list
+                    {
+                        (self.graph, self.shown) = (Rc::new(graph), shown);
+                        self.picture_the_list();
+                        self.look_into_the_list();
+                    }
+                }
+            }
+            Msg::FoundSaying(typing, question, found, more) => {
+                if typing == self.typed.load(Ordering::Relaxed) {
+                    self.shown = Shown { heading: format!("Saying “{question}”"), items: found.into_iter().map(|m| (m, None)).collect(), more };
+                    self.asked = None;
+                    self.go(vec![]);
+                    self.picture_the_list();
+                }
+            }
+            Msg::Found(typing, question, vector, hits) => {
+                // An answer to what has since been typed over is of no use.
+                if typing == self.typed.load(Ordering::Relaxed) {
+                    match hits {
+                        Ok((hits, more)) => {
+                            self.by_picture = false;
+                            self.shown = Shown { heading: format!("Nearest to “{question}”"), items: hits.into_iter().map(|h| (h.memory, Some(h.distance))).collect(), more };
+                            self.asked = Some((question, vector));
+                            self.go(vec![]);
+                            self.picture_the_list();
+                        }
+                        Err(e) => self.trouble = Some(e),
+                    }
+                }
+            }
+            Msg::Search => {
+                self.list_page = 0;
+                self.search();
+            }
+            Msg::Sighted(sighted) => {
+                // Shown at once, by how it looks; what the model says of it follows.
+                if self.store.is_some() && self.by_picture {
+                    (self.sighted, self.asked, self.list_page) = (Some(sighted), None, 0);
+                    self.typed.fetch_add(1, Ordering::Relaxed);
+                    self.go(vec![]);
+                    self.show();
+                }
+            }
+            Msg::PastePicture => self.search_by_picture(false),
+            Msg::PasteKey => self.search_by_picture(true),
+            Msg::Pasted(small) => {
+                if self.store.is_some() {
+                    self.pasted = small.map(|(w, h, rgba)| Image::new(w, h, rgba));
+                }
+            }
+            Msg::Seen(seen) => {
+                self.searching = false;
+                match seen {
+                    Ok(asked) if self.store.is_some() && self.by_picture => {
+                        (self.asked, self.list_page) = (Some(asked), 0);
+                        self.query.clear();
+                        // An answer to what was typed before is not to take its place.
+                        self.typed.fetch_add(1, Ordering::Relaxed);
+                        self.go(vec![]);
+                        self.show();
+                    }
+                    Ok(_) => {}
+                    // What it looks like was found all the same, if sight saw it.
+                    Err(_) if self.sighted.is_some() => {}
+                    Err(e) => {
+                        self.pasted = None;
+                        self.trouble = Some(e);
+                    }
+                }
+            }
             Msg::Asked(question, vector) => {
                 self.searching = false;
                 match vector {
                     Ok(vector) => {
+                        self.by_picture = false;
                         self.asked = Some((question, vector));
                         self.go(vec![]);
                         self.show();
@@ -1561,10 +2107,20 @@ impl Apollo {
                 }
             }
             Msg::Kind(kind) => {
+                self.list_page = 0;
                 self.kind = kind;
+                // A kind chosen is gone to at its cloud, whatever words had
+                // been picked; choosing the one already chosen goes back to it.
+                self.go(vec![]);
                 self.show();
+                // What is typed is looked for again, among that kind.
+                if self.proxy.is_some() && !self.query.trim().is_empty() {
+                    self.search_as_typed();
+                }
             }
             Msg::Word(word) => {
+                self.list_page = 0;
+                (self.by_picture, self.pasted, self.sighted) = (false, None, None);
                 // A picked word again goes back to it; a new one is picked too.
                 let mut trail = self.trail.clone();
                 match trail.iter().position(|w| *w == word) {
@@ -1580,6 +2136,7 @@ impl Apollo {
             Msg::Back | Msg::Forward => {
                 let to = if matches!(m, Msg::Back) { self.at.checked_sub(1) } else { Some(self.at + 1).filter(|i| *i < self.history.len()) };
                 if let Some(to) = to {
+                    self.list_page = 0;
                     (self.at, self.trail) = (to, self.history[to].clone());
                     self.asked = None;
                     self.query.clear();
@@ -1587,6 +2144,8 @@ impl Apollo {
                 }
             }
             Msg::Clear => {
+                self.list_page = 0;
+                (self.by_picture, self.pasted, self.sighted) = (false, None, None);
                 self.go(vec![]);
                 self.asked = None;
                 self.query.clear();
@@ -1700,7 +2259,11 @@ impl Apollo {
                 self.log_done(self.progress.failed, &p);
                 self.working = p.now.clone().map(|path| (path, std::time::Instant::now(), p.looking));
                 self.progress = p;
-                if more && self.page == Page::Memory {
+                // Not after every file: with several read at once they come
+                // hundreds to the second, and showing the memory looks through it.
+                // Nor while something is being looked for, whose list this would take the place of.
+                if more && self.page == Page::Memory && self.query.trim().is_empty() && self.last_shown.elapsed() >= Duration::from_secs(10) {
+                    self.last_shown = std::time::Instant::now();
                     self.show();
                 }
             }
@@ -2018,7 +2581,20 @@ impl Apollo {
             return container(lock).width(Length::Fill).height(Length::Fill).center().into();
         }
         let search = text_input("Search by meaning: “a dog on a beach”, “the invoice from March”", self.query.clone()).on_input(Msg::Query).on_submit(Msg::Search).on_cancel(Msg::Clear).width(Length::Fill);
-        let top = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(icon(icons::SEARCH).size(16.0).tone(Tone::Muted)).push(search).push(icon_button(icons::LOCK, 30.0).kind(ButtonKind::Ghost).on_press(Msg::Lock));
+        // A picture being looked for is shown in the search, small, with a
+        // way to take it out again.
+        let pictured = self.pasted.as_ref().filter(|_| self.by_picture && (self.searching || ((self.asked.is_some() || self.sighted.is_some()) && self.trail.is_empty())));
+        let lead: Element<Msg> = match pictured {
+            Some(small) => row()
+                .spacing(2.0)
+                .align(Align::Center)
+                .push(container(picture(small).fit(Fit::Cover).width(54.0).height(36.0)).radius(6.0).width(54.0).height(36.0))
+                .push(icon_button(icons::X, 24.0).kind(ButtonKind::Ghost).on_press(Msg::Clear))
+                .into(),
+            None => icon(icons::SEARCH).size(16.0).tone(Tone::Muted).into(),
+        };
+        let search = if pictured.is_some() { text_input(if self.searching { "Looking at the picture…" } else { "Photos and videos like this picture. Type to search for something else." }, self.query.clone()).on_input(Msg::Query).on_submit(Msg::Search).on_cancel(Msg::Clear).width(Length::Fill) } else { search };
+        let top = row().spacing(8.0).align(Align::Center).width(Length::Fill).push(lead).push(search).push(icon_button(icons::IMAGE, 30.0).kind(ButtonKind::Ghost).on_press_maybe((!self.searching).then_some(Msg::PastePicture))).push(icon_button(icons::LOCK, 30.0).kind(ButtonKind::Ghost).on_press(Msg::Lock));
         let kinds = segmented(std::iter::once("All").chain(Kind::ALL.iter().map(|k| k.plural())), Some(self.kind.map_or(0, |k| 1 + Kind::ALL.iter().position(|a| *a == k).unwrap_or(0))), |i| Msg::Kind(i.checked_sub(1).and_then(|i| Kind::ALL.get(i).copied())));
 
         let cloud: Element<Msg> = if self.cloud.is_empty() {
@@ -2031,7 +2607,7 @@ impl Apollo {
         };
         let summary = format!("{} · {} from {}", count(self.stats.total(), "memory", "memories"), count(self.stats.words, "word", "words"), count(self.stats.files, "file", "files"));
         let steps = row().spacing(2.0).push(icon_button(icons::ARROW_LEFT, 28.0).kind(ButtonKind::Ghost).on_press_maybe((self.at > 0).then_some(Msg::Back))).push(icon_button(icons::ARROW_RIGHT, 28.0).kind(ButtonKind::Ghost).on_press_maybe((self.at + 1 < self.history.len()).then_some(Msg::Forward)));
-        let mut heading = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(steps).push(text(self.shown.heading.clone()).role(TextRole::Title)).push(text(if self.searching { "Searching…".to_owned() } else { summary }).role(TextRole::Caption).tone(Tone::Muted)).push(Space::new(Length::Fill, 0.0));
+        let mut heading = row().spacing(10.0).align(Align::Center).width(Length::Fill).push(steps).push(text(snippet(&self.shown.heading, 72)).role(TextRole::Title).no_wrap()).push(text(if self.searching { "Searching…".to_owned() } else { summary }).role(TextRole::Caption).tone(Tone::Muted)).push(Space::new(Length::Fill, 0.0));
         if !self.trail.is_empty() || self.asked.is_some() {
             heading = heading.push(Button::new(text(if self.trail.is_empty() { "Clear" } else { "Back to the Cloud" }).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([10.0, 4.0]).on_press(Msg::Clear));
         }
@@ -2042,11 +2618,34 @@ impl Apollo {
         if self.shown.items.is_empty() {
             list = list.push(container(text("Nothing here.").tone(Tone::Muted)).padding([0.0, 12.0]));
         }
-        let mut body = column().spacing(12.0).width(Length::Fill).push(container(cloud).surface(Surface::Well).radius(14.0).padding(10.0).width(Length::Fill)).push(heading);
+        // More than a page of them: turned to here, under the last.
+        if self.list_page > 0 || self.shown.more {
+            let page = self.list_page;
+            let from = page * LISTED;
+            let turn = |label: &str, to: Option<usize>| Button::new(text(label).role(TextRole::Caption)).kind(ButtonKind::Ghost).padding([12.0, 6.0]).on_press_maybe(to.map(Msg::ListPage));
+            let said = if self.shown.items.is_empty() { format!("Page {}", page + 1) } else { format!("Page {} · {} to {}", page + 1, from + 1, from + self.shown.items.len()) };
+            list = list.push(Space::new(0.0, 6.0)).push(
+                row()
+                    .spacing(10.0)
+                    .align(Align::Center)
+                    .width(Length::Fill)
+                    .push(Space::fill_x())
+                    .push(turn("Previous", page.checked_sub(1)))
+                    .push(text(said).role(TextRole::Caption).tone(Tone::Muted))
+                    .push(turn("Next", self.shown.more.then_some(page + 1)))
+                    .push(Space::fill_x()),
+            );
+        }
+        let mut body = column().spacing(12.0).width(Length::Fill).push(container(cloud).surface(Surface::Well).radius(14.0).padding(10.0).width(Length::Fill));
         if let Some(why) = &self.trouble {
             body = body.push(notice(Tone::Bad, why.clone()));
         }
-        column().spacing(12.0).padding(18.0).width(Length::Fill).height(Length::Fill).push(top).push(kinds).push(scrollable(body.push(list)).height(Length::Fill)).into()
+        // The steps back and forward, and what is listed, stay put above
+        // what scrolls, so that they are at hand however far down one is.
+        // A page turned to is shown from the top of the list, not from as
+        // far down as the last was read.
+        let list_at = if self.trouble.is_some() { 2 } else { 1 };
+        column().spacing(12.0).padding(18.0).width(Length::Fill).height(Length::Fill).push(top).push(kinds).push(heading).push(scrollable(body.push(list)).reveal(self.turned, list_at).height(Length::Fill)).into()
     }
 
     fn memory_row(&self, m: &Memory, distance: Option<f32>) -> Element<Msg> {
@@ -2282,10 +2881,10 @@ impl Apollo {
             .push(section("Ready when asked"))
             .push(setting(
                 "Stay ready in the background",
-                &format!("Closing the window leaves Apollo running out of sight, with the model that answers kept in memory (about a gigabyte), so a question from the search bar ({}) is answered at once. It starts at login the same way. Quit Apollo, in the File menu, ends it.", if cfg!(target_os = "macos") { "⌘⇧A" } else { "Ctrl+Shift+A" }),
+                &format!("Closing the window leaves Apollo running out of sight, with the model that answers kept in memory (about a gigabyte), so a question from the search bar ({}) is answered at once. It starts at login the same way. Quit Apollo, in the menu of its icon in the {}, ends it.", if cfg!(target_os = "macos") { "⌘⇧A" } else { "Ctrl+Shift+A" }, if cfg!(target_os = "macos") { "menu bar" } else { "system tray" }),
                 toggle(self.settings.background, Msg::Background),
             ))
-            .push(setting("Keep the memory unlocked for", "Unlocked once, the memory stays so while questions keep coming, and locks again when it has gone unused this long. A question asked while it is locked brings up the login check first.", unlocked_for));
+            .push(setting("Keep the memory unlocked for", "Unlocked once, the memory stays so while questions keep coming, and locks again when it has gone unused this long. A question asked while it is locked brings up the login check first. Until it quits, Apollo asks once, when it starts.", unlocked_for));
         page = page.push(section("Warnings")).push(setting(
             "Warn me",
             "While it is open Apollo keeps an eye on the computer and says, through NeoShell, when memory or the disk is running out and what is using it, and when something stands open: a disk that is not encrypted, a firewall that is off, a model server the whole network can use, a key or a token lying in a file it reads. It looks and tells; it changes nothing.",
@@ -2366,6 +2965,8 @@ fn read_folders() -> Result<(), String> {
         return Err(format!("{} must be downloaded first: open Apollo, or run `ollama pull` for each.", missing.join(" and ")));
     }
     let mut store = Store::open_for(&neo_apollo_core::dir().join("memory.db"), &key::database_key()?, &model)?;
+    index::use_indexes(neo_index::store::folder());
+        neo_apollo_core::sight::use_models(neo_apollo_core::sight::models_dir());
     let done = index::run(&mut store, &model, &settings.roots(), settings.look_ahead, &mut |p: &Progress| {
         if let Some(now) = &p.now {
             println!("[{} of {}] {}", p.done + 1, p.total, now.display());
@@ -2759,7 +3360,8 @@ mod tests {
         h.render(1.0);
         // The two picked words sit side by side; clicking the first goes back to it.
         let (left, wide) = (neo_desktop::ui::SIDEBAR_W + 28.0, WINDOW.w - neo_desktop::ui::SIDEBAR_W - 12.0 - 56.0);
-        let first = Point::new(left + wide / 4.0, 170.0 + 10.0 + CLOUD_H / 2.0);
+        // (Below the search, the kinds, and the heading that stays put above what scrolls.)
+        let first = Point::new(left + wide / 4.0, 210.0 + 10.0 + CLOUD_H / 2.0);
         h.move_to(first);
         assert_eq!(h.cursor(), neo::CursorIcon::Pointer);
         h.click(first);
@@ -2772,6 +3374,55 @@ mod tests {
         h.app_mut().update(Msg::Lock);
         assert_eq!((h.app().history.len(), h.app().at), (1, 0));
         h.render(1.0);
+    }
+
+    #[test]
+    fn a_long_list_is_turned_through_a_page_at_a_time() {
+        // Asked for one past the page, which says whether there is another.
+        let found: Vec<usize> = (0..up_to(0)).collect();
+        assert_eq!(found.len(), LISTED + 1);
+        let (first, more) = page_of(found, 0);
+        assert!(first == (0..LISTED).collect::<Vec<_>>() && more);
+        let (second, more) = page_of((0..LISTED + 7).collect(), 1);
+        assert!(second == (LISTED..LISTED + 7).collect::<Vec<_>>() && !more, "the last page is what is left");
+        let (past, more) = page_of((0..5).collect::<Vec<usize>>(), 3);
+        assert!(past.is_empty() && !more, "a page past the end is empty, and nothing breaks");
+        // In the app: few memories are one page, with nothing to turn to; another kind, a word or a search goes back to the first.
+        let (mut a, _scratch) = app("pages");
+        a.update(Msg::Unlock);
+        a.update(Msg::Page(Page::Memory));
+        assert!(!a.shown.items.is_empty() && !a.shown.more && a.list_page == 0);
+        a.update(Msg::ListPage(1));
+        assert!(a.list_page == 1 && a.shown.items.is_empty() && !a.shown.more, "past the end there is nothing, and a way back");
+        a.update(Msg::Kind(Some(Kind::Photo)));
+        assert_eq!(a.list_page, 0);
+        a.update(Msg::ListPage(1));
+        a.update(Msg::Clear);
+        assert!(a.list_page == 0 && !a.shown.items.is_empty());
+    }
+
+    #[test]
+    fn a_picture_is_looked_for_among_photos_and_videos_only() {
+        let (mut a, _scratch) = app("by-picture");
+        a.update(Msg::Unlock);
+        a.update(Msg::Page(Page::Memory));
+        let kinds: Vec<Kind> = a.shown.items.iter().map(|(m, _)| m.kind).collect();
+        assert!(kinds.iter().any(|k| !matches!(k, Kind::Photo | Kind::Video)), "there are other things remembered: {kinds:?}");
+        // What the model made of a picture, as the thread that looks at it hands back.
+        let said = "a dog on a beach".to_owned();
+        let vector = a.model.embed(std::slice::from_ref(&said), false).unwrap().pop().unwrap();
+        // (As pasting one does, before the model is asked anything.)
+        a.by_picture = true;
+        a.update(Msg::Seen(Ok(("dog, beach".into(), vector))));
+        assert!(a.by_picture && a.shown.heading == "Like the picture: dog, beach", "{}", a.shown.heading);
+        assert!(!a.shown.items.is_empty() && a.shown.items.iter().all(|(m, _)| matches!(m.kind, Kind::Photo | Kind::Video)), "{:?}", a.shown.items.iter().map(|(m, _)| m.kind).collect::<Vec<_>>());
+        // A word picked, or the cloud gone back to, and it is a picture no longer.
+        a.update(Msg::Clear);
+        assert!(a.asked.is_none() && a.shown.heading == "Newest");
+        // One that could not be made sense of says so, and nothing is searched.
+        a.searching = true;
+        a.update(Msg::Seen(Err("It is not a picture that can be read.".into())));
+        assert!(!a.searching && a.trouble.is_some() && a.asked.is_none());
     }
 
     #[test]
@@ -2843,7 +3494,10 @@ mod tests {
     fn apollo_waits_out_of_sight_and_the_memory_locks_itself_when_left() {
         let (mut a, scratch) = app("background");
         a.settings_file = Some(scratch.0.join("settings"));
-        assert!(a.settings.background && a.settings.stay_unlocked == 15 && a.window_state().visible);
+        // Left as it comes, the memory stays unlocked until Apollo is quit;
+        // here it is set to lock itself, which is what is tried below.
+        assert!(a.settings.background && a.settings.stay_unlocked == 0 && a.window_state().visible);
+        a.settings.stay_unlocked = 15;
         // Closing the window only puts it away; a question brings it back.
         let closing = a.on_close();
         assert!(matches!(closing, Some(Msg::Hide)));
@@ -3219,7 +3873,10 @@ mod tests {
         // Reading lists the pictures and reads the document; nothing is looked at.
         a.update(Msg::Read);
         assert_eq!((a.progress.read, a.progress.listed, a.stats.light, a.stats.of(Kind::Photo)), (1, 3, 3, photos + 3));
-        assert_eq!(a.log.iter().map(|l| (l.path.file_name().unwrap().to_str().unwrap(), l.looked)).collect::<Vec<_>>(), [("plan.txt", false), ("IMG_0.png", false), ("IMG_1.png", false), ("IMG_2.png", false)], "the Activity page's account of it");
+        // Several are read at once, so the account is in the order they were done, which is not fixed.
+        let mut account: Vec<_> = a.log.iter().map(|l| (l.path.file_name().unwrap().to_str().unwrap(), l.looked)).collect();
+        account.sort_unstable();
+        assert_eq!(account, [("IMG_0.png", false), ("IMG_1.png", false), ("IMG_2.png", false), ("plan.txt", false)], "the Activity page's account of it");
         assert_eq!(a.seconds_a_look(), None);
         // A search turns them up by name; they are looked at behind it, and the list is of what they show.
         a.update(Msg::Page(Page::Memory));
