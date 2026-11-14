@@ -1,9 +1,9 @@
 //! Keeping an index between runs, so a disk measured once does not have
 //! to be measured from nothing again.
 //!
-//! One file per folder measured, in the user's cache folder. It lists the
-//! name of every folder under it and of every large file, so it is
-//! readable by the user alone.
+//! One file per folder measured, in the user's cache folder, where every
+//! Neo app that wants it finds it. It lists the name of every folder and
+//! file under it, so it is readable by the user alone.
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,18 +12,18 @@ use crate::changes::Mark;
 use crate::scan::{Big, Folder, Index, Linked};
 
 /// Changed whenever the layout below does, so an old file is not misread.
-const MAGIC: &[u8; 8] = b"NEODISK2";
+const MAGIC: &[u8; 8] = b"NEOINDX3";
 
 /// Where indexes are kept.
 pub fn folder() -> PathBuf {
     if cfg!(target_os = "macos") {
-        neo_desktop::fs::home_dir().join("Library/Caches/org.neo.Disk")
+        neo_desktop::fs::home_dir().join("Library/Caches/org.neo.Index")
     } else if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
-        PathBuf::from(dir).join("neo-disk")
+        PathBuf::from(dir).join("neo-index")
     } else if let Some(dir) = std::env::var_os("LOCALAPPDATA").filter(|_| cfg!(windows)) {
-        PathBuf::from(dir).join("NeoDisk")
+        PathBuf::from(dir).join(r"Neo\index")
     } else {
-        neo_desktop::fs::home_dir().join(".cache/neo-disk")
+        neo_desktop::fs::home_dir().join(".cache/neo-index")
     }
 }
 
@@ -45,9 +45,14 @@ fn put_str(w: &mut impl Write, s: &str) -> std::io::Result<()> {
 fn put_folder(w: &mut impl Write, f: &Folder) -> std::io::Result<()> {
     put_str(w, &f.name)?;
     w.write_all(&f.mtime.to_le_bytes())?;
-    w.write_all(&[f.denied as u8])?;
+    w.write_all(&[f.denied as u8 | (f.hidden as u8) << 1])?;
     w.write_all(&f.small_size.to_le_bytes())?;
     w.write_all(&f.small_count.to_le_bytes())?;
+    put_str(w, &f.small_names)?;
+    w.write_all(&(f.small_sizes.len() as u32).to_le_bytes())?;
+    for size in &f.small_sizes {
+        w.write_all(&size.to_le_bytes())?;
+    }
     w.write_all(&(f.big.len() as u32).to_le_bytes())?;
     for b in &f.big {
         put_str(w, &b.name)?;
@@ -68,7 +73,8 @@ fn put_folder(w: &mut impl Write, f: &Folder) -> std::io::Result<()> {
 pub fn save(dir: &Path, index: &Index) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = file(dir, &index.root);
-    let part = path.with_extension("part");
+    // A name of its own, since more than one app may be saving it.
+    let part = path.with_extension(format!("{}.part", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -101,9 +107,13 @@ impl<R: Read> In<R> {
         self.bytes().map(u64::from_le_bytes)
     }
     fn str(&mut self) -> Option<String> {
-        // No name or path is longer than this; a length that is means the
-        // file is not what it should be.
-        let len = self.u32().filter(|n| *n <= 1 << 16)? as usize;
+        self.text(1 << 16)
+    }
+    /// A string of no more bytes than this: a length that is more means
+    /// the file is not what it should be. No name or path is over 64 KB;
+    /// the small names of one folder together may be megabytes.
+    fn text(&mut self, most: u32) -> Option<String> {
+        let len = self.u32().filter(|n| *n <= most)? as usize;
         let mut b = vec![0; len];
         self.0.read_exact(&mut b).ok()?;
         String::from_utf8(b).ok()
@@ -112,7 +122,12 @@ impl<R: Read> In<R> {
         if depth > 4096 {
             return None;
         }
-        let mut f = Folder { name: self.str()?.into(), mtime: self.u64()? as i64, denied: self.bytes::<1>()?[0] != 0, small_size: self.u64()?, small_count: self.u32()?, ..Default::default() };
+        let name = self.str()?;
+        let (mtime, flags) = (self.u64()? as i64, self.bytes::<1>()?[0]);
+        let mut f = Folder { name: name.into(), mtime, denied: flags & 1 != 0, hidden: flags & 2 != 0, small_size: self.u64()?, small_count: self.u32()?, small_names: self.text(1 << 28)?.into(), ..Default::default() };
+        for _ in 0..self.u32()? {
+            f.small_sizes.push(self.u32()?);
+        }
         // Counts are not trusted with memory before the items are read.
         for _ in 0..self.u32()? {
             f.big.push(Big { name: self.str()?.into(), size: self.u64()? });
@@ -125,6 +140,13 @@ impl<R: Read> In<R> {
         }
         Some(f)
     }
+}
+
+/// The saved index that covers a path: its own, or that of the nearest
+/// folder above it that has one, as a whole disk's has for every folder
+/// on it.
+pub fn covering(dir: &Path, path: &Path) -> Option<Index> {
+    path.ancestors().find_map(|root| load(dir, root))
 }
 
 /// The saved index for `root`, if there is one that can be read.
@@ -144,8 +166,8 @@ mod tests {
     use super::*;
 
     fn sample() -> Index {
-        let leaf = Folder { name: "2025".into(), mtime: -5, big: vec![Big { name: "raw.dng".into(), size: 40_000_000 }], small_size: 900, small_count: 3, ..Default::default() };
-        let locked = Folder { name: "privé".into(), denied: true, ..Default::default() };
+        let leaf = Folder { name: "2025".into(), mtime: -5, big: vec![Big { name: "raw.dng".into(), size: 40_000_000 }], small_size: 900, small_count: 3, small_names: "a.txt\0b é.md\0c\0".into(), small_sizes: vec![100, 300, 500], ..Default::default() };
+        let locked = Folder { name: "privé".into(), denied: true, hidden: true, ..Default::default() };
         Index { root: "/Users/sam".into(), on_disk: true, taken: 1_790_000_000, mark: Mark { event: 987_654_321, volume: "A1B2".into() }, folder: Folder { name: "sam".into(), mtime: 1_790_000_000_123_456_789, linked: vec![Linked { id: 77, size: 5_000_000, name: "twice".into() }], folders: vec![leaf, locked], ..Default::default() } }
     }
 
@@ -158,6 +180,12 @@ mod tests {
         save(&dir, &index).unwrap();
         assert_eq!(load(&dir, &index.root), Some(index.clone()));
         assert_eq!(load(&dir, Path::new("/Users/alex")), None, "another folder's index is not this one");
+        // A folder inside it is covered by it; one beside it is not.
+        assert_eq!(covering(&dir, Path::new("/Users/sam/2025/deep")).map(|i| i.root), Some(index.root.clone()));
+        assert_eq!(covering(&dir, Path::new("/Users/alex/2025")), None);
+        let leaf = index.folder_at(Path::new("/Users/sam/2025")).unwrap();
+        assert_eq!(leaf.files().collect::<Vec<_>>(), [("raw.dng", 40_000_000), ("a.txt", 100), ("b é.md", 300), ("c", 500)]);
+        assert!(index.folder_at(Path::new("/Users/sam/nowhere")).is_none() && index.folder_at(Path::new("/Users/sam")).is_some());
         // Saving again replaces it, and leaves nothing half-written behind.
         let mut later = index.clone();
         later.taken += 60;
