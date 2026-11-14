@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -198,7 +198,7 @@ impl Run {
     /// from the Dock is given a bare one. Each line it prints is passed to
     /// `said`, and how it ended to `ended`, both from other threads.
     pub fn start(&mut self, dirs: &[PathBuf], said: impl Fn(String) + Send + Clone + 'static, ended: impl FnOnce(Option<i32>) + Send + 'static) {
-        let mut command = Command::new(&self.spec.program);
+        let mut command = neo_desktop::command(&self.spec.program);
         if let Ok(path) = std::env::join_paths(dirs).map(|p| p.to_os_string()).map(|p| if p.is_empty() { std::env::var_os("PATH").unwrap_or_default() } else { p }) {
             command.env("PATH", path);
         }

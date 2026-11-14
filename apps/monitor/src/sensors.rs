@@ -5,8 +5,11 @@
 //!   fallback. Fans come from the controller too.
 //! - Linux: the kernel's hwmon sensors, for temperatures (through `sysinfo`)
 //!   and fans (`/sys/class/hwmon`).
-//! - Windows: whatever thermal zones the firmware reports. Fans are not
-//!   available without a vendor driver.
+//! - Windows: whatever thermal zones the firmware reports, and an NVIDIA
+//!   graphics card through the tool its driver comes with. The processor's
+//!   own sensors and the fans are read through a kernel driver, which Neo
+//!   does not have; HWiNFO has, and what it shares while it runs is shown
+//!   (see [`crate::hwinfo`]).
 //!
 //! Reading takes tens of milliseconds, so it is done off the main thread.
 
@@ -143,12 +146,40 @@ fn generic(components: &mut sysinfo::Components) -> Vec<Sensor> {
     out
 }
 
+/// NVIDIA graphics cards, asked of `nvidia-smi`, which the driver installs.
+#[cfg(windows)]
+fn nvidia() -> Vec<Sensor> {
+    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join(r"System32\nvidia-smi.exe");
+    if !system.is_file() {
+        return vec![];
+    }
+    let Ok(out) = neo_desktop::command(system).args(["--query-gpu=name,temperature.gpu", "--format=csv,noheader,nounits"]).stdin(std::process::Stdio::null()).output() else { return vec![] };
+    nvidia_cards(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// What `nvidia-smi` answers, a card to a line: its name, then its temperature.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn nvidia_cards(answer: &str) -> Vec<Sensor> {
+    answer
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let (name, celsius) = line.rsplit_once(',')?;
+            let celsius = celsius.trim().parse::<f32>().ok().filter(|t| plausible(*t))?;
+            Some(Sensor { kind: Kind::Gpu, name: name.trim().to_owned(), id: format!("nvidia-smi GPU {i}"), celsius, idle: false })
+        })
+        .collect()
+}
+
 pub struct Reader {
     components: sysinfo::Components,
     #[cfg(target_os = "macos")]
     smc: Option<crate::smc::Smc>,
     #[cfg(target_os = "macos")]
     keys: Vec<(Kind, String, &'static str)>,
+    /// What HWiNFO shared at this reading: temperatures, and fans.
+    #[cfg(windows)]
+    shared: Option<(Vec<Sensor>, Vec<Fan>)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -212,10 +243,16 @@ impl Reader {
             smc: crate::smc::Smc::open(),
             #[cfg(target_os = "macos")]
             keys: mac::keys(cpu_brand),
+            #[cfg(windows)]
+            shared: None,
         }
     }
 
     pub fn read(&mut self) -> Reading {
+        #[cfg(windows)]
+        {
+            self.shared = crate::hwinfo::read();
+        }
         Reading { sensors: self.temperatures(), fans: self.fans() }
     }
 
@@ -246,7 +283,19 @@ impl Reader {
                 return named;
             }
         }
-        generic(&mut self.components)
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut found = generic(&mut self.components);
+        #[cfg(windows)]
+        {
+            // What HWiNFO shares, where it is running; and the graphics
+            // card from its own tool unless HWiNFO has told of it already.
+            found.extend(self.shared.iter().flat_map(|(sensors, _)| sensors.iter().cloned()));
+            if !found.iter().any(|s| s.kind == Kind::Gpu) {
+                found.extend(nvidia());
+            }
+            found.sort_by_key(|s| s.kind);
+        }
+        found
     }
 
     #[cfg(target_os = "macos")]
@@ -284,6 +333,10 @@ impl Reader {
 
     #[cfg(not(unix))]
     fn fans(&self) -> Vec<Fan> {
+        #[cfg(windows)]
+        if let Some((_, fans)) = &self.shared {
+            return fans.clone();
+        }
         vec![]
     }
 }
@@ -297,6 +350,12 @@ mod tests {
         for (label, kind) in [("coretemp Core 0", Kind::Cpu), ("k10temp Tctl", Kind::Cpu), ("PMU tdie3", Kind::Cpu), ("amdgpu edge", Kind::Gpu), ("GPU MTR Temp Sensor1", Kind::Gpu), ("nvme Composite", Kind::Storage), ("NAND CH0 temp", Kind::Storage), ("spd5118 temp1", Kind::Memory), ("gas gauge battery", Kind::Battery), ("acpitz temp1", Kind::Other)] {
             assert_eq!(classify(label), kind, "{label}");
         }
+    }
+
+    #[test]
+    fn reads_what_nvidia_smi_answers() {
+        let cards = nvidia_cards("NVIDIA GeForce RTX 5070, 43\nNVIDIA RTX A2000, 12GB, 61\nnothing here\n");
+        assert_eq!(cards.iter().map(|s| (s.kind, s.name.as_str(), s.celsius)).collect::<Vec<_>>(), vec![(Kind::Gpu, "NVIDIA GeForce RTX 5070", 43.0), (Kind::Gpu, "NVIDIA RTX A2000, 12GB", 61.0)]);
     }
 
     #[test]

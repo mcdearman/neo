@@ -3,7 +3,7 @@
 //! macOS is asked through AppleScript's own `volume` words, which need
 //! no leave from the user. Linux is asked through PipeWire's `wpctl`.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// How loud things are, each from 0 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +33,7 @@ pub fn parse_wpctl(text: &str) -> Option<(f32, bool)> {
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = neo_desktop::command(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

@@ -116,7 +116,7 @@ impl Dap {
     /// its `PATH`. Its messages are passed to `on_message` from another thread.
     pub fn spawn(program: &Path, args: &[String], cwd: &Path, dirs: &[PathBuf], launch: Value, breakpoints: Vec<(PathBuf, Vec<usize>)>, on_message: impl Fn(Incoming) + Send + 'static) -> std::io::Result<Self> {
         use std::process::Stdio;
-        let mut command = std::process::Command::new(program);
+        let mut command = neo_desktop::command(program);
         if let Ok(path) = std::env::join_paths(dirs)
             && !path.is_empty()
         {

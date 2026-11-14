@@ -9,9 +9,12 @@
 //! Touch ID or password, with [`authenticate`].
 
 /// What the key is filed under.
+#[cfg_attr(windows, allow(dead_code))]
 const SERVICE: &str = "org.neo.Apollo";
+#[cfg_attr(windows, allow(dead_code))]
 const ACCOUNT: &str = "memory";
 
+#[cfg_attr(windows, allow(dead_code))]
 fn hex(key: &[u8; 32]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -57,11 +60,11 @@ pub fn authenticate(reason: &str) -> Result<(), String> {
 
 /// A key kept in a file only its owner can read: for systems with no
 /// keychain to ask.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 mod file {
     use super::*;
 
-    fn path() -> std::path::PathBuf {
+    pub fn path() -> std::path::PathBuf {
         crate::dir().join("key")
     }
 
@@ -86,20 +89,20 @@ mod file {
 mod imp {
     use super::*;
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// The login keychain, through the system's own tool. Any app of the
     /// user's may read the item, so that a rebuilt Apollo is not stopped
     /// and asked for the login password every time it starts.
     pub fn read() -> Result<Option<[u8; 32]>, String> {
-        let out = Command::new("/usr/bin/security").args(["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"]).stdin(Stdio::null()).output().map_err(|e| format!("Couldn't ask the keychain: {e}"))?;
+        let out = neo_desktop::command("/usr/bin/security").args(["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"]).stdin(Stdio::null()).output().map_err(|e| format!("Couldn't ask the keychain: {e}"))?;
         Ok(out.status.success().then(|| unhex(&String::from_utf8_lossy(&out.stdout))).flatten())
     }
 
     pub fn write(key: &[u8; 32]) -> Result<(), String> {
         // Given on the tool's input, not its command line, where other
         // programs could see it.
-        let mut tool = Command::new("/usr/bin/security").arg("-i").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("Couldn't ask the keychain: {e}"))?;
+        let mut tool = neo_desktop::command("/usr/bin/security").arg("-i").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("Couldn't ask the keychain: {e}"))?;
         let line = format!("add-generic-password -U -A -s {SERVICE} -a {ACCOUNT} -l \"Apollo memory\" -w {}\n", hex(key));
         tool.stdin.take().ok_or("no input")?.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         tool.wait().map_err(|e| e.to_string())?;
@@ -142,7 +145,7 @@ mod imp {
 mod imp {
     use super::*;
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     fn secret_tool() -> Option<std::path::PathBuf> {
         Some(neo_desktop::fs::tool("secret-tool")).filter(|p| p.is_file())
@@ -152,7 +155,7 @@ mod imp {
     /// and a file only the user can read where there is not.
     pub fn read() -> Result<Option<[u8; 32]>, String> {
         if let Some(tool) = secret_tool()
-            && let Ok(out) = Command::new(tool).args(["lookup", "service", SERVICE, "account", ACCOUNT]).stdin(Stdio::null()).output()
+            && let Ok(out) = neo_desktop::command(tool).args(["lookup", "service", SERVICE, "account", ACCOUNT]).stdin(Stdio::null()).output()
             && let Some(key) = unhex(&String::from_utf8_lossy(&out.stdout))
         {
             return Ok(Some(key));
@@ -162,7 +165,7 @@ mod imp {
 
     pub fn write(key: &[u8; 32]) -> Result<(), String> {
         if let Some(tool) = secret_tool()
-            && let Ok(mut child) = Command::new(tool).args(["store", "--label", "Apollo memory", "service", SERVICE, "account", ACCOUNT]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+            && let Ok(mut child) = neo_desktop::command(tool).args(["store", "--label", "Apollo memory", "service", SERVICE, "account", ACCOUNT]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         {
             let wrote = child.stdin.take().is_some_and(|mut input| input.write_all(hex(key).as_bytes()).is_ok());
             if child.wait().is_ok_and(|s| s.success()) && wrote {
@@ -179,7 +182,7 @@ mod imp {
         if !pkexec.is_file() {
             return Err("This system has no polkit to check who you are with.".into());
         }
-        match Command::new(pkexec).arg("true").stdin(Stdio::null()).status() {
+        match neo_desktop::command(pkexec).arg("true").stdin(Stdio::null()).status() {
             Ok(s) if s.success() => Ok(()),
             Ok(_) => Err("Not unlocked.".into()),
             Err(e) => Err(format!("Couldn't ask who you are: {e}")),
@@ -187,7 +190,97 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData};
+    use windows::Win32::System::WinRT::{IUserConsentVerifierInterop, RO_INIT_MULTITHREADED, RoInitialize};
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::core::{HSTRING, PCWSTR, factory};
+    use windows_future::IAsyncOperation;
+
+    /// What a key locked by the user's login begins with in its file.
+    const LOCKED: &str = "dpapi:";
+
+    /// Locks or unlocks `data` with the user's Windows login: what comes
+    /// out locked can be read by this user on this computer and no other.
+    fn protect(data: &[u8], lock: bool) -> Result<Vec<u8>, String> {
+        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: the input is `data`, which outlives the call, and what
+        // Windows gives back is copied and then freed as it asks.
+        unsafe {
+            let done = if lock {
+                CryptProtectData(&input, PCWSTR::null(), None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+            } else {
+                CryptUnprotectData(&input, None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+            };
+            done.map_err(|e| format!("Windows could not {} the key to Apollo's memory: {e}", if lock { "lock" } else { "unlock" }))?;
+            let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+            LocalFree(Some(HLOCAL(out.pbData.cast())));
+            Ok(bytes)
+        }
+    }
+
+    /// The key from its file, where it is kept locked by the user's login.
+    /// One left there in the open by an earlier Neo is locked when found.
+    pub fn read() -> Result<Option<[u8; 32]>, String> {
+        let Ok(text) = std::fs::read_to_string(file::path()) else { return Ok(None) };
+        let Some(locked) = text.trim().strip_prefix(LOCKED) else {
+            let key = unhex(&text);
+            if let Some(key) = &key {
+                let _ = write(key);
+            }
+            return Ok(key);
+        };
+        if locked.len() % 2 != 0 || !locked.is_ascii() {
+            return Ok(None);
+        }
+        let Some(bytes) = (0..locked.len() / 2).map(|i| u8::from_str_radix(&locked[i * 2..i * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>() else { return Ok(None) };
+        Ok(protect(&bytes, false)?.try_into().ok())
+    }
+
+    pub fn write(key: &[u8; 32]) -> Result<(), String> {
+        let locked: String = protect(key, true)?.iter().map(|b| format!("{b:02x}")).collect();
+        let path = file::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, format!("{LOCKED}{locked}")).map_err(|e| e.to_string())
+    }
+
+    /// Windows Hello: a face, a finger or the PIN, asked for by Windows
+    /// itself over the window in front, which is Apollo's.
+    pub fn authenticate(reason: &str) -> Result<(), String> {
+        let asked = || -> windows::core::Result<Result<(), String>> {
+            // SAFETY: plain calls into Windows, on a thread it has been told of.
+            unsafe {
+                // More than once on a thread does no harm.
+                let _ = RoInitialize(RO_INIT_MULTITHREADED);
+                if UserConsentVerifier::CheckAvailabilityAsync()?.join()? != UserConsentVerifierAvailability::Available {
+                    return Ok(Err("Windows Hello is not set up. Set a PIN in Windows Settings, under Accounts and Sign-in options, and Apollo can check who you are.".into()));
+                }
+                let interop = factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+                let answer: IAsyncOperation<UserConsentVerificationResult> = interop.RequestVerificationForWindowAsync(GetForegroundWindow(), &HSTRING::from(reason))?;
+                Ok(if answer.join()? == UserConsentVerificationResult::Verified { Ok(()) } else { Err("Not unlocked.".into()) })
+            }
+        };
+        asked().unwrap_or_else(|e| Err(format!("Couldn't ask who you are: {e}")))
+    }
+
+    #[test]
+    fn what_the_login_locks_it_unlocks_and_nothing_else_does() {
+        let key: [u8; 32] = std::array::from_fn(|i| (i * 5) as u8);
+        let locked = protect(&key, true).unwrap();
+        assert!(locked.len() > key.len() && !locked.windows(32).any(|w| w == key), "not the key in the open");
+        assert_eq!(protect(&locked, false).unwrap(), key);
+        assert!(protect(&key, false).is_err(), "what was never locked is not unlocked");
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod imp {
     use super::*;
 

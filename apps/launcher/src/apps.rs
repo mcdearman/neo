@@ -171,7 +171,7 @@ pub fn exec_command(exec: &str) -> String {
 pub fn launch(app: &AppEntry) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(&app.path).spawn().map(|_| ())
+        neo_desktop::command("open").arg(&app.path).spawn().map(|_| ())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -180,11 +180,11 @@ pub fn launch(app: &AppEntry) -> std::io::Result<()> {
             return Err(std::io::Error::other("this entry has no command to run"));
         }
         // The Exec line is a shell-like command; let the shell split it.
-        std::process::Command::new("sh").arg("-c").arg(format!("exec {command}")).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map(|_| ())
+        neo_desktop::command("sh").arg("-c").arg(format!("exec {command}")).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map(|_| ())
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&app.path).spawn().map(|_| ())
+        neo_desktop::command("cmd").args(["/C", "start", ""]).arg(&app.path).spawn().map(|_| ())
     }
 }
 
@@ -204,7 +204,12 @@ pub fn icon(app: &AppEntry) -> Option<Image> {
         let ok = unsafe { neo_app_icon(path.as_ptr(), SIDE as c_int, pixels.as_mut_ptr()) } != 0;
         ok.then(|| Image::frame(SIDE as u32, SIDE as u32, pixels))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        const SIDE: usize = 64;
+        neo_desktop::icons::of_file(&app.path, SIDE)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = app;
         None

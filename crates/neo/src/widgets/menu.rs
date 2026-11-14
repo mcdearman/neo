@@ -1,4 +1,4 @@
-use armature_render::{FontFamily, Point, Rect, Size, TextLayout, TextStyle};
+use armature_render::{FontFamily, Image, Point, Rect, Size, TextLayout, TextStyle};
 use neo_theme::{Icon, Shadow, Surface, TextRole};
 
 use crate::ThemeCx;
@@ -14,6 +14,8 @@ const ICON: f32 = 15.0;
 pub(crate) struct Row {
     pub label: String,
     pub icon: Option<Icon>,
+    /// A picture in the icon's place, such as an app's own.
+    pub image: Option<Image>,
     /// Shown at the right in a quieter colour, such as a shortcut.
     pub hint: Option<String>,
     pub enabled: bool,
@@ -40,7 +42,7 @@ impl RowList {
     pub fn layout(cx: &mut Cx, rows: &[Row]) -> Self {
         let style = cx.theme().text(TextRole::Body).style();
         let icon_style = TextStyle { size: ICON, weight: 400, family: FontFamily::Icons, line_height: 1.0, letter_spacing: 0.0 };
-        let any_icon = rows.iter().any(|r| r.icon.is_some());
+        let any_icon = rows.iter().any(|r| r.icon.is_some() || r.image.is_some());
         let mut width: f32 = 160.0;
         let mut height = PAD * 2.0;
         let mut texts = Vec::with_capacity(rows.len());
@@ -108,7 +110,11 @@ impl RowList {
             }
             let mut x = area.x + 10.0;
             if self.any_icon {
-                if let Some(g) = &text.glyph {
+                if let Some(image) = &row.image {
+                    // A little larger than a glyph, which has air around it.
+                    let side = ICON + 3.0;
+                    cx.scene.image(image, Rect::new(x - 1.5, area.y + ((ITEM_H - side) * 0.5).round(), side, side));
+                } else if let Some(g) = &text.glyph {
                     cx.scene.text(g, Point::new(x, area.y + ((ITEM_H - g.size().h) * 0.5).round()), if row.danger && row.enabled { p.bad } else { p.muted });
                 }
                 x += ICON + 10.0;
@@ -179,7 +185,7 @@ impl<M: Clone> PopupMenu<M> {
     /// `at` is where the menu's top-left corner goes, in window
     /// coordinates. It is moved as needed to stay inside the window.
     pub fn new(at: Point, items: Vec<MenuItem<M>>, on_dismiss: M) -> Self {
-        let rows = items.iter().map(|i| Row { label: i.label.clone(), icon: i.icon, hint: None, enabled: i.message.is_some(), danger: i.danger, separator: i.separator }).collect();
+        let rows = items.iter().map(|i| Row { label: i.label.clone(), icon: i.icon, image: None, hint: None, enabled: i.message.is_some(), danger: i.danger, separator: i.separator }).collect();
         Self { at, items, on_dismiss, rows, list: RowList::default() }
     }
 

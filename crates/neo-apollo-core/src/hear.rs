@@ -7,7 +7,7 @@
 //! a document's is: "the video where we talk about the ferry".
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// The program that writes speech down.
 pub const TOOL: &str = "whisper-cli";
@@ -151,7 +151,7 @@ pub fn download_to(url: &str, to: &Path, about: u64, progress: &mut dyn FnMut(u6
     let _ = std::fs::remove_file(&part);
     // The system's own downloader, which every system has and which knows
     // how to follow where the file has moved to.
-    let mut curl = Command::new(neo_desktop::fs::tool("curl")).args(["--location", "--fail", "--silent", "--show-error", "--connect-timeout", "15", "--output"]).arg(&part).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("The model could not be fetched: {e}"))?;
+    let mut curl = neo_desktop::command(neo_desktop::fs::tool("curl")).args(["--location", "--fail", "--silent", "--show-error", "--connect-timeout", "15", "--output"]).arg(&part).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("The model could not be fetched: {e}"))?;
     // How far it has got is how much of the file is there.
     let fetched = loop {
         match curl.try_wait() {
@@ -245,7 +245,7 @@ pub fn transcribe_with(path: &Path, model: &Path, from: u32, stretch: u32) -> Re
     // listener has a file of its own, for several go at once.
     let wav = std::env::temp_dir().join(format!("neo-apollo-hear-{}-{:x}-{from}.wav", std::process::id(), path.to_string_lossy().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))));
     let stretch_of_it = format!("{WITHOUT_SILENCE},atrim=start={from}:duration={stretch},asetpts=PTS-STARTPTS");
-    let taken = Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-v", "error", "-i"]).arg(path).args(["-vn", "-ac", "1", "-ar", "16000", "-af", &stretch_of_it, "-f", "wav"]).arg(&wav).stdin(Stdio::null()).stderr(Stdio::null()).status();
+    let taken = neo_desktop::command(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-v", "error", "-i"]).arg(path).args(["-vn", "-ac", "1", "-ar", "16000", "-af", &stretch_of_it, "-f", "wav"]).arg(&wav).stdin(Stdio::null()).stderr(Stdio::null()).status();
     // 16-bit, one channel, 16 kHz: 32,000 bytes a second after the header.
     let seconds = std::fs::metadata(&wav).map_or(0.0, |m| m.len().saturating_sub(44) as f32 / 32_000.0);
     // No sound in it at all, or none left, is not a failure: there is nothing to hear.
@@ -253,7 +253,7 @@ pub fn transcribe_with(path: &Path, model: &Path, from: u32, stretch: u32) -> Re
         let _ = std::fs::remove_file(&wav);
         return Ok(Heard::default());
     }
-    let heard = Command::new(neo_desktop::fs::tool(TOOL)).arg("-m").arg(model).arg("-f").arg(&wav).args(["-nt", "-np", "-l", "auto", "-sns"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let heard = neo_desktop::command(neo_desktop::fs::tool(TOOL)).arg("-m").arg(model).arg("-f").arg(&wav).args(["-nt", "-np", "-l", "auto", "-sns"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
     let _ = std::fs::remove_file(&wav);
     let heard = heard.map_err(|e| format!("Couldn't run {TOOL}: {e}"))?;
     if !heard.status.success() {

@@ -192,7 +192,7 @@ mod tests {
         let png = dir.join("in.png");
         image::RgbaImage::from_pixel(64, 48, image::Rgba([200, 40, 40, 255])).save(&png).unwrap();
         let heic = dir.join("out.heic");
-        let made = std::process::Command::new("sips").args(["-s", "format", "heic"]).arg(&png).arg("--out").arg(&heic).output().is_ok_and(|o| o.status.success());
+        let made = neo_desktop::command("sips").args(["-s", "format", "heic"]).arg(&png).arg("--out").arg(&heic).output().is_ok_and(|o| o.status.success());
         if made {
             let d = decode(&heic).expect("HEIC decodes through ImageIO");
             assert_eq!((d.image.width(), d.image.height()), (64, 48));

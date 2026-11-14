@@ -11,8 +11,6 @@
 //! process that is another user's, or the system's, may refuse the last
 //! two, and is then described by what the rest say.
 
-use std::process::Command;
-
 /// Where a program comes from, going by where it is kept.
 pub fn origin(path: &str) -> Option<String> {
     let home = neo_desktop::fs::home_dir();
@@ -166,7 +164,7 @@ pub fn working_on(lsof: &str) -> Vec<String> {
 }
 
 fn said(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let out = neo_desktop::command(program).args(args).output().ok()?;
     // `codesign` says what it has to say on the other stream.
     let text = if out.stdout.is_empty() { out.stderr } else { out.stdout };
     Some(String::from_utf8_lossy(&text).into_owned()).filter(|t| !t.trim().is_empty())
@@ -226,7 +224,7 @@ pub fn gather(s: &Subject, closely: bool) -> Vec<String> {
         }
         // A second's look at what its threads are running.
         let file = std::env::temp_dir().join(format!("neo-monitor-sample-{pid}.txt"));
-        let _ = Command::new("/usr/bin/sample").args([&pid, "1", "-mayDie", "-file"]).arg(&file).output();
+        let _ = neo_desktop::command("/usr/bin/sample").args([&pid, "1", "-mayDie", "-file"]).arg(&file).output();
         let busy = std::fs::read_to_string(&file).map(|s| busy_in(&s)).unwrap_or_default();
         let _ = std::fs::remove_file(&file);
         if a.cpu < 2.0 {

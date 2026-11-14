@@ -57,7 +57,7 @@ impl<M: 'static> Frame<M> {
     pub fn menus(mut self, menus: Vec<armature::Menu<M>>) -> Self {
         self.menu_rows = menus
             .iter()
-            .map(|m| m.entries.iter().map(|e| Row { label: e.label.clone(), icon: None, hint: e.shortcut.as_ref().map(|s| s.label()), enabled: e.message.is_some(), danger: false, separator: e.separator }).collect())
+            .map(|m| m.entries.iter().map(|e| Row { label: e.label.clone(), icon: None, image: e.icon.clone(), hint: e.shortcut.as_ref().map(|s| s.label()), enabled: e.message.is_some(), danger: false, separator: e.separator }).collect())
             .collect();
         self.menus = menus;
         self

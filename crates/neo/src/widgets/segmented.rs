@@ -145,7 +145,10 @@ impl<M: 'static> Widget<M> for Segmented<M> {
                 let pressed = cx.state::<SegState>().pressed.take();
                 if let Some(i) = pressed {
                     cx.request_redraw();
-                    if hit(*pos) == Some(i) && self.selected != Some(i) {
+                    // The one already chosen says so too when it is clicked:
+                    // where the options are tabs, that is how one goes back
+                    // to the top of the tab one is in.
+                    if hit(*pos) == Some(i) {
                         cx.emit((self.on_select)(i));
                     }
                 }

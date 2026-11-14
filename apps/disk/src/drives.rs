@@ -148,13 +148,13 @@ fn plain_id(id: &str) -> bool {
 /// The commands that carry out `action` on `d`, in order, each as a
 /// program and its arguments. Refuses a format that is not allowed.
 pub fn commands(d: &Drive, action: &Action) -> Result<Vec<Vec<String>>, String> {
+    if cfg!(windows) {
+        return Err("Mounting and formatting are not available on Windows yet.".into());
+    }
     if !plain_id(&d.id) || (*action == Action::Eject && !plain_id(&d.parent)) {
         return Err(format!("\"{}\" is not a drive NeoDisk recognises.", d.id));
     }
     let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
-    if cfg!(windows) {
-        return Err("Mounting and formatting are not available on Windows yet.".into());
-    }
     let mac = cfg!(target_os = "macos");
     Ok(match action {
         Action::Mount if mac => vec![argv(&["diskutil", "mount", &d.id])],
@@ -214,7 +214,7 @@ pub fn run(steps: &[Vec<String>]) -> Result<String, String> {
         let Some((program, args)) = step.split_first() else {
             continue;
         };
-        let out = std::process::Command::new(program).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| format!("Could not run {program}: {e}"))?;
+        let out = neo_desktop::command(program).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| format!("Could not run {program}: {e}"))?;
         let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_owned();
         if !out.status.success() {
             let why = [text(&out.stderr), text(&out.stdout)].into_iter().find(|s| !s.is_empty()).unwrap_or_else(|| format!("{program} failed"));
@@ -225,16 +225,40 @@ pub fn run(steps: &[Vec<String>]) -> Result<String, String> {
     Ok(said)
 }
 
+/// The drives Windows has given letters to, each a volume: C: and the
+/// rest. All of them are shown, built in or plugged in, as Windows shows
+/// them all itself.
+#[cfg(windows)]
+fn windows_volumes() -> Vec<Drive> {
+    let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let mut found: Vec<Drive> = sysinfo::Disks::new_with_refreshed_list()
+        .iter()
+        .map(|d| {
+            let id = d.mount_point().to_string_lossy().trim_end_matches('\\').to_owned();
+            Drive { parent: id.clone(), name: d.name().to_string_lossy().into_owned(), size: d.total_space(), fs: d.file_system().to_string_lossy().into_owned(), mount: Some(d.mount_point().to_path_buf()), external: d.is_removable(), startup: id.eq_ignore_ascii_case(&system), whole: false, id }
+        })
+        .collect();
+    // The one Windows runs from first, then by letter.
+    found.sort_by(|a, b| b.startup.cmp(&a.startup).then_with(|| a.id.cmp(&b.id)));
+    found
+}
+
 /// Every drive worth showing: the startup disk, and whatever is plugged in.
 pub fn list() -> Result<Vec<Drive>, String> {
+    #[cfg(windows)]
+    return Ok(windows_volumes());
+    #[cfg(not(windows))]
+    list_with_the_systems_tools()
+}
+
+#[cfg(not(windows))]
+fn list_with_the_systems_tools() -> Result<Vec<Drive>, String> {
     let read = |program: &str, args: &[&str]| -> Result<String, String> {
-        let out = std::process::Command::new(program).args(args).output().map_err(|e| format!("Listing drives needs {program}: {e}"))?;
+        let out = neo_desktop::command(program).args(args).output().map_err(|e| format!("Listing drives needs {program}: {e}"))?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     };
     if cfg!(target_os = "macos") {
         Ok(parse_diskutil(&read("diskutil", &["info", "-all"])?))
-    } else if cfg!(windows) {
-        Err("Listing drives is not available on Windows yet.".into())
     } else {
         parse_lsblk(&read("lsblk", &["-J", "-b", "-o", "NAME,PATH,SIZE,FSTYPE,LABEL,MOUNTPOINT,RM,HOTPLUG,TYPE"])?)
     }
@@ -242,6 +266,7 @@ pub fn list() -> Result<Vec<Drive>, String> {
 
 /// Reads `diskutil info -all`: a block of `Key: value` lines per device,
 /// with a row of asterisks between blocks.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn parse_diskutil(text: &str) -> Vec<Drive> {
     let mut all = vec![];
     for block in text.split("**********") {
@@ -281,6 +306,7 @@ pub fn parse_diskutil(text: &str) -> Vec<Drive> {
 /// A minimal reading of the JSON `lsblk -J` prints: enough to walk its
 /// devices without a JSON library. Each device is an object of string,
 /// number, boolean or null fields, with its partitions under `children`.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn parse_lsblk(text: &str) -> Result<Vec<Drive>, String> {
     #[derive(Debug)]
     enum J {
@@ -553,8 +579,13 @@ mod tests {
         for d in &found {
             println!("{:<14} {:<22} {:>14} {:<16} external {:<5} startup {:<5} whole {:<5} {:?}", d.id, d.title(), d.size, d.fs, d.external, d.startup, d.whole, d.mount);
         }
-        assert_eq!(found.iter().filter(|d| d.startup && d.mount.as_deref() == Some(std::path::Path::new("/"))).count(), 1, "one startup volume");
-        assert!(found.iter().all(|d| plain_id(&d.id) && plain_id(&d.parent) && d.size > 0));
+        assert_eq!(found.iter().filter(|d| d.startup).count(), 1, "one startup volume");
+        if cfg!(windows) {
+            assert!(found.iter().all(|d| d.size > 0 && d.mount.is_some()));
+        } else {
+            assert!(found.iter().all(|d| plain_id(&d.id) && plain_id(&d.parent) && d.size > 0));
+            assert_eq!(found.iter().filter(|d| d.startup).filter_map(|d| d.mount.as_deref()).collect::<Vec<_>>(), [std::path::Path::new("/")]);
+        }
         assert!(found.iter().filter(|d| d.startup).all(|d| format_refusal(d).is_some()));
     }
 

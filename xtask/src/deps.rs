@@ -23,19 +23,53 @@ pub struct Dependency {
     pub brew: &'static str,
     pub winget: Option<&'static str>,
     pub linux: fn(&str) -> Option<&'static str>,
+    /// Where Windows gets it when winget has no package of it: a zip of
+    /// the program as its makers build it, to be unpacked beside the apps.
+    pub windows_zip: Option<Zip>,
+    /// And where a Windows computer with an NVIDIA graphics card gets it
+    /// instead: a build that works on the card, which is several times
+    /// quicker and several times the download.
+    pub windows_zip_nvidia: Option<Zip>,
+    /// macOS has something of its own for this, and does without.
+    pub not_on_macos: bool,
+}
+
+/// A program to download for Windows, at a release that is known to work.
+pub struct Zip {
+    pub url: &'static str,
+    /// The file's SHA-256, so that what is unpacked is what was meant.
+    pub sha256: &'static str,
+    /// The folder in the zip that holds the program and what it runs with.
+    pub folder: &'static str,
+    /// The folder it is unpacked into, under the apps' `tools`.
+    pub into: &'static str,
 }
 
 pub const DEPENDENCIES: &[Dependency] = &[
-    Dependency { program: "ffmpeg", why: "thumbnails of videos in Files, and Apollo's look at them; on Linux and Windows, playing in Videos and recording in NeoCap", brew: "ffmpeg", winget: Some("Gyan.FFmpeg"), linux: |_| Some("ffmpeg") },
+    Dependency { program: "ffmpeg", why: "thumbnails of videos in Files, and Apollo's look at them; on Linux and Windows, playing in Videos and recording in NeoCap", brew: "ffmpeg", winget: Some("Gyan.FFmpeg"), linux: |_| Some("ffmpeg"), windows_zip: None, windows_zip_nvidia: None, not_on_macos: false },
     // Linux distributions do not package it; it has an installer of its own.
-    Dependency { program: "ollama", why: "Apollo, whose model it runs on this computer (https://ollama.com/download)", brew: "ollama", winget: Some("Ollama.Ollama"), linux: |manager| (manager == "pacman").then_some("ollama") },
-    // Packaged for Homebrew; elsewhere it is built from whisper.cpp's source.
-    Dependency { program: "whisper-cli", why: "Apollo's hearing of what is said in videos and recordings (https://github.com/ggml-org/whisper.cpp)", brew: "whisper-cpp", winget: None, linux: |_| None },
+    Dependency { program: "ollama", why: "Apollo, whose model it runs on this computer (https://ollama.com/download)", brew: "ollama", winget: Some("Ollama.Ollama"), linux: |manager| (manager == "pacman").then_some("ollama"), windows_zip: None, windows_zip_nvidia: None, not_on_macos: false },
+    // Packaged for Homebrew, and built for Windows by its makers; on Linux
+    // it is built from whisper.cpp's source.
+    Dependency {
+        program: "whisper-cli",
+        why: "Apollo's hearing of what is said in videos and recordings (https://github.com/ggml-org/whisper.cpp)",
+        brew: "whisper-cpp",
+        winget: None,
+        linux: |_| None,
+        windows_zip: Some(Zip { url: "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip", sha256: "6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb", folder: "Release", into: "whisper" }),
+        // Built against CUDA 12, with the libraries it needs beside it: on an
+        // RTX 5070 it heard three minutes of sound in 34 s where the other took 82.
+        windows_zip_nvidia: Some(Zip { url: "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cuda-12.4.0-x64.zip", sha256: "afef0b881c500958921c3f5523b50e59ee2ec9b6f5cbd25b324c51ed308a957a", folder: "Release", into: "whisper-cuda" }),
+        not_on_macos: false,
+    },
+    // macOS reads word processors' files with a tool of its own.
+    Dependency { program: "pandoc", why: "Apollo's reading of word processors' documents", brew: "pandoc", winget: Some("JohnMacFarlane.Pandoc"), linux: |_| Some("pandoc"), windows_zip: None, windows_zip_nvidia: None, not_on_macos: true },
     Dependency {
         program: "pdftotext",
         why: "Apollo's reading of PDFs",
         brew: "poppler",
-        winget: None,
+        winget: Some("oschwartz10612.Poppler"),
         linux: |manager| {
             Some(match manager {
                 "pacman" => "poppler",
@@ -43,6 +77,9 @@ pub const DEPENDENCIES: &[Dependency] = &[
                 _ => "poppler-utils",
             })
         },
+        windows_zip: None,
+        windows_zip_nvidia: None,
+        not_on_macos: false,
     },
 ];
 
@@ -50,11 +87,82 @@ pub const DEPENDENCIES: &[Dependency] = &[
 /// may not have on its `PATH`.
 const USUAL: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"];
 
+/// Where the apps' own tools are kept on Windows: beside the apps, a folder to each.
+pub fn tools_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default().join(r"Programs\Neo\tools")
+}
+
+/// The folders Windows would give a program started now for its `PATH`.
+/// This one's own is as old as the terminal it was started from, and knows
+/// nothing of what winget installed a moment ago.
+#[cfg(windows)]
+fn fresh_path() -> Vec<PathBuf> {
+    let mut dirs = vec![];
+    for key in [r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment", r"HKCU\Environment"] {
+        let Ok(out) = Command::new("reg").args(["query", key, "/v", "Path"]).output() else { continue };
+        // "    Path    REG_EXPAND_SZ    C:\one;%USERPROFILE%\two"
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(value) = text.lines().find_map(|l| l.split_once("_SZ").map(|(_, v)| v.trim().to_owned())) else { continue };
+        for dir in value.split(';').filter(|d| !d.is_empty()) {
+            // Names between percent signs stand for other variables.
+            let mut whole = String::new();
+            for (i, part) in dir.split('%').enumerate() {
+                whole.push_str(&if i % 2 == 1 { std::env::var(part).unwrap_or_default() } else { part.to_owned() });
+            }
+            dirs.push(PathBuf::from(whole));
+        }
+    }
+    dirs
+}
+
+#[cfg(not(windows))]
+fn fresh_path() -> Vec<PathBuf> {
+    vec![]
+}
+
 /// Where a program is, on the `PATH` or in the usual places.
 pub fn find(program: &str) -> Option<PathBuf> {
     let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);
     let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
-    on_path.into_iter().chain(USUAL.iter().map(PathBuf::from)).map(|dir| dir.join(&name)).find(|p| p.is_file())
+    let ours = std::fs::read_dir(tools_dir()).into_iter().flatten().flatten().map(|e| e.path());
+    on_path.into_iter().chain(USUAL.iter().map(PathBuf::from)).chain(fresh_path()).chain(ours).map(|dir| dir.join(&name)).find(|p| p.is_file())
+}
+
+/// The download of a dependency that suits this Windows computer, if it
+/// is got by download at all: the NVIDIA one where there is such a card,
+/// which is known by the tool its driver installs.
+fn zip_for(dep: &Dependency) -> Option<&Zip> {
+    if !cfg!(windows) || dep.winget.is_some() {
+        return None;
+    }
+    let nvidia = std::env::var_os("SystemRoot").is_some_and(|root| PathBuf::from(root).join(r"System32\nvidia-smi.exe").is_file());
+    dep.windows_zip_nvidia.as_ref().filter(|_| nvidia).or(dep.windows_zip.as_ref())
+}
+
+/// Downloads a program for Windows and unpacks it beside the apps.
+fn fetch(zip: &Zip) -> Result<(), String> {
+    let dir = tools_dir().join(zip.into);
+    let file = std::env::temp_dir().join(format!("neo-{}.zip", zip.into));
+    let run = |program: &str, args: &[&std::ffi::OsStr]| Command::new(program).args(args).output().map_err(|e| format!("could not run {program}: {e}"));
+    // curl and tar come with Windows, and tar reads zips.
+    let got = run("curl", &["-sSfL".as_ref(), "-o".as_ref(), file.as_os_str(), zip.url.as_ref()])?;
+    if !got.status.success() {
+        return Err(format!("{} could not be downloaded: {}", zip.url, String::from_utf8_lossy(&got.stderr).trim()));
+    }
+    let sum = run("certutil", &["-hashfile".as_ref(), file.as_os_str(), "SHA256".as_ref()])?;
+    let sum = String::from_utf8_lossy(&sum.stdout).to_lowercase();
+    if !sum.lines().any(|l| l.split_whitespace().collect::<String>() == zip.sha256) {
+        let _ = std::fs::remove_file(&file);
+        return Err(format!("{} is not the file that was expected, and was not unpacked", zip.url));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let unpacked = run("tar", &["-xf".as_ref(), file.as_os_str(), "-C".as_ref(), dir.as_os_str(), "--strip-components=1".as_ref(), zip.folder.as_ref()])?;
+    let _ = std::fs::remove_file(&file);
+    if !unpacked.status.success() {
+        return Err(format!("{} could not be unpacked: {}", zip.url, String::from_utf8_lossy(&unpacked.stderr).trim()));
+    }
+    Ok(())
 }
 
 /// The command that installs a dependency with this system's own package
@@ -68,7 +176,7 @@ pub fn install_command(dep: &Dependency, have: &dyn Fn(&str) -> bool) -> Option<
         return have("brew").then(|| words(&["brew", "install", dep.brew]));
     }
     if cfg!(windows) {
-        return dep.winget.filter(|_| have("winget")).map(|id| words(&["winget", "install", "--id", id, "-e"]));
+        return dep.winget.filter(|_| have("winget")).map(|id| words(&["winget", "install", "--id", id, "-e", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]));
     }
     let managers: [(&str, &[&str]); 5] = [("apt-get", &["install", "-y"]), ("dnf", &["install", "-y"]), ("pacman", &["-S", "--noconfirm", "--needed"]), ("zypper", &["install", "-y"]), ("apk", &["add"])];
     let (manager, args) = managers.iter().find(|(manager, _)| have(manager))?;
@@ -84,13 +192,34 @@ pub fn install_command(dep: &Dependency, have: &dyn Fn(&str) -> bool) -> Option<
 /// was asked to be got.
 pub fn ensure(install: bool) -> Result<(), String> {
     let mut missing = vec![];
-    for dep in DEPENDENCIES {
-        match find(dep.program) {
+    for dep in DEPENDENCIES.iter().filter(|d| !(d.not_on_macos && cfg!(target_os = "macos"))) {
+        // One of ours that is not the build this computer should have counts as missing.
+        let ours_but_another = |at: &PathBuf| zip_for(dep).is_some_and(|zip| at.starts_with(tools_dir()) && !at.starts_with(tools_dir().join(zip.into)));
+        match find(dep.program).filter(|at| !ours_but_another(at)) {
             Some(at) => println!("found {} at {}", dep.program, at.display()),
             None => missing.push(dep),
         }
     }
     for dep in missing {
+        // What winget does not have, Windows is given from where it is made.
+        if let Some(zip) = zip_for(dep) {
+            if !install {
+                println!("missing {}: {}", dep.program, dep.why);
+                println!("    to get it: cargo xtask deps --install    (from {})", zip.url);
+                continue;
+            }
+            println!("installing {}: from {}", dep.program, zip.url);
+            fetch(zip)?;
+            // The other build of it, if it was here, would be found first.
+            for other in [&dep.windows_zip, &dep.windows_zip_nvidia].into_iter().flatten().filter(|other| other.into != zip.into) {
+                let _ = std::fs::remove_dir_all(tools_dir().join(other.into));
+            }
+            match find(dep.program) {
+                Some(at) => println!("installed {} at {}", dep.program, at.display()),
+                None => return Err(format!("{} was unpacked from {} but is not there", dep.program, zip.url)),
+            }
+            continue;
+        }
         let command = install_command(dep, &|p| find(p).is_some());
         let how = command.as_ref().map(|c| c.join(" "));
         if !install {

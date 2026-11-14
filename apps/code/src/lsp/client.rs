@@ -393,7 +393,7 @@ impl Client {
     /// bare `PATH` that would hide them.
     pub fn spawn(found: &Found, root: &Path, dirs: &[PathBuf], on_message: impl Fn(Incoming) + Send + 'static) -> std::io::Result<Self> {
         use std::process::Stdio;
-        let mut command = std::process::Command::new(&found.program);
+        let mut command = neo_desktop::command(&found.program);
         if let Ok(path) = std::env::join_paths(dirs) {
             command.env("PATH", path);
         }

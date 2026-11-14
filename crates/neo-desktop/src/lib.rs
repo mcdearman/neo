@@ -30,7 +30,9 @@ pub mod apollo;
 mod appearance;
 pub mod autostart;
 pub mod config;
+pub mod displays;
 pub mod fs;
+pub mod icons;
 pub mod notify;
 pub mod pointing;
 mod prefs;
@@ -44,6 +46,22 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use neo::{Element, MenuEntry, Scheme, Shortcut, Subscription, Theme};
+
+/// A command to run `program`, as `std::process::Command::new` gives, that
+/// opens no window of its own. A Neo app on Windows has no console, so
+/// Windows would open one for every console program it starts: a black
+/// window that flashes by, or stays for as long as the program does.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// What the shared parts of an app ask of it. An app wraps these in one of
 /// its own messages and hands them back to [`Desktop::update`].

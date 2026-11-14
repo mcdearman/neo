@@ -12,8 +12,9 @@ repository = "https://github.com/mcdearman/neo"
 neo-theme = { path = "crates/neo-theme" }
 # The framework underneath, at a revision that is known to work with this
 # one. To work on both side by side, see `.cargo/local.toml.example`.
-armature-render = { git = "https://github.com/mcdearman/armature", rev = "1ccfbad33ccd34f396e942d13b3d77cd4ee696b1" }
-armature = { git = "https://github.com/mcdearman/armature", rev = "1ccfbad33ccd34f396e942d13b3d77cd4ee696b1" }
+armature-render = { git = "https://github.com/mcdearman/armature", rev = "f6af07feb5c2713b589569747e7943e8d4053486" }
+armature = { git = "https://github.com/mcdearman/armature", rev = "f6af07feb5c2713b589569747e7943e8d4053486" }
 neo = { path = "crates/neo" }
 neo-desktop = { path = "crates/neo-desktop" }
 neo-term = { path = "crates/neo-term" }
+neo-index = { path = "crates/neo-index" }

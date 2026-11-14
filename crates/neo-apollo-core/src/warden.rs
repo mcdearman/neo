@@ -11,7 +11,7 @@
 //! Everything here looks and reports; nothing is changed.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Something to tell the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub fn disk_warnings(free: u64, total: u64) -> Vec<Warning> {
 }
 
 fn said(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = neo_desktop::command(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

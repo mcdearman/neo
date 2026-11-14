@@ -95,7 +95,7 @@ pub fn parse_status(text: &str) -> Status {
 /// Runs git in `root` and returns what it printed, or what it complained of.
 /// `dirs` become its `PATH`, since an app started from the Dock has a bare one.
 pub fn run(root: &Path, dirs: &[PathBuf], args: &[&str]) -> Result<String, String> {
-    let mut command = std::process::Command::new("git");
+    let mut command = neo_desktop::command("git");
     if let Ok(path) = std::env::join_paths(dirs)
         && !path.is_empty()
     {

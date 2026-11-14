@@ -55,10 +55,31 @@ pub struct Settings {
     pub stay_unlocked: u32,
 }
 
+/// The drives built into this computer, by their roots: `C:\` and the
+/// rest. None but on Windows. One that is plugged in, a disc or a share
+/// on the network is not counted: it may not be there tomorrow.
+pub fn fixed_drives() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+        use windows::core::HSTRING;
+        const FIXED: u32 = 3;
+        // SAFETY: asked of Windows with a root's name, which it only reads.
+        ('A'..='Z').map(|letter| format!("{letter}:\\")).filter(|root| unsafe { GetDriveTypeW(&HSTRING::from(root.as_str())) } == FIXED).map(PathBuf::from).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![]
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let dir = neo_desktop::fs::user_dir;
-        let folders = ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect();
+        // On Windows, where a computer's things are spread over its drives,
+        // every drive built into it; elsewhere, where they are kept at home.
+        let drives = fixed_drives();
+        let folders = if drives.is_empty() { ["PICTURES", "VIDEOS", "DOCUMENTS"].into_iter().map(|d| Folder { path: dir(d), on: true }).collect() } else { drives.into_iter().map(|path| Folder { path, on: true }).collect() };
         Self {
             folders,
             chat_model: "gemma3:1b".into(),
@@ -75,7 +96,8 @@ impl Default for Settings {
             look_ahead: false,
             warn: true,
             background: true,
-            stay_unlocked: 15,
+            // Asked once, when it starts, and not again until it is quit.
+            stay_unlocked: 0,
         }
     }
 }
@@ -249,7 +271,10 @@ mod tests {
     #[test]
     fn settings_are_written_and_read_back() {
         let d = Settings::default();
-        assert_eq!((d.folders.len(), d.folders.iter().all(|f| f.on), d.remember_conversations), (3, true, true));
+        // Pictures, Videos and Documents; on Windows, the drives built in.
+        let drives = fixed_drives();
+        assert_eq!((d.folders.len(), d.folders.iter().all(|f| f.on), d.remember_conversations), (if drives.is_empty() { 3 } else { drives.len() }, true, true));
+        assert_eq!(drives.is_empty(), !cfg!(windows), "a Windows computer has a drive it runs from");
         let s = Settings {
             folders: vec![Folder { path: "/a b/c".into(), on: true }, Folder { path: "/d".into(), on: false }],
             chat_model: "qwen3".into(),

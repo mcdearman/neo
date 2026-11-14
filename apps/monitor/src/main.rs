@@ -10,6 +10,7 @@ mod ask;
 mod detail;
 mod evidence;
 mod heat;
+mod hwinfo;
 mod inspect;
 mod net;
 mod power;
@@ -151,7 +152,7 @@ enum Msg {
 fn program_of(sys: &System, pid: Pid) -> Option<String> {
     let known = sys.process(pid).and_then(|p| p.exe()).map(|e| e.display().to_string()).filter(|e| !e.is_empty());
     known.or_else(|| {
-        let out = std::process::Command::new("ps").args(["-p", &pid.as_u32().to_string(), "-o", "comm="]).output().ok()?;
+        let out = neo_desktop::command("ps").args(["-p", &pid.as_u32().to_string(), "-o", "comm="]).output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|p| p.starts_with('/'))
     })
 }
@@ -398,6 +399,9 @@ impl App for Monitor {
         match m {
             Msg::Page(p) => {
                 self.page = p;
+                // A page chosen is gone to at its top: from one process's
+                // threads, Processes goes back to all of them.
+                self.inspect = None;
                 self.watching_heat.store(p == Page::Sensors, std::sync::atomic::Ordering::Relaxed);
                 self.watching_net.store(p == Page::Network, std::sync::atomic::Ordering::Relaxed);
             }
@@ -666,11 +670,12 @@ impl Monitor {
             selected => {
                 let mut r = row().spacing(10.0).align(Align::Center).width(Length::Fill).padding([16.0, 10.0]);
                 r = match &self.status {
-                    Some((tone, msg)) => r.push(notice(*tone, msg.clone())),
-                    None if chosen.len() > 1 => r.push(text(format!("{} processes selected", chosen.len())).role(TextRole::Caption).tone(Tone::Muted)),
-                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads, end it, or ask Apollo what it is. Shift with the arrows selects several.".into())).role(TextRole::Caption).tone(Tone::Muted)),
+                    Some((tone, msg)) => r.push(notice(*tone, msg.clone())).push(Space::fill_x()),
+                    None if chosen.len() > 1 => r.push(text(format!("{} processes selected", chosen.len())).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)),
+                    // Whatever is said here wraps in the room the buttons leave, and never squeezes them.
+                    None => r.push(text(selected.map(|p| format!("{} · PID {}", p.name, p.pid)).unwrap_or_else(|| "Select a process to see its threads, end it, or ask Apollo what it is. Shift with the arrows selects several.".into())).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)),
                 };
-                r.push(Space::fill_x()).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::SPARKLES).size(15.0)).push(text("Ask Apollo"))).on_press_maybe(selected.map(|_| Msg::AskApollo))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
+                r.push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::SPARKLES).size(15.0)).push(text("Ask Apollo"))).on_press_maybe(selected.map(|_| Msg::AskApollo))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CPU).size(15.0)).push(text("Threads and swap"))).on_press_maybe(selected.map(|_| Msg::Inspect))).push(Button::new(row().spacing(8.0).align(Align::Center).push(icon(icons::CIRCLE_STOP).size(15.0)).push(text("End process"))).on_press_maybe(selected.map(|_| Msg::End))).into()
             }
         };
         column().width(Length::Fill).height(Length::Fill).push(toolbar).push(Divider::horizontal()).push(header).push(scrollable(rows).height(Length::Fill)).push(Divider::horizontal()).push(footer).into()

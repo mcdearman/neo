@@ -1,0 +1,13 @@
+[package]
+name = "neo-index"
+description = "An index of what is on a disk: every folder and file by name and size, kept between runs and brought up to date from what changed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo-desktop.workspace = true
+rayon = "1.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

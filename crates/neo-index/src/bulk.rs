@@ -130,5 +130,5 @@ pub fn list(path: &Path, on_disk: bool) -> io::Result<Listing> {
             }
         }
     })?;
-    Ok(Listing { mtime: st.st_mtime * 1_000_000_000 + st.st_mtime_nsec, dev: st.st_dev as u64, items })
+    Ok(Listing { mtime: st.st_mtime * 1_000_000_000 + st.st_mtime_nsec, hidden: false, dev: st.st_dev as u64, items })
 }

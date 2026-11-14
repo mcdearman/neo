@@ -254,7 +254,7 @@ impl Ollama {
         if !program.is_file() {
             return Err("Ollama, which runs Apollo's model, is not installed. Get it with: cargo xtask deps --install".into());
         }
-        std::process::Command::new(&program).arg("serve").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(|e| format!("Couldn't start Ollama: {e}"))?;
+        neo_desktop::command(&program).arg("serve").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(|e| format!("Couldn't start Ollama: {e}"))?;
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(200));
             if self.running() {

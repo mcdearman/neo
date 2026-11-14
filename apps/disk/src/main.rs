@@ -16,12 +16,10 @@
 //!     cargo run -p neo-disk -- --snapshot target/snapshots
 //!     cargo run --release -p neo-disk -- --measure ~
 
-#[cfg(target_os = "macos")]
-mod bulk;
-mod changes;
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod drives;
-mod scan;
-mod store;
 mod treemap;
 
 use std::path::{Path, PathBuf};
@@ -35,6 +33,7 @@ use neo::{Key, Proxy, Size};
 use neo_desktop::fs::human_size;
 use neo_desktop::ui::{nav_item, notice, section, split};
 use neo_desktop::{Desktop, DesktopMsg};
+use neo_index::{scan, store};
 
 use drives::{Action, Drive, Fs};
 use scan::{Entry, Progress};
@@ -149,6 +148,12 @@ struct NeoDisk {
     /// The scan showing was stopped before it finished.
     stopped: bool,
     proxy: Option<Proxy<Msg>>,
+    /// What is about to be deleted, once it is said to be: its place, its
+    /// name and its size. And whether a deletion is going on, and how the
+    /// last one went.
+    to_delete: Option<(PathBuf, String, u64)>,
+    deleting: bool,
+    deleted: Option<Result<String, String>>,
 }
 
 /// How a result was come by.
@@ -225,6 +230,11 @@ enum Msg {
     Jump(usize),
     /// Show the folder on screen in Files.
     Reveal,
+    /// Ask whether to delete the thing at this place in the list.
+    AskDelete(usize),
+    Delete,
+    KeepIt,
+    Deleted(Result<String, String>),
     Rescan,
     Cancel,
     Tab(Tab),
@@ -278,6 +288,9 @@ impl NeoDisk {
             target: None,
             tree: None,
             path: vec![],
+            to_delete: None,
+            deleting: false,
+            deleted: None,
             map: Rc::new(vec![]),
             progress: Arc::default(),
             running: false,
@@ -434,6 +447,20 @@ impl NeoDisk {
         }
 
         let mut list = column().spacing(1.0).width(Length::Fill);
+        // Said before anything is deleted, and what became of it after.
+        if let Some((_, name, size)) = &self.to_delete {
+            let ask = column()
+                .spacing(8.0)
+                .width(Length::Fill)
+                .push(text(format!("Move {name} ({}) to the {TRASH}?", human_size(*size))).role(TextRole::Strong).width(Length::Fill))
+                .push(text(format!("It can be had back from the {TRASH} until that is emptied.")).role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill))
+                .push(row().spacing(8.0).push(Space::fill_x()).push(button("Keep it").on_press(Msg::KeepIt)).push(Button::new(text("Delete")).kind(ButtonKind::Accent).on_press(Msg::Delete)));
+            list = list.push(container(ask).surface(Surface::Well).radius(10.0).padding(12.0).width(Length::Fill)).push(Space::new(0.0, 6.0));
+        } else if self.deleting {
+            list = list.push(notice(Tone::Accent, "Deleting…")).push(Space::new(0.0, 6.0));
+        } else if let Some(how) = &self.deleted {
+            list = list.push(match how { Ok(said) => notice(Tone::Good, said.clone()), Err(why) => notice(Tone::Bad, why.clone()) }).push(Space::new(0.0, 6.0));
+        }
         for (i, c) in here.children.iter().take(ROWS).enumerate() {
             let share = if here.size > 0 { c.size as f32 / here.size as f32 } else { 0.0 };
             let glyph = if c.group {
@@ -453,7 +480,10 @@ impl NeoDisk {
                 .push(text(size).mono().role(TextRole::Caption).tone(if c.denied { Tone::Warn } else { Tone::Muted }))
                 .push(text(format!("{:>5.1}%", share * 100.0)).mono().role(TextRole::Caption).tone(Tone::Faint));
             let opens = c.dir && !c.children.is_empty();
-            list = list.push(Button::new(column().spacing(5.0).width(Length::Fill).push(line).push(progress_bar(share).height(3.0))).kind(ButtonKind::Ghost).width(Length::Fill).padding([8.0, 7.0]).radius(6.0).on_press_maybe(opens.then_some(Msg::Enter(i))));
+            let entry = Button::new(column().spacing(5.0).width(Length::Fill).push(line).push(progress_bar(share).height(3.0))).kind(ButtonKind::Ghost).width(Length::Fill).padding([8.0, 7.0]).radius(6.0).on_press_maybe(opens.then_some(Msg::Enter(i)));
+            // Anything but a group of small things can be deleted.
+            let delete = icon_button(icons::TRASH_2, 28.0).kind(ButtonKind::Ghost).on_press_maybe((!c.group && !self.deleting && self.to_delete.is_none()).then_some(Msg::AskDelete(i)));
+            list = list.push(row().spacing(2.0).align(Align::Center).width(Length::Fill).push(entry).push(delete));
         }
         if here.children.len() > ROWS {
             let rest: u64 = here.children[ROWS..].iter().map(|c| c.size).sum();
@@ -466,6 +496,9 @@ impl NeoDisk {
         column().spacing(8.0).padding(14.0).width(Length::Fill).height(Length::Fill).push(header).push(text(note).role(TextRole::Caption).tone(Tone::Muted)).push(row().spacing(14.0).width(Length::Fill).height(Length::Fill).push(container(scrollable(list)).width(370.0).height(Length::Fill)).push(map)).into()
     }
 }
+
+/// What the system calls the place deleted things go.
+const TRASH: &str = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
 
 /// A drive's size, file system and whether it is mounted, in a line.
 fn summary(d: &Drive) -> String {
@@ -704,6 +737,16 @@ impl App for NeoDisk {
                 self.start(target, false);
             }
             Msg::Tab(tab) => {
+                // The tab one is in, chosen again, goes back to its top:
+                // out of the folders gone into, or of what was being set
+                // for a drive.
+                if tab == self.tab {
+                    match tab {
+                        Tab::Usage if !self.path.is_empty() => self.show(vec![]),
+                        Tab::Drives => self.form = None,
+                        _ => {}
+                    }
+                }
                 self.tab = tab;
                 if tab == Tab::Drives && self.drives.is_none() {
                     self.find_drives();
@@ -823,6 +866,36 @@ impl App for NeoDisk {
             Msg::Reveal => {
                 if let Some(path) = self.folder_path() {
                     let _ = neo_desktop::fs::reveal(&path);
+                }
+            }
+            Msg::AskDelete(i) => {
+                // Not a group of small things, which is many things, nor what cannot be read.
+                if let (Some(folder), Some(c)) = (self.folder_path(), self.current().and_then(|here| here.children.get(i)).filter(|c| !c.group))
+                    && !self.deleting
+                {
+                    self.to_delete = Some((folder.join(&c.name), c.name.clone(), c.size));
+                    self.deleted = None;
+                }
+            }
+            Msg::KeepIt => self.to_delete = None,
+            Msg::Delete => {
+                if let Some((path, name, size)) = self.to_delete.take() {
+                    self.deleting = true;
+                    // To the Recycle Bin or the Trash, from which it can be had back.
+                    let delete = move || neo_desktop::fs::move_to_trash(&path).map(|_| format!("Moved {name} ({}) to the {}.", human_size(size), TRASH)).map_err(|e| format!("{name} was not deleted: {e}"));
+                    match self.proxy.clone() {
+                        Some(proxy) => drop(std::thread::spawn(move || proxy.send(Msg::Deleted(delete())))),
+                        None => self.update(Msg::Deleted(delete())),
+                    }
+                }
+            }
+            Msg::Deleted(how) => {
+                self.deleting = false;
+                let gone = how.is_ok();
+                self.deleted = Some(how);
+                // Measured again, which with what is kept of the last time is quick.
+                if gone {
+                    self.update(Msg::Rescan);
                 }
             }
             Msg::Rescan | Msg::RescanFully => {
@@ -1052,6 +1125,29 @@ mod tests {
         // An index that is not there does nothing.
         app.update(Msg::Enter(99));
         assert!(app.path.is_empty());
+    }
+
+    #[test]
+    fn deleting_is_asked_first_and_can_be_called_off() {
+        let root = std::env::temp_dir().join(format!("neo-disk-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("big")).unwrap();
+        std::fs::write(root.join("big/data.bin"), vec![1u8; 2_000_000]).unwrap();
+        let mut app = NeoDisk::new();
+        app.update(Msg::Scan(root.clone()));
+        app.update(Msg::AskDelete(0));
+        let (path, name, size) = app.to_delete.clone().expect("asked about");
+        assert!(path == root.join("big") && name == "big" && size >= 2_000_000, "{path:?} {name} {size}");
+        // Called off: nothing happens to it.
+        app.update(Msg::KeepIt);
+        assert!(app.to_delete.is_none() && root.join("big/data.bin").exists());
+        // What a deletion that went wrong says, and one that went well (told
+        // here, not done: a test does not put things in the Recycle Bin).
+        app.update(Msg::Deleted(Err("big was not deleted: it is in use".into())));
+        assert!(matches!(&app.deleted, Some(Err(e)) if e.contains("in use")) && !app.deleting);
+        app.update(Msg::AskDelete(99));
+        assert!(app.to_delete.is_none(), "nothing there, nothing asked");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

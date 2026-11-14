@@ -75,6 +75,15 @@ pub struct Folder {
     /// The files too small to list: their size together, and how many.
     pub small_size: u64,
     pub small_count: u32,
+    /// Their names, each ended by a nul, which no name holds: one piece of
+    /// memory to a folder, where a string to a file would be most of what
+    /// an index of a whole disk weighs. And their sizes, in the same order.
+    /// What is using a disk's space has no use for these; what there is to
+    /// read on it, and where a file of some name is, has.
+    pub small_names: Box<str>,
+    pub small_sizes: Vec<u32>,
+    /// The system hides the folder, or keeps it as its own.
+    pub hidden: bool,
     pub linked: Vec<Linked>,
     pub folders: Vec<Folder>,
 }
@@ -91,7 +100,28 @@ pub struct Index {
     pub folder: Folder,
 }
 
+impl Folder {
+    /// Every file directly in it, by name and size: the large, those with
+    /// more than one name, and the small.
+    pub fn files(&self) -> impl Iterator<Item = (&str, u64)> {
+        let small = self.small_names.split_terminator('\0').zip(self.small_sizes.iter().map(|s| u64::from(*s)));
+        self.big.iter().map(|b| (&*b.name, b.size)).chain(self.linked.iter().map(|l| (&*l.name, l.size))).chain(small)
+    }
+
+    /// The folder reached from this one by these names, one inside another.
+    pub fn at<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Option<&Folder> {
+        names.into_iter().try_fold(self, |f, name| f.folders.iter().find(|c| &*c.name == name))
+    }
+}
+
 impl Index {
+    /// The folder at `path`, which is the root or somewhere under it.
+    pub fn folder_at(&self, path: &Path) -> Option<&Folder> {
+        let rest = path.strip_prefix(&self.root).ok()?;
+        let names: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        self.folder.at(names.iter().map(String::as_str))
+    }
+
     /// What to show: sizes added up, small things folded together, the
     /// largest first.
     pub fn entry(&self) -> Entry {
@@ -174,6 +204,8 @@ pub struct Item {
 /// A folder's own details and what is directly in it.
 pub struct Listing {
     pub mtime: i64,
+    /// The system hides the folder, or keeps it as its own.
+    pub hidden: bool,
     /// The device the folder is on.
     pub dev: u64,
     pub items: Vec<Item>,
@@ -203,7 +235,11 @@ fn list(path: &Path, on_disk: bool) -> std::io::Result<Listing> {
         items.push(Item { name: item.file_name().to_string_lossy().into_owned(), dir: meta.is_dir(), size, links, id });
     }
     let _ = on_disk;
-    Ok(Listing { mtime: mtime(&own), dev: device(&own), items })
+    #[cfg(windows)]
+    let hidden = std::os::windows::fs::MetadataExt::file_attributes(&own) & (0x2 | 0x4) != 0;
+    #[cfg(not(windows))]
+    let hidden = false;
+    Ok(Listing { mtime: mtime(&own), hidden, dev: device(&own), items })
 }
 
 #[cfg(unix)]
@@ -272,8 +308,9 @@ impl<'a> Walk<'a> {
     /// Sorts a listing into a folder's own record, and the names of the
     /// folders inside it, which are still to be read.
     fn own(&self, name: Box<str>, listing: Listing) -> (Folder, Vec<String>) {
-        let mut f = Folder { name, mtime: listing.mtime, ..Default::default() };
+        let mut f = Folder { name, mtime: listing.mtime, hidden: listing.hidden, ..Default::default() };
         let (mut dirs, mut files, mut bytes) = (vec![], 0, 0);
+        let mut names = String::new();
         for item in listing.items {
             if item.dir {
                 dirs.push(item.name);
@@ -288,8 +325,12 @@ impl<'a> Walk<'a> {
             } else {
                 f.small_size += item.size;
                 f.small_count += 1;
+                names.push_str(&item.name);
+                names.push('\0');
+                f.small_sizes.push(item.size as u32);
             }
         }
+        f.small_names = names.into();
         self.progress.files.fetch_add(files, Ordering::Relaxed);
         self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
         (f, dirs)
