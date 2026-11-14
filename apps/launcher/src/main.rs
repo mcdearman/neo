@@ -62,7 +62,13 @@ struct Launcher {
     /// Counts each time the window is shown, to give the search field
     /// focus afresh.
     showings: u64,
+    /// The display the window is on, and how many of the system's pixels
+    /// make one of its own there.
     screen: Rect,
+    scale: f32,
+    /// The display being worked on when the window was called up, which it
+    /// comes up on, wherever it was before.
+    called_on: Option<Rect>,
     error: Option<String>,
     /// The window is the bar for asking Apollo, and not the list of apps.
     asking: bool,
@@ -107,7 +113,7 @@ fn save_habits(habits: &Habits) {
 
 impl Launcher {
     fn new(register_hotkey: bool, apps: Vec<AppEntry>, habits: Habits) -> Self {
-        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), habits, query: String::new(), results: vec![], selected: 0, asking: false, shown: true, focused: false, showings: 0, screen: Rect::ZERO, error: None, hotkeys: None, register_hotkey, quit: false };
+        let mut l = Self { desktop: Desktop::load(), apps, icons: HashMap::new(), habits, query: String::new(), results: vec![], selected: 0, asking: false, shown: true, focused: false, showings: 0, screen: Rect::ZERO, scale: 0.0, called_on: None, error: None, hotkeys: None, register_hotkey, quit: false };
         l.search();
         l
     }
@@ -132,6 +138,11 @@ impl Launcher {
     }
 
     fn show(&mut self) {
+        // In the system's pixels, made the window's own at the scale it is
+        // at now, as they are turned back when it is put there.
+        if !cfg!(test) && self.scale > 0.0 {
+            self.called_on = neo_desktop::displays::active().map(|(x, y, w, h)| Rect::new(x as f32 / self.scale, y as f32 / self.scale, w as f32 / self.scale, h as f32 / self.scale));
+        }
         self.shown = true;
         self.focused = false;
         self.showings += 1;
@@ -185,7 +196,7 @@ impl App for Launcher {
     }
 
     fn window(&self) -> WindowSettings {
-        WindowSettings { size: Size::new(WIDTH, HEIGHT), min_size: Some(Size::new(WIDTH, ASK_HEIGHT)), resizable: false, app_id: Some("org.neo.Launcher".into()), ..Default::default() }
+        WindowSettings { size: Size::new(WIDTH, HEIGHT), min_size: Some(Size::new(WIDTH, ASK_HEIGHT)), resizable: false, app_id: Some("org.neo.Launcher".into()), skip_taskbar: true, ..Default::default() }
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -197,7 +208,8 @@ impl App for Launcher {
 
     fn window_state(&self) -> WindowState {
         // Centred, a little above the middle, where the eye goes first.
-        let position = (self.screen != Rect::ZERO).then(|| Point::new((self.screen.x + (self.screen.w - WIDTH) * 0.5).round(), (self.screen.y + self.screen.h * 0.22).round()));
+        let screen = self.called_on.unwrap_or(self.screen);
+        let position = (screen != Rect::ZERO).then(|| Point::new((screen.x + (screen.w - WIDTH) * 0.5).round(), (screen.y + screen.h * 0.22).round()));
         WindowState { visible: self.shown, always_on_top: true, bare: true, size: Some(Size::new(WIDTH, if self.asking { ASK_HEIGHT } else { HEIGHT })), position, hidden_from_capture: false, passive: false }
     }
 
@@ -306,7 +318,7 @@ impl App for Launcher {
                     self.hide();
                 }
             }
-            Msg::Geometry(g) => self.screen = g.screen,
+            Msg::Geometry(g) => (self.screen, self.scale) = (g.screen, g.scale),
             Msg::Icons(batch) => self.icons.extend(batch),
             Msg::Poll => {
                 self.desktop.poll();
@@ -573,6 +585,18 @@ mod tests {
         let mut l = launcher();
         assert_eq!(l.window_state().position, None, "until the screen is known");
         l.update(Msg::Geometry(WindowGeometry { frame: Rect::ZERO, screen: Rect::new(0.0, 0.0, 1512.0, 982.0), scale: 2.0 }));
+        assert_eq!(l.window_state().position, Some(Point::new(436.0, 216.0)));
+    }
+
+    #[test]
+    fn comes_up_on_the_display_it_was_called_on() {
+        let mut l = launcher();
+        l.update(Msg::Geometry(WindowGeometry { frame: Rect::ZERO, screen: Rect::new(-1512.0, 0.0, 1512.0, 982.0), scale: 2.0 }));
+        // Called up on the display to the right, while it was last on the left one.
+        l.called_on = Some(Rect::new(0.0, 0.0, 1512.0, 982.0));
+        assert_eq!(l.window_state().position, Some(Point::new(436.0, 216.0)));
+        // Its report of where it was before does not take it back.
+        l.update(Msg::Geometry(WindowGeometry { frame: Rect::ZERO, screen: Rect::new(-1512.0, 0.0, 1512.0, 982.0), scale: 2.0 }));
         assert_eq!(l.window_state().position, Some(Point::new(436.0, 216.0)));
     }
 }

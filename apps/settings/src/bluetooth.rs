@@ -4,7 +4,7 @@
 //! on and off goes through the same calls its own settings use. Linux is
 //! asked through BlueZ's `bluetoothctl`.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// A device this computer has been paired with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub fn parse_bluetoothctl(devices: &str, connected: &str) -> Vec<Device> {
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = neo_desktop::command(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

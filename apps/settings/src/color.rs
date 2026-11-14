@@ -68,7 +68,7 @@ mod imp {
     pub fn sample(picked: Picked) {
         let Some((program, args)) = tool() else { return picked(None) };
         std::thread::spawn(move || {
-            let out = std::process::Command::new(program).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+            let out = neo_desktop::command(program).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
             picked(out.ok().filter(|o| o.status.success()).and_then(|o| parse_hex(String::from_utf8_lossy(&o.stdout).trim())));
         });
     }

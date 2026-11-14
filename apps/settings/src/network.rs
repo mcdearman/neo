@@ -5,7 +5,7 @@
 //! asked through NetworkManager's `nmcli`. What is passing over the
 //! network is System Monitor's to show.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// One way this computer can be on a network: Wi-Fi, Ethernet, a bridge.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -101,7 +101,7 @@ pub fn parse_nmcli(text: &str) -> Vec<Connection> {
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = neo_desktop::command(neo_desktop::fs::tool(program)).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

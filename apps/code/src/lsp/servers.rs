@@ -171,7 +171,7 @@ fn login_shell_path() -> Option<String> {
     let shell = std::env::var_os("SHELL")?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = std::process::Command::new(shell).args(["-l", "-c", "printf '%s' \"$PATH\""]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+        let out = neo_desktop::command(shell).args(["-l", "-c", "printf '%s' \"$PATH\""]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
         let _ = tx.send(out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()));
     });
     rx.recv_timeout(Duration::from_secs(3)).ok().flatten().filter(|p| !p.is_empty())

@@ -258,7 +258,7 @@ mod system {
 mod ff {
     use super::*;
     use std::io::Read;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -326,7 +326,7 @@ mod ff {
 
     impl Player {
         pub fn open(path: &Path) -> Result<Self, String> {
-            let out = Command::new(neo_desktop::fs::tool("ffprobe"))
+            let out = neo_desktop::command(neo_desktop::fs::tool("ffprobe"))
                 .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "default=noprint_wrappers=1"])
                 .arg(path)
                 .output()
@@ -349,7 +349,7 @@ mod ff {
         /// the video's own speed; otherwise it writes one frame and stops.
         fn decode_from(&mut self, at: f64, playing: bool) {
             let (w, h) = self.size;
-            let mut cmd = Command::new(neo_desktop::fs::tool("ffmpeg"));
+            let mut cmd = neo_desktop::command(neo_desktop::fs::tool("ffmpeg"));
             cmd.args(["-loglevel", "error", "-noautorotate"]);
             if playing {
                 // -re reads the input in real time, so frames arrive when due.
@@ -379,8 +379,10 @@ mod ff {
 
         fn play_audio_from(&mut self, at: f64) {
             let volume = (self.volume * 100.0).round() as u32;
-            self.audio = Command::new(neo_desktop::fs::tool("ffplay"))
-                .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-vn"])
+            self.audio = neo_desktop::command(neo_desktop::fs::tool("ffplay"))
+                // The first sound track: where there are several, as in a
+                // recording with the microphone, that is all of them mixed.
+                .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-vn", "-ast", "a:0"])
                 .arg("-ss")
                 .arg(format!("{at:.3}"))
                 .arg("-volume")
@@ -499,14 +501,13 @@ mod ff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     /// A second of test pattern in a container of the kind named, made
     /// with ffmpeg itself. `None` where there is no ffmpeg to make it.
     fn clip(name: &str) -> Option<PathBuf> {
         let path = std::env::temp_dir().join(format!("neo-videos-{}-{name}", std::process::id()));
-        let made = Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=24", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
+        let made = neo_desktop::command(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=24", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
         made.then_some(path)
     }
 

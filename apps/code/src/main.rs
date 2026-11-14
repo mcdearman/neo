@@ -20,6 +20,8 @@ mod runner;
 mod settings;
 mod side;
 
+use std::cell::Cell;
+
 use neo::prelude::*;
 use neo::{Color, Key, KeyEvent, Proxy, Size};
 use neo_desktop::Desktop;
@@ -218,6 +220,8 @@ struct NeoCode {
     tabs: Vec<Tab>,
     active: Option<usize>,
     dark: Option<bool>,
+    /// The system's scheme, as last told to `theme`: what Auto follows.
+    system: Cell<Scheme>,
     toast: Option<String>,
     keymap: Keymap,
     /// The folder that is open, when the project is on disk.
@@ -353,7 +357,7 @@ impl NeoCode {
             }
             nodes.push(Node { name: parts[parts.len() - 1].into(), path: path.to_string(), depth: parts.len() - 1, dir: false, expanded: false, source: Some(Source::Memory(text)) });
         }
-        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() };
+        let mut app = Self { project: "aurora".into(), nodes, tabs: vec![], active: None, dark: None, system: Cell::new(Scheme::Light), toast: None, keymap: Keymap::Vim, root: None, desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() };
         for p in ["src/main.rs", "src/solar.rs", "Cargo.toml"] {
             if let Some(i) = app.nodes.iter().position(|n| n.path == p) {
                 app.update(Msg::Open(i));
@@ -394,7 +398,7 @@ impl NeoCode {
     fn folder(root: &Path) -> Self {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let (project, nodes) = Self::load(&root);
-        Self { project, nodes, tabs: vec![], active: None, dark: None, toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() }
+        Self { project, nodes, tabs: vec![], active: None, dark: None, system: Cell::new(Scheme::Light), toast: None, keymap: Keymap::Vim, root: Some(root), desktop: Desktop::load(), servers: intel::Servers::default(), run: None, runs: 0, runs_commands: !cfg!(test), settings: Default::default(), settings_seen: [None, None], config: None, recent: vec![], debug: None, debugs: 0, breakpoints: Default::default(), asking: None, debug_args: Default::default(), meadow: None, terminal: None, terminal_shown: false, editor_focus: 0, jumps: vec![], page: side::Page::Explorer, side_shown: true, source: Default::default() }
     }
 
     /// The folder a file belongs to: the nearest one above it that looks
@@ -547,9 +551,10 @@ fn file_icon(name: &str) -> neo::theme::Icon {
 }
 
 impl NeoCode {
-    /// Whether the window is dark: the override if set, else the desktop setting.
+    /// Whether the window is dark: the override if set, else the desktop
+    /// setting, which may be to follow the system.
     fn is_dark(&self) -> bool {
-        self.dark.unwrap_or(self.desktop.appearance.scheme == neo_desktop::SchemePref::Dark)
+        self.dark.unwrap_or_else(|| self.desktop.theme(self.system.get()).scheme == Scheme::Dark)
     }
 }
 
@@ -797,6 +802,7 @@ impl App for NeoCode {
     }
 
     fn theme(&self, system: Scheme) -> Theme {
+        self.system.set(system);
         let mut theme = self.desktop.theme(system);
         theme.syntax = self.settings.syntax;
         // The sun and moon button overrides the desktop's scheme for this window.

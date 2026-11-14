@@ -94,18 +94,18 @@ pub fn frame_commands(video: &Path, out_dir: &Path, out: &Path, side: u32) -> Ve
         // is asked only for the kinds macOS can read: given any other, it
         // does not say no, it just never answers.
         if neo_desktop::fs::has_extension(video, &["mov", "mp4", "m4v", "3gp"]) {
-            let mut c = std::process::Command::new("qlmanage");
+            let mut c = neo_desktop::command("qlmanage");
             c.args(["-t", "-s", &side.to_string(), "-o"]).arg(out_dir).arg(video);
             commands.push(c);
         }
     } else {
-        let mut c = std::process::Command::new("ffmpegthumbnailer");
+        let mut c = neo_desktop::command("ffmpegthumbnailer");
         c.arg("-i").arg(video).arg("-o").arg(out).args(["-s", &side.to_string()]);
         commands.push(c);
     }
     // A second in, past any black first frame; scaled to fit the side.
     // ffmpeg reads everything, and Neo counts on its being installed.
-    let mut c = std::process::Command::new(neo_desktop::fs::tool("ffmpeg"));
+    let mut c = neo_desktop::command(neo_desktop::fs::tool("ffmpeg"));
     c.args(["-y", "-loglevel", "error", "-ss", "1", "-i"]).arg(video).args(["-frames:v", "1", "-vf", &format!("scale={side}:{side}:force_original_aspect_ratio=decrease")]).arg(out);
     commands.push(c);
     commands
@@ -309,11 +309,11 @@ mod tests {
         #[cfg(unix)]
         {
             let began = std::time::Instant::now();
-            assert_eq!(finished_in_time(std::process::Command::new("sleep").arg("30"), std::time::Duration::from_millis(200)), Some(false));
+            assert_eq!(finished_in_time(neo_desktop::command("sleep").arg("30"), std::time::Duration::from_millis(200)), Some(false));
             assert!(began.elapsed() < std::time::Duration::from_secs(5));
-            assert_eq!(finished_in_time(&mut std::process::Command::new("true"), std::time::Duration::from_secs(5)), Some(true));
-            assert_eq!(finished_in_time(&mut std::process::Command::new("false"), std::time::Duration::from_secs(5)), Some(false));
-            assert_eq!(finished_in_time(&mut std::process::Command::new("neo-files-no-such-tool"), std::time::Duration::from_secs(5)), None);
+            assert_eq!(finished_in_time(&mut neo_desktop::command("true"), std::time::Duration::from_secs(5)), Some(true));
+            assert_eq!(finished_in_time(&mut neo_desktop::command("false"), std::time::Duration::from_secs(5)), Some(false));
+            assert_eq!(finished_in_time(&mut neo_desktop::command("neo-files-no-such-tool"), std::time::Duration::from_secs(5)), None);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

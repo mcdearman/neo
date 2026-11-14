@@ -499,6 +499,8 @@ impl App for Settings {
             Msg::Page(p) => {
                 self.page = p;
                 self.error = None;
+                // A page is gone to as it is at first, with nothing open over it.
+                (self.picker, self.choosing) = (None, None);
                 self.arrive();
             }
             Msg::Wallpaper(path) => match self.set_wallpaper(&path) {
@@ -692,7 +694,7 @@ impl App for Settings {
             }
             Msg::OpenAccessibility => {
                 if cfg!(target_os = "macos") && !cfg!(test) {
-                    let _ = std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+                    let _ = neo_desktop::command("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
                 }
             }
             Msg::Scheme(s) => self.change(|a| a.scheme = s),

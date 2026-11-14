@@ -359,7 +359,7 @@ mod tests {
         // Made with ffmpeg, where there is one; a kind it plays itself, so
         // the test does not need the main thread's run loop.
         let path = std::env::temp_dir().join(format!("neo-videos-{}-autoplay.mkv", std::process::id()));
-        let made = std::process::Command::new(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=12", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
+        let made = neo_desktop::command(neo_desktop::fs::tool("ffmpeg")).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=12", "-pix_fmt", "yuv420p"]).arg(&path).status().is_ok_and(|s| s.success());
         if !made {
             return;
         }
@@ -390,7 +390,7 @@ mod tests {
     fn closing_the_app_stops_the_picture_and_the_sound() {
         // With sound, so there is something to be left playing.
         let path = std::env::temp_dir().join(format!("neo-videos-{}-closing.mkv", std::process::id()));
-        let made = std::process::Command::new(neo_desktop::fs::tool("ffmpeg"))
+        let made = neo_desktop::command(neo_desktop::fs::tool("ffmpeg"))
             .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=30:size=160x120:rate=12", "-f", "lavfi", "-i", "sine=frequency=440:duration=30", "-pix_fmt", "yuv420p", "-shortest"])
             .arg(&path)
             .status()
@@ -399,7 +399,7 @@ mod tests {
             return;
         }
         // The programs playing this file, by its name on their command lines.
-        let playing = || std::process::Command::new("pgrep").arg("-f").arg(path.file_name().unwrap()).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
+        let playing = || neo_desktop::command("pgrep").arg("-f").arg(path.file_name().unwrap()).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
         let mut app = Videos::new(Some(path.clone()));
         app.update(Msg::Volume(0.0));
         app.autoplay = true;

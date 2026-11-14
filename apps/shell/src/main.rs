@@ -10,6 +10,9 @@
 //!     cargo run -p neo-shell
 //!     cargo run -p neo-shell -- --snapshot target/snapshots
 
+// Release builds on Windows open no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -329,7 +332,7 @@ impl App for Shell {
     }
 
     fn window(&self) -> WindowSettings {
-        WindowSettings { size: self.size(), min_size: None, resizable: false, app_id: Some("org.neo.Shell".into()), ..Default::default() }
+        WindowSettings { size: self.size(), min_size: None, resizable: false, app_id: Some("org.neo.Shell".into()), skip_taskbar: true, ..Default::default() }
     }
 
     fn theme(&self, system: Scheme) -> Theme {
@@ -375,6 +378,10 @@ impl App for Shell {
         if !cfg!(test) {
             self.start_tiling();
             std::thread::spawn(scroll::run);
+            // What is on this computer's disks, by name: kept up to date
+            // from here, since NeoShell runs from when the computer starts,
+            // for NeoDisk, Apollo and whatever else wants to know.
+            std::thread::spawn(neo_index::keep::run);
         }
     }
 

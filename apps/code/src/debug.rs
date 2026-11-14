@@ -279,7 +279,7 @@ impl NeoCode {
         let (Some(proxy), true) = (self.servers.proxy.clone(), self.runs_commands) else { return };
         let dirs = self.servers.dirs.clone().unwrap_or_default();
         std::thread::spawn(move || {
-            let mut command = std::process::Command::new(&build.program);
+            let mut command = neo_desktop::command(&build.program);
             if let Ok(path) = std::env::join_paths(&dirs)
                 && !path.is_empty()
             {

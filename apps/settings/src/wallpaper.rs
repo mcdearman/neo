@@ -8,7 +8,7 @@
 //! to draw when it has a desktop of its own.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Kinds of picture that can be a desktop picture.
 const PICTURES: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff", "bmp"];
@@ -92,7 +92,7 @@ pub fn thumbnail(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         return None;
     }
     let out = std::env::temp_dir().join(format!("neo-settings-thumb-{}-{:x}.jpg", std::process::id(), path.to_string_lossy().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))));
-    let made = Command::new("/usr/bin/sips").args(["-s", "format", "jpeg", "-Z", &THUMB_SIDE.to_string()]).arg(path).arg("--out").arg(&out).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let made = neo_desktop::command("/usr/bin/sips").args(["-s", "format", "jpeg", "-Z", &THUMB_SIDE.to_string()]).arg(path).arg("--out").arg(&out).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     let picture = made.ok().filter(|s| s.success()).and_then(|_| image::open(&out).ok());
     let _ = std::fs::remove_file(&out);
     picture.map(small)
@@ -172,7 +172,7 @@ mod imp {
 
     fn run(program: &str, args: &[&str]) -> Option<String> {
         let tool = neo_desktop::fs::tool(program);
-        let out = Command::new(tool).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        let out = neo_desktop::command(tool).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
