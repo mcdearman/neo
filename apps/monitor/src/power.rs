@@ -262,8 +262,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_busy_process_is_seen_drawing_power_and_an_idle_one_not() {
-        let busy = std::process::Command::new("sh").args(["-c", "while :; do :; done"]).spawn().unwrap();
-        let idle = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let busy = neo_desktop::command("sh").args(["-c", "while :; do :; done"]).spawn().unwrap();
+        let idle = neo_desktop::command("sleep").arg("30").spawn().unwrap();
         let pids: HashMap<u32, f32> = [(busy.id(), 1.0), (idle.id(), 0.0)].into();
         let mut meter = Meter::default();
         assert!(meter.sample(&pids).is_empty(), "nothing to compare with the first time");

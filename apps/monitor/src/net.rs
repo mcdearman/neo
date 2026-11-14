@@ -140,7 +140,7 @@ impl Watcher {
         if !cfg!(target_os = "macos") {
             return None;
         }
-        let out = std::process::Command::new("/usr/bin/nettop").args(["-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+        let out = neo_desktop::command("/usr/bin/nettop").args(["-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
         out.status.success().then(|| self.take(parse_nettop(&String::from_utf8_lossy(&out.stdout)), Instant::now()))
     }
 }

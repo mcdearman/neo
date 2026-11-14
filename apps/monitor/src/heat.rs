@@ -110,7 +110,7 @@ impl Monitor {
             return container(waiting).width(Length::Fill).height(Length::Fill).center().into();
         };
         if reading.sensors.is_empty() && reading.fans.is_empty() {
-            let why = if cfg!(windows) { "Windows reports temperatures only where the firmware provides them, and often only to administrators." } else { "This computer reports no temperature or fan sensors. In a virtual machine that is expected." };
+            let why = if cfg!(windows) { "Windows reports temperatures only where the firmware provides them. For the processor, the board and the fans, run HWiNFO with Shared Memory Support turned on in its settings." } else { "This computer reports no temperature or fan sensors. In a virtual machine that is expected." };
             let none = column().spacing(10.0).align(Align::Center).push(icon(icons::THERMOMETER).size(34.0).tone(Tone::Faint)).push(text("No sensors found").role(TextRole::Strong)).push(container(text(why).tone(Tone::Muted).align(Align::Center)).max_width(440.0));
             return container(none).width(Length::Fill).height(Length::Fill).center().into();
         }
@@ -121,7 +121,7 @@ impl Monitor {
             let why = if cfg!(target_os = "macos") {
                 "No fans reported. This Mac may not have any."
             } else if cfg!(windows) {
-                "Windows does not report fan speeds without the maker's own driver."
+                "Windows does not report fan speeds. Run HWiNFO with Shared Memory Support turned on to see them here."
             } else {
                 "No fan sensors found. Some laptops report them only with a vendor kernel module."
             };
@@ -163,6 +163,11 @@ impl Monitor {
         page = page.push(middle);
         if !reading.sensors.is_empty() {
             page = page.push(panel("All sensors", format!("{} sensors", reading.sensors.len()), all));
+        }
+        // Windows gives the processor's own sensors to nobody without a
+        // driver; said here, with what does have one, where they are missing.
+        if cfg!(windows) && reading.of(Kind::Cpu).next().is_none() {
+            page = page.push(container(text("The processor's and the board's sensors need a driver that Windows does not come with. Run HWiNFO with Shared Memory Support turned on in its settings and they are shown here.").role(TextRole::Caption).tone(Tone::Muted).width(Length::Fill)).padding([0.0, 6.0]));
         }
         scrollable(page).into()
     }
