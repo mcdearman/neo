@@ -1,0 +1,11 @@
+[package]
+name = "neo-sight"
+description = "Telling pictures and faces apart by what is in them, for Apollo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Runs the models. It brings ONNX Runtime with it, built for this system.
+ort = "=2.0.0-rc.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
